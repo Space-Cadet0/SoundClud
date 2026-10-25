@@ -1,4 +1,5 @@
 use crate::coordinator::ReceiverCoordinator;
+use crate::flac_streamer::{compute_flac_stream_plan, spawn_flac_byte_stream, DLNA_FLAC_FEATURES};
 use crate::protocol::ApiErrorResponse;
 use crate::wav_streamer::{
     compute_total_pcm_bytes, parse_http_byte_range, spawn_wav_byte_stream, DLNA_WAV_FEATURES,
@@ -197,6 +198,87 @@ pub async fn get_heos_wav_stream(
     }
 
     let rx = spawn_wav_byte_stream(session, start_ms, parsed_range);
+    let stream_body = Body::from_stream(ReceiverStream::new(rx));
+    resp_builder
+        .body(stream_body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+pub async fn get_heos_flac_stream(
+    method: Method,
+    Path(capability_token): Path<String>,
+    Query(query): Query<WavStreamQuery>,
+    State(coord): State<Arc<ReceiverCoordinator>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(session) = coord.lookup_heos_stream(&capability_token) else {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorResponse::new(
+                "invalid_capability_token",
+                "unknown or expired HEOS stream capability token",
+            )),
+        )
+            .into_response();
+    };
+
+    let start_ms = query.start_ms.unwrap_or(0);
+    let plan = compute_flac_stream_plan(&session.track, session.effective_duration_ms(), start_ms);
+    let total_file_bytes = plan.total_file_bytes;
+
+    let parsed_range =
+        if let Some(raw_range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
+            match parse_http_byte_range(raw_range, total_file_bytes) {
+                Ok(spec) => Some(spec),
+                Err(_) => {
+                    return (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [
+                            (
+                                header::CONTENT_RANGE.as_str(),
+                                format!("bytes */{total_file_bytes}"),
+                            ),
+                            ("contentFeatures.dlna.org", DLNA_FLAC_FEATURES.to_string()),
+                        ],
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            None
+        };
+
+    let (status, content_len, content_range) = match parsed_range {
+        Some(spec) => {
+            let len = spec.end_inclusive - spec.start + 1;
+            let cr = format!(
+                "bytes {}-{}/{total_file_bytes}",
+                spec.start, spec.end_inclusive
+            );
+            (StatusCode::PARTIAL_CONTENT, len, Some(cr))
+        }
+        None => (StatusCode::OK, total_file_bytes, None),
+    };
+
+    let mut resp_builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "audio/flac")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_LENGTH, content_len.to_string())
+        .header("transferMode.dlna.org", "Streaming")
+        .header("contentFeatures.dlna.org", DLNA_FLAC_FEATURES);
+
+    if let Some(cr) = content_range {
+        resp_builder = resp_builder.header(header::CONTENT_RANGE, cr);
+    }
+
+    if method == Method::HEAD {
+        return resp_builder
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let rx = spawn_flac_byte_stream(session, start_ms, parsed_range);
     let stream_body = Body::from_stream(ReceiverStream::new(rx));
     resp_builder
         .body(stream_body)

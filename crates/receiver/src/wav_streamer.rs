@@ -117,7 +117,7 @@ pub fn parse_http_byte_range(
 
 pub(crate) struct LinearStereoResampler {
     src_rate: u32,
-    pos_in_curr: f64,
+    phase_num: i64,
     prev_frame: Option<(f32, f32)>,
 }
 
@@ -125,7 +125,7 @@ impl LinearStereoResampler {
     pub(crate) fn new(src_rate: u32) -> Self {
         Self {
             src_rate,
-            pos_in_curr: 0.0,
+            phase_num: 0,
             prev_frame: None,
         }
     }
@@ -135,18 +135,20 @@ impl LinearStereoResampler {
             out.extend_from_slice(stereo_in);
             return;
         }
-        let step = f64::from(self.src_rate) / f64::from(BIT_PERFECT_SAMPLE_RATE_HZ);
+        let denom = i64::from(BIT_PERFECT_SAMPLE_RATE_HZ);
+        let step = i64::from(self.src_rate);
         let len = stereo_in.len();
+        let limit = (len as i64) * denom;
         let prev = self.prev_frame.unwrap_or(stereo_in[0]);
 
-        while self.pos_in_curr < len as f64 {
-            let (s0, s1, frac) = if self.pos_in_curr < 0.0 {
-                let f = (self.pos_in_curr + 1.0).clamp(0.0, 1.0) as f32;
+        while self.phase_num < limit {
+            let (s0, s1, frac) = if self.phase_num < 0 {
+                let f = ((self.phase_num + denom) as f32 / denom as f32).clamp(0.0, 1.0);
                 (prev, stereo_in[0], f)
             } else {
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let idx = self.pos_in_curr.floor() as usize;
-                let f = (self.pos_in_curr - idx as f64) as f32;
+                let idx = usize::try_from(self.phase_num / denom).unwrap_or(0);
+                let rem = self.phase_num % denom;
+                let f = (rem as f32) / (denom as f32);
                 let a = stereo_in[idx];
                 let b = if idx + 1 < len { stereo_in[idx + 1] } else { a };
                 (a, b, f)
@@ -154,9 +156,9 @@ impl LinearStereoResampler {
             let l = s0.0 + (s1.0 - s0.0) * frac;
             let r = s0.1 + (s1.1 - s0.1) * frac;
             out.push((l, r));
-            self.pos_in_curr += step;
+            self.phase_num += step;
         }
-        self.pos_in_curr -= len as f64;
+        self.phase_num -= limit;
         self.prev_frame = stereo_in.last().copied();
     }
 }
@@ -194,57 +196,28 @@ pub(crate) fn extract_stereo_frames(decoded: AudioBufferRef<'_>, out_stereo: &mu
     }
 }
 
-/// Spawns an asynchronous `0 dB` `44,100 Hz / 24-bit` WAV byte stream for `session`,
-/// honoring `start_ms` AND optional HTTP byte `range`, and zero-padding any tail shortfall
-/// so `Content-Length` is satisfied to the exact byte.
+/// Spawns an asynchronous `0 dB` `44,100 Hz / 24-bit` signed little-endian (`s24le`) stereo PCM
+/// window stream starting at `start_ms` + `start_frame_offset` frames + `skip_subframe_bytes`,
+/// zero-padding any tail shortfall so `pcm_bytes_to_emit` is satisfied to the exact byte.
 #[must_use]
-pub fn spawn_wav_byte_stream(
+pub(crate) fn spawn_pcm24_window_stream(
     session: Arc<HlsSession>,
     start_ms: u64,
-    range: Option<ByteRangeSpec>,
+    start_frame_offset: u64,
+    skip_subframe_bytes: usize,
+    pcm_bytes_to_emit: u64,
 ) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
 
     tokio::spawn(async move {
-        let playlist = session.playlist_snapshot();
-        let track_dur_ms = session.effective_duration_ms();
-        let pcm_total = compute_total_pcm_bytes(track_dur_ms, start_ms);
-        let total_file_bytes = WAV_HEADER_BYTES + u64::from(pcm_total);
-        let effective_range = range.unwrap_or(ByteRangeSpec {
-            start: 0,
-            end_inclusive: total_file_bytes.saturating_sub(1),
-        });
-
-        let mut remaining_to_emit = effective_range
-            .end_inclusive
-            .saturating_sub(effective_range.start)
-            .saturating_add(1);
-
-        if effective_range.start < WAV_HEADER_BYTES {
-            let hdr = build_wav_header(pcm_total);
-            let hdr_start = usize::try_from(effective_range.start).unwrap_or(0);
-            let hdr_end =
-                usize::try_from((effective_range.end_inclusive + 1).min(WAV_HEADER_BYTES))
-                    .unwrap_or(44);
-            let slice = Bytes::copy_from_slice(&hdr[hdr_start..hdr_end]);
-            let emitted = slice.len() as u64;
-            if tx.send(Ok(slice)).await.is_err() {
-                return;
-            }
-            remaining_to_emit = remaining_to_emit.saturating_sub(emitted);
-        }
-
+        let mut remaining_to_emit = pcm_bytes_to_emit;
         if remaining_to_emit == 0 {
             return;
         }
 
-        let pcm_byte_offset = effective_range.start.saturating_sub(WAV_HEADER_BYTES);
-        let frame_offset = pcm_byte_offset / u64::from(WAV_BLOCK_ALIGN);
-        let skip_subframe_bytes =
-            usize::try_from(pcm_byte_offset % u64::from(WAV_BLOCK_ALIGN)).unwrap_or(0);
-
+        let playlist = session.playlist_snapshot();
         let target_time_secs = (start_ms as f64 / 1000.0)
-            + (frame_offset as f64 / f64::from(BIT_PERFECT_SAMPLE_RATE_HZ));
+            + (start_frame_offset as f64 / f64::from(BIT_PERFECT_SAMPLE_RATE_HZ));
 
         if session.active_descriptor().protocol == PlayableProtocol::Progressive {
             if !stream_progressive_to_wav(
@@ -300,6 +273,69 @@ pub fn spawn_wav_byte_stream(
         }
 
         emit_zero_padding(&tx, &mut remaining_to_emit).await;
+    });
+
+    rx
+}
+
+/// Spawns an asynchronous `0 dB` `44,100 Hz / 24-bit` WAV byte stream for `session`,
+/// honoring `start_ms` AND optional HTTP byte `range`, and zero-padding any tail shortfall
+/// so `Content-Length` is satisfied to the exact byte.
+#[must_use]
+pub fn spawn_wav_byte_stream(
+    session: Arc<HlsSession>,
+    start_ms: u64,
+    range: Option<ByteRangeSpec>,
+) -> mpsc::Receiver<Result<Bytes, std::io::Error>> {
+    let track_dur_ms = session.effective_duration_ms();
+    let pcm_total = compute_total_pcm_bytes(track_dur_ms, start_ms);
+    let total_file_bytes = WAV_HEADER_BYTES + u64::from(pcm_total);
+    let effective_range = range.unwrap_or(ByteRangeSpec {
+        start: 0,
+        end_inclusive: total_file_bytes.saturating_sub(1),
+    });
+
+    let remaining_total = effective_range
+        .end_inclusive
+        .saturating_sub(effective_range.start)
+        .saturating_add(1);
+
+    if effective_range.start >= WAV_HEADER_BYTES {
+        let pcm_byte_offset = effective_range.start - WAV_HEADER_BYTES;
+        let frame_offset = pcm_byte_offset / u64::from(WAV_BLOCK_ALIGN);
+        let skip_subframe_bytes =
+            usize::try_from(pcm_byte_offset % u64::from(WAV_BLOCK_ALIGN)).unwrap_or(0);
+        return spawn_pcm24_window_stream(
+            session,
+            start_ms,
+            frame_offset,
+            skip_subframe_bytes,
+            remaining_total,
+        );
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    tokio::spawn(async move {
+        let mut remaining_to_emit = remaining_total;
+        let hdr = build_wav_header(pcm_total);
+        let hdr_start = usize::try_from(effective_range.start).unwrap_or(0);
+        let hdr_end = usize::try_from((effective_range.end_inclusive + 1).min(WAV_HEADER_BYTES))
+            .unwrap_or(44);
+        let slice = Bytes::copy_from_slice(&hdr[hdr_start..hdr_end]);
+        let emitted = slice.len() as u64;
+        if tx.send(Ok(slice)).await.is_err() {
+            return;
+        }
+        remaining_to_emit = remaining_to_emit.saturating_sub(emitted);
+        if remaining_to_emit == 0 {
+            return;
+        }
+        let mut pcm_rx = spawn_pcm24_window_stream(session, start_ms, 0, 0, remaining_to_emit);
+        while let Some(item) = pcm_rx.recv().await {
+            if tx.send(item).await.is_err() {
+                break;
+            }
+        }
     });
 
     rx

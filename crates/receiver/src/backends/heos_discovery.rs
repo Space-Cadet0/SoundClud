@@ -191,10 +191,21 @@ pub async fn query_heos_cli_player_info(ip: IpAddr, cli_port: u16) -> Option<Heo
         let Some(payload) = parsed.payload else {
             continue;
         };
+        if payload.is_empty() {
+            return None;
+        }
+        let ip_str = ip.to_string();
         if let Some(matching) = payload
             .iter()
-            .find(|p| p.ip.as_deref() == Some(&ip.to_string()))
-            .or_else(|| payload.first())
+            .find(|p| p.ip.as_deref() == Some(ip_str.as_str()))
+            .or_else(|| {
+                if payload.len() == 1 || ip.is_loopback() || payload.iter().all(|p| p.ip.is_none())
+                {
+                    payload.first()
+                } else {
+                    None
+                }
+            })
         {
             return Some(HeosCliPlayerInfo {
                 name: matching.name.clone().filter(|s| !s.trim().is_empty()),
@@ -202,6 +213,7 @@ pub async fn query_heos_cli_player_info(ip: IpAddr, cli_port: u16) -> Option<Heo
                 pid: matching.pid,
             });
         }
+        return None;
     }
     None
 }

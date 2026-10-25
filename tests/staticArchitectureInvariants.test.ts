@@ -575,6 +575,85 @@ describe('Zero-PII & Universal Portability Repository Gate', () => {
       ).toBe(false);
     }
   });
+
+  it('enforces HEOS 0 dB zero-volume/mute invariant, non-rewaking keepalives, and non-empty DIDL-Lite guard across crates/receiver/src', () => {
+    const receiverRustFiles = workspaceSnapshot.textFiles.filter(
+      (file) => file.relativePath.startsWith('crates/receiver/src/') && file.relativePath.endsWith('.rs'),
+    );
+    expect(receiverRustFiles.length).toBeGreaterThanOrEqual(10);
+
+    const byRelPath = new Map(
+      receiverRustFiles.map((file) => [file.relativePath, file.content] as const),
+    );
+
+    const forbiddenVolumeOrMutePatterns: readonly { readonly label: string; readonly regex: RegExp }[] = [
+      { label: 'UPnP RenderingControl', regex: /\bRenderingControl\b/ },
+      { label: 'UPnP SetVolume/SetMute', regex: /\bSet(?:Volume|Mute)\b/ },
+      { label: 'HEOS CLI set_volume/set_mute', regex: /\bset_(?:volume|mute)\b/ },
+      { label: 'Denon/Marantz MCU MV/MU command', regex: /b"(?:MV|MU)[A-Z0-9?]*\\r"/ },
+    ];
+
+    for (const file of receiverRustFiles) {
+      expect(
+        /\bunsafe\b/.test(file.content),
+        `${file.relativePath} must contain zero unsafe blocks`,
+      ).toBe(false);
+
+      // Strip // comments before checking protocol literals so docstrings explaining the ban don't false-trigger.
+      const codeOnly = file.content
+        .split(/\r?\n/)
+        .filter((line) => !line.trimStart().startsWith('//'))
+        .join('\n');
+
+      for (const forbidden of forbiddenVolumeOrMutePatterns) {
+        expect(
+          forbidden.regex.test(codeOnly),
+          `${file.relativePath} must never invoke ${forbidden.label}`,
+        ).toBe(false);
+      }
+    }
+
+    const heosUpnpSrc = byRelPath.get('crates/receiver/src/backends/heos_upnp.rs') ?? '';
+    const heosMcuSrc = byRelPath.get('crates/receiver/src/backends/heos_mcu.rs') ?? '';
+    const heosSoapSrc = byRelPath.get('crates/receiver/src/backends/heos_soap.rs') ?? '';
+    const flacStreamerSrc = byRelPath.get('crates/receiver/src/flac_streamer.rs') ?? '';
+
+    expect(heosUpnpSrc.length).toBeGreaterThan(0);
+    expect(heosMcuSrc.length).toBeGreaterThan(0);
+    expect(heosSoapSrc.length).toBeGreaterThan(0);
+    expect(flacStreamerSrc.length).toBeGreaterThan(0);
+
+    // 1. set_device_power_state_on may ONLY be called inside ensure_device_awake, NEVER inside spawn_poller.
+    const pollerIdx = heosUpnpSrc.indexOf('fn spawn_poller(');
+    expect(pollerIdx).toBeGreaterThan(0);
+    const fromPollerOnward = heosUpnpSrc.slice(pollerIdx);
+    expect(fromPollerOnward.includes('set_device_power_state_on')).toBe(false);
+    expect(fromPollerOnward.includes('activate_host_mcu_zone')).toBe(false);
+
+    // 2. keepalive_host_mcu must never send PWON\r (must respect user/remote PWSTANDBY).
+    const keepaliveFnIdx = heosMcuSrc.indexOf('pub async fn keepalive_host_mcu(');
+    expect(keepaliveFnIdx).toBeGreaterThan(0);
+    const nextPubFnIdx = heosMcuSrc.indexOf('pub async fn ', keepaliveFnIdx + 1);
+    const keepaliveBody =
+      nextPubFnIdx > keepaliveFnIdx
+        ? heosMcuSrc.slice(keepaliveFnIdx, nextPubFnIdx)
+        : heosMcuSrc.slice(keepaliveFnIdx);
+    expect(keepaliveBody.includes('b"PWON\\r"')).toBe(false);
+    expect(keepaliveBody.includes('McuPowerStatus::Standby')).toBe(true);
+
+    // 3. last_keepalive_at must use get_or_insert_with in load() and never be reset in seek().
+    expect(heosUpnpSrc.includes('last_keepalive_at.get_or_insert_with(Instant::now)')).toBe(true);
+    const seekFnIdx = heosUpnpSrc.indexOf('fn seek(&self,');
+    const stopFnIdx = heosUpnpSrc.indexOf('fn preload_next(&self,');
+    expect(seekFnIdx).toBeGreaterThan(0);
+    expect(stopFnIdx).toBeGreaterThan(seekFnIdx);
+    const seekBody = heosUpnpSrc.slice(seekFnIdx, stopFnIdx);
+    expect(seekBody.includes('last_keepalive_at')).toBe(false);
+
+    // 4. avt_set_transport_uri must reject empty CurrentURIMetaData and sanitize literal "" titles/artists.
+    expect(heosSoapSrc.includes('if didl_lite.trim().is_empty()')).toBe(true);
+    expect(flacStreamerSrc.includes("trim_matches('\"')")).toBe(true);
+  });
 });
 
 describe('Cross-OS Temp Directory Discipline', () => {

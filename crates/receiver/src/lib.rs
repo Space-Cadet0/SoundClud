@@ -3,13 +3,14 @@
 //! Unified multi-output `0 dB` bit-perfect audio receiver daemon (`v1`) for SoundClud.
 //!
 //! Combines `LocalMpvBackend` (`44,100 Hz` CoreAudio/TOSLINK S/PDIF & ALSA),
-//! `HeosUpnpBackend` (Universal Denon/Marantz HEOS Direct `ACT:1` + `AVTransport` WAV),
+//! `HeosUpnpBackend` (Universal Denon/Marantz HEOS Direct `ACT:1` + `AVTransport` FLAC/WAV),
 //! and a shared origin-scoped Go+ HLS/AES-128 RAM proxy.
 
 pub mod backends;
 pub mod cli;
 pub mod coordinator;
 pub mod discovery;
+pub mod flac_streamer;
 pub mod hls_fetch;
 pub mod hls_proxy;
 pub mod m3u8;

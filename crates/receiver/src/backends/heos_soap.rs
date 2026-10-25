@@ -1,3 +1,5 @@
+use crate::flac_streamer::sanitize_display_text;
+pub use crate::flac_streamer::DLNA_FLAC_FEATURES;
 use crate::protocol::{StandbyState, TrackMetadata};
 pub use crate::wav_streamer::DLNA_WAV_FEATURES;
 use crate::wav_streamer::{MAX_WAV_WINDOW_DURATION_MS, WAV_BYTE_RATE, WAV_HEADER_BYTES};
@@ -100,18 +102,8 @@ pub fn build_didl_lite_metadata(
     start_ms: u64,
     pcm_bytes: u32,
 ) -> String {
-    let raw_title = track.title.trim();
-    let title = xml_escape(if raw_title.is_empty() {
-        "SoundCloud Track"
-    } else {
-        raw_title
-    });
-    let raw_artist = track.artist.trim();
-    let artist = xml_escape(if raw_artist.is_empty() {
-        "SoundCloud"
-    } else {
-        raw_artist
-    });
+    let title = xml_escape(sanitize_display_text(&track.title, "SoundCloud Track"));
+    let artist = xml_escape(sanitize_display_text(&track.artist, "SoundCloud"));
     let url_esc = xml_escape(stream_url);
 
     let rem_ms = track.duration_ms.saturating_sub(start_ms);
@@ -147,6 +139,49 @@ pub fn build_didl_lite_metadata(
          <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
          <res protocolInfo=\"http-get:*:audio/wav:{DLNA_WAV_FEATURES}\" size=\"{total_file_bytes}\" \
          bitrate=\"264600\" bitsPerSample=\"24\" sampleFrequency=\"44100\" \
+         nrAudioChannels=\"2\" duration=\"{dur}\">{url_esc}</res>\
+         </item></DIDL-Lite>",
+        xml_escape(&track.track_id)
+    )
+}
+
+/// Builds DLNA-compliant UPnP `DIDL-Lite` XML for Denon/Marantz front-panel OLED display
+/// and seekable (`DLNA.ORG_OP=01`) `0 dB` `44,100 Hz / 24-bit` FLAC transport.
+#[must_use]
+pub fn build_flac_didl_lite_metadata(
+    track: &TrackMetadata,
+    stream_url: &str,
+    total_file_bytes: u64,
+    duration_ms: u64,
+) -> String {
+    let title = xml_escape(sanitize_display_text(&track.title, "SoundCloud Track"));
+    let artist = xml_escape(sanitize_display_text(&track.artist, "SoundCloud"));
+    let url_esc = xml_escape(stream_url);
+    let dur = format_upnp_duration(duration_ms);
+
+    let art_tag = track
+        .artwork_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map_or_else(String::new, |art| {
+            format!("<upnp:albumArtURI>{}</upnp:albumArtURI>", xml_escape(art))
+        });
+
+    format!(
+        "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+         xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
+         <item id=\"sc_{}\" parentID=\"0\" restricted=\"1\">\
+         <dc:title>{title}</dc:title>\
+         <dc:creator>{artist}</dc:creator>\
+         <upnp:artist>{artist}</upnp:artist>\
+         <upnp:album>SoundCloud</upnp:album>\
+         <upnp:genre>Music</upnp:genre>\
+         {art_tag}\
+         <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
+         <res protocolInfo=\"http-get:*:audio/flac:{DLNA_FLAC_FEATURES}\" size=\"{total_file_bytes}\" \
+         bitrate=\"2116800\" bitsPerSample=\"24\" sampleFrequency=\"44100\" \
          nrAudioChannels=\"2\" duration=\"{dur}\">{url_esc}</res>\
          </item></DIDL-Lite>",
         xml_escape(&track.track_id)
@@ -231,6 +266,9 @@ pub async fn avt_set_transport_uri(
     stream_url: &str,
     didl_lite: &str,
 ) -> Result<(), String> {
+    if didl_lite.trim().is_empty() {
+        return Err("refusing SetAVTransportURI with empty CurrentURIMetaData".to_string());
+    }
     let args = format!(
         "<InstanceID>0</InstanceID><CurrentURI>{}</CurrentURI><CurrentURIMetaData>{}</CurrentURIMetaData>",
         xml_escape(stream_url),

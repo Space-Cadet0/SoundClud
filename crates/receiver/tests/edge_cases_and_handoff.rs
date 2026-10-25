@@ -330,7 +330,7 @@ async fn emits_track_ended_and_preloads_next_on_local_mpv_and_reanchors_heos_see
     assert_eq!(head_resp.status().as_u16(), 200);
     assert_eq!(
         head_resp.headers().get("content-type").unwrap(),
-        "audio/wav"
+        "audio/flac"
     );
 
     server.coordinator().seek(4, 1_500).await.unwrap();

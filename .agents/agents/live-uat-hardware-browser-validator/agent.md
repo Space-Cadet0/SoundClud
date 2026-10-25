@@ -29,5 +29,5 @@ Your role closes the simulation-vs-reality gap after offline unit/chaos gates (`
      3. Multi-codec coverage (`aac_256k` Go+ AAC-LC, HE-AAC `mp4a.40.5` fallback to MP3/native decode, progressive MP3).
      4. Consecutive track-to-track transitions (clicking Track A -> Track B -> Track C + Next/Prev).
      5. Waveform scrubbing & 1+ hour DJ mix random-access seeking (`<1.5s` seek convergence without sequential segment decode).
-     6. HEOS front-panel OLED metadata (`Track Title`, `Artist`, finite duration vs `∞`, `Pause,Seek` enabled in `CurrentTransportActions`) and active Host-MCU zone state preventing 15-minute Auto-Standby shutdown.
+     6. HEOS front-panel OLED metadata & anti-Auto-Standby soak: verify bound `heos_pid` (`get_players` non-empty), `get_now_playing_media` (`song` & `artist` populated, zero `""`), `GetPositionInfo.TrackDuration > 0` (finite duration via `SUBFRAME_VERBATIM` 24-bit FLAC, zero `∞`), `Pause,Seek` enabled in `CurrentTransportActions`, and continuous >15-minute playback soak confirming `PW? == PWON` with zero EU ErP 15-minute Auto-Standby countdown or shutdown.
 3. Report empirical measurements, redacted protocol responses, and clear PASS/FAIL verdicts via `send_message`.

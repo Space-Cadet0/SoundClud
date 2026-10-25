@@ -207,6 +207,8 @@ async fn caps_2gib_window_zero_pads_exact_content_length_and_deduplicates_pcm_ca
 }
 
 struct MockAiosState {
+    act_power_on: AtomicBool,
+    set_power_calls: AtomicUsize,
     transitioning_left: AtomicUsize,
     fail_first_play: AtomicBool,
     mid_track_stopped: AtomicBool,
@@ -218,16 +220,27 @@ struct MockAiosState {
 async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_token_retention() {
     let temp = tempfile::tempdir().unwrap();
 
-    // 1. Mock HEOS CLI (:1255) sending "command under process" before payload
+    // Shared MCU state so mock CLI can simulate standby `payload: []` -> post-wake `pid: 7` binding!
+    let remote_powered_off = Arc::new(AtomicBool::new(false));
+    let mcu_powered = Arc::new(AtomicBool::new(false));
+    let mcu_net_selected = Arc::new(AtomicBool::new(false));
+    let post_wake_empty_players_left = Arc::new(AtomicUsize::new(1));
+
+    // 1. Mock HEOS CLI (:1255): returns `payload: []` while in standby and on first post-wake poll,
+    //    then returns `"command under process"` + `pid: 7` so `resolve_heos_player_pid` retries & binds!
     let cli_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .unwrap();
     let cli_port = cli_listener.local_addr().unwrap().port();
     let cli_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cli_log_bg = cli_log.clone();
+    let cli_mcu_pwr = mcu_powered.clone();
+    let cli_empty_left = post_wake_empty_players_left.clone();
     let cli_task = tokio::spawn(async move {
         while let Ok((stream, _)) = cli_listener.accept().await {
             let log_ref = cli_log_bg.clone();
+            let pwr_ref = cli_mcu_pwr.clone();
+            let empty_ref = cli_empty_left.clone();
             tokio::spawn(async move {
                 let (r, mut w) = stream.into_split();
                 let mut lines = BufReader::new(r).lines();
@@ -241,10 +254,23 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
                                 "message": "command under process"
                             }
                         });
-                        let ready = json!({
-                            "heos": { "command": "player/get_players", "result": "success" },
-                            "payload": [{ "name": "Studio Amp", "pid": 7, "model": "Network Amp", "ip": "127.0.0.1" }]
-                        });
+                        let ready = if !pwr_ref.load(Ordering::SeqCst) {
+                            json!({
+                                "heos": { "command": "player/get_players", "result": "success" },
+                                "payload": []
+                            })
+                        } else if empty_ref.load(Ordering::SeqCst) > 0 {
+                            empty_ref.fetch_sub(1, Ordering::SeqCst);
+                            json!({
+                                "heos": { "command": "player/get_players", "result": "success" },
+                                "payload": []
+                            })
+                        } else {
+                            json!({
+                                "heos": { "command": "player/get_players", "result": "success" },
+                                "payload": [{ "name": "Studio Amp", "pid": 7, "model": "Network Amp", "ip": "127.0.0.1" }]
+                            })
+                        };
                         let _ = w
                             .write_all(format!("{pending}\r\n{ready}\r\n").as_bytes())
                             .await;
@@ -258,22 +284,22 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
         }
     });
 
-    // 2. Mock Host-MCU (:23 CR-framed) starting in PWSTANDBY + SITV, then entering PWSTANDBY later
+    // 2. Mock Host-MCU (:23 CR-framed) starting in PWSTANDBY + SITV + SLPOFF
     let mcu_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
         .await
         .unwrap();
     let mcu_port = mcu_listener.local_addr().unwrap().port();
     let mcu_cmds: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let mcu_cmds_bg = mcu_cmds.clone();
-    let remote_powered_off = Arc::new(AtomicBool::new(false));
     let remote_off_bg = remote_powered_off.clone();
-    let mcu_powered = Arc::new(AtomicBool::new(false));
     let mcu_pwr_bg = mcu_powered.clone();
+    let mcu_net_bg = mcu_net_selected.clone();
     let mcu_task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = mcu_listener.accept().await {
             let cmds_ref = mcu_cmds_bg.clone();
             let pwr_ref = mcu_pwr_bg.clone();
             let off_ref = remote_off_bg.clone();
+            let net_ref = mcu_net_bg.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 128];
                 while let Ok(n) = stream.read(&mut buf).await {
@@ -302,10 +328,19 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
                                 let _ = stream.write_all(b"PWON\r").await;
                             }
                             "SI?" => {
-                                let _ = stream.write_all(b"SITV\r").await;
+                                let reply = if net_ref.load(Ordering::SeqCst) {
+                                    b"SINET\r".as_slice()
+                                } else {
+                                    b"SITV\r".as_slice()
+                                };
+                                let _ = stream.write_all(reply).await;
                             }
                             "SINET" => {
+                                net_ref.store(true, Ordering::SeqCst);
                                 let _ = stream.write_all(b"SINET\r").await;
+                            }
+                            "SLP?" | "SLPOFF" => {
+                                let _ = stream.write_all(b"SLPOFF\r").await;
                             }
                             _ => {}
                         }
@@ -315,8 +350,10 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
         }
     });
 
-    // 3. Mock UPnP AVTransport server
+    // 3. Mock UPnP ACT + AVTransport server
     let aios = Arc::new(MockAiosState {
+        act_power_on: AtomicBool::new(false),
+        set_power_calls: AtomicUsize::new(0),
         transitioning_left: AtomicUsize::new(1),
         fail_first_play: AtomicBool::new(true),
         mid_track_stopped: AtomicBool::new(false),
@@ -333,10 +370,28 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
             "/desc.xml",
             get(move || async move {
                 format!(
-                    "<root><device><UDN>uuid:resilient-unit-01</UDN><friendlyName>Fallback</friendlyName>\
-                     <serviceList><service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\
-                     <controlURL>http://{upnp_addr}/AVT</controlURL></service></serviceList></device></root>"
+                    "<root><device><UDN>uuid:resilient-unit-01</UDN><friendlyName>Studio Amp</friendlyName>\
+                     <serviceList>\
+                     <service><serviceType>urn:schemas-denon-com:service:ACT:1</serviceType>\
+                     <controlURL>http://{upnp_addr}/ACT</controlURL></service>\
+                     <service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>\
+                     <controlURL>http://{upnp_addr}/AVT</controlURL></service>\
+                     </serviceList></device></root>"
                 )
+            }),
+        )
+        .route(
+            "/ACT",
+            post(|State(st): State<Arc<MockAiosState>>, headers: HeaderMap, body: String| async move {
+                let act = headers.get("soapaction").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                st.actions.lock().unwrap().push(act.clone());
+                if act.contains("SetDevicePowerState") && body.contains("<devicePower>ON</devicePower>") {
+                    st.set_power_calls.fetch_add(1, Ordering::SeqCst);
+                    st.act_power_on.store(true, Ordering::SeqCst);
+                    return (StatusCode::OK, "<s:Envelope><s:Body><u:SetDevicePowerStateResponse/></s:Body></s:Envelope>".to_string());
+                }
+                let pwr = if st.act_power_on.load(Ordering::SeqCst) { "ON" } else { "OFF" };
+                (StatusCode::OK, format!("<s:Envelope><s:Body><devicePower>{pwr}</devicePower></s:Body></s:Envelope>"))
             }),
         )
         .route(
@@ -482,16 +537,29 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
     assert_eq!(tel.phase, PlaybackPhase::Playing);
     assert_eq!(tel.stream_info.unwrap().preset, "mp3_1_0");
     let track1_uri = aios.uris.lock().unwrap().last().cloned().unwrap();
+    assert!(track1_uri.contains("/stream.flac?start_ms=0"));
 
-    // Verify Host-MCU (:23) woke PWON + SINET with ZERO volume commands!
+    // Verify Host-MCU (:23) woke FIRST (`PW? -> PWON -> SI? -> SINET -> SLP? -> SLPOFF`),
+    // ACT SetDevicePowerState("ON") ran once for initial wake, and CLI bound `pid = 7`!
+    assert_eq!(aios.set_power_calls.load(Ordering::SeqCst), 1);
     {
         let cmds = mcu_cmds.lock().unwrap().clone();
-        assert!(cmds.contains(&"PWON".to_string()));
-        assert!(cmds.contains(&"SINET".to_string()));
+        assert_eq!(
+            &cmds[..6],
+            &["PW?", "PWON", "SI?", "SINET", "SLP?", "SLPOFF"]
+        );
         assert!(!cmds
             .iter()
             .any(|c| c.starts_with("MV") || c.starts_with("MU")));
     }
+    assert!(
+        cli_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "heos://player/set_play_state?pid=7&state=play"),
+        "must retry get_players past empty payload:[] and assert play state for pid=7"
+    );
 
     // Verify Pause SOAP 500 falls back to Stop + Paused and Resume re-anchors cleanly
     server.coordinator().set_paused(2, true).await.unwrap();
@@ -522,12 +590,66 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
     let reanchored_uri = aios.uris.lock().unwrap().last().cloned().unwrap();
     assert!(reanchored_uri.ends_with("?start_ms=9000000"));
 
-    // Mid-track STOPPED at 0:05 of 1:00 must NOT prematurely end playback;
-    // then remote PWSTANDBY on :23 must transition receiver cleanly to Idle!
+    // Verify keepalive timer persists across poller respawns (`seek` every 55ms < 120ms keepalive_interval)
+    // and sends `SLPOFF` + `set_play_state?pid=7&state=play` with ZERO `SetDevicePowerState` calls!
+    let slpoff_before = mcu_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "SLPOFF")
+        .count();
+    let heartbeat_before = cli_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.contains("heart_beat"))
+        .count();
+    for step in 0..3u64 {
+        tokio::time::sleep(Duration::from_millis(55)).await;
+        server
+            .coordinator()
+            .seek(10 + step, 9_001_000 + step * 1_000)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    let slpoff_after = mcu_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "SLPOFF")
+        .count();
+    let heartbeat_after = cli_log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.contains("heart_beat"))
+        .count();
+    assert!(
+        slpoff_after > slpoff_before && heartbeat_after > heartbeat_before,
+        "keepalive must fire across rapid seek poller respawns without starvation"
+    );
+    assert_eq!(
+        aios.set_power_calls.load(Ordering::SeqCst),
+        1,
+        "keepalive while Playing must NEVER call ACT SetDevicePowerState"
+    );
+
+    // Mid-track STOPPED while still PWON at 0:05 of 1:00 must NOT prematurely end playback;
+    // then remote PWSTANDBY on :23 must transition receiver cleanly to Idle WITHOUT re-waking!
     aios.mid_track_stopped.store(true, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_millis(140)).await;
-    aios.mid_track_stopped.store(false, Ordering::SeqCst);
+    assert_eq!(
+        server.coordinator().telemetry_snapshot().phase,
+        PlaybackPhase::Playing
+    );
 
+    let pwon_before_standby = mcu_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "PWON")
+        .count();
     remote_powered_off.store(true, Ordering::SeqCst);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
@@ -539,6 +661,23 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
     })
     .await
     .expect("remote standby transitions receiver to Idle");
+    aios.mid_track_stopped.store(false, Ordering::SeqCst);
+
+    let pwon_after_standby = mcu_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "PWON")
+        .count();
+    assert_eq!(
+        pwon_after_standby, pwon_before_standby,
+        "must NEVER send PWON when amplifier enters standby"
+    );
+    assert_eq!(
+        aios.set_power_calls.load(Ordering::SeqCst),
+        1,
+        "must NEVER call SetDevicePowerState when amplifier enters standby"
+    );
 
     // Failed load_track must surface PlaybackPhase::Error in telemetry_snapshot()
     let mut bad_loc = make_loc("bad");

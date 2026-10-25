@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
-import type { AddressInfo } from 'node:net';
+import net, { type AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -1447,6 +1447,886 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
         expect(Number(decodedCountStr)).toBeGreaterThanOrEqual(1);
       } finally {
         await daemon.stop();
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  it(
+    'adversarially verifies live /heos/{token}/stream.flac RFC 9639 SUBFRAME_VERBATIM 24-bit framing, CRC-8/CRC-16, SEEKTABLE, VORBIS_COMMENT, HTTP 206 byte ranges, macOS CoreAudio afinfo/afconvert, and Host-MCU anti-standby invariants',
+    async () => {
+      const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-heos-flac-qa-'));
+      const openTcpSockets = new Set<net.Socket>();
+      const trackSockets = (srv: net.Server): void => {
+        srv.on('connection', (sock) => {
+          openTcpSockets.add(sock);
+          sock.once('close', () => {
+            openTcpSockets.delete(sock);
+          });
+        });
+      };
+
+      // 1. Mock Host-MCU (:23 CR-framed) starting in PWSTANDBY + SITV + SLPOFF
+      const mcuCommands: string[] = [];
+      let mcuPoweredOn = false;
+      let mcuNetSelected = false;
+      let forceRemoteStandby = false;
+
+      const mcuServer = net.createServer((sock) => {
+        let rxBuf = '';
+        sock.on('data', (chunk: Buffer) => {
+          rxBuf += chunk.toString('utf8');
+          let crIdx: number;
+          while ((crIdx = rxBuf.indexOf('\r')) !== -1) {
+            const cmd = rxBuf.slice(0, crIdx).trim();
+            rxBuf = rxBuf.slice(crIdx + 1);
+            if (cmd.length === 0) {
+              continue;
+            }
+            mcuCommands.push(cmd);
+            if (cmd === 'PW?') {
+              sock.write(forceRemoteStandby || !mcuPoweredOn ? 'PWSTANDBY\r' : 'PWON\r');
+            } else if (cmd === 'PWON') {
+              mcuPoweredOn = true;
+              sock.write('PWON\r');
+            } else if (cmd === 'SI?') {
+              sock.write(mcuNetSelected ? 'SINET\r' : 'SITV\r');
+            } else if (cmd === 'SINET') {
+              mcuNetSelected = true;
+              sock.write('SINET\r');
+            } else if (cmd === 'SLP?' || cmd === 'SLPOFF') {
+              sock.write('SLPOFF\r');
+            }
+          }
+        });
+      });
+      trackSockets(mcuServer);
+
+      // 2. Mock HEOS CLI (:1255 CRLF JSON) simulating async "command under process" + pid 99
+      const cliCommands: string[] = [];
+      const cliServer = net.createServer((sock) => {
+        let rxBuf = '';
+        sock.on('data', (chunk: Buffer) => {
+          rxBuf += chunk.toString('utf8');
+          let nlIdx: number;
+          while ((nlIdx = rxBuf.indexOf('\n')) !== -1) {
+            const line = rxBuf.slice(0, nlIdx).trim();
+            rxBuf = rxBuf.slice(nlIdx + 1);
+            if (line.length === 0) {
+              continue;
+            }
+            cliCommands.push(line);
+            if (line.includes('get_players')) {
+              const underProc = JSON.stringify({
+                heos: {
+                  command: 'player/get_players',
+                  result: 'success',
+                  message: 'command under process',
+                },
+              });
+              const ready = JSON.stringify({
+                heos: { command: 'player/get_players', result: 'success' },
+                payload: mcuPoweredOn
+                  ? [
+                      {
+                        name: 'Synthetic Reference Amp',
+                        pid: 99,
+                        model: 'Reference Network Amp',
+                        ip: '127.0.0.1',
+                      },
+                    ]
+                  : [],
+              });
+              sock.write(`${underProc}\r\n${ready}\r\n`);
+            } else {
+              sock.write('{"heos":{"result":"success"}}\r\n');
+            }
+          }
+        });
+      });
+      trackSockets(cliServer);
+
+      // 3. Mock HEOS UPnP ACT:1 + AVTransport:1 + RenderingControl:1 trap server
+      let actPowerOn = false;
+      let setPowerStateOnCalls = 0;
+      let renderingControlHits = 0;
+      let emptyMetadataViolations = 0;
+      const soapActions: string[] = [];
+      let capturedStreamUri = '';
+      let capturedDidlXml = '';
+
+      const xmlUnescape = (raw: string): string =>
+        raw
+          .replaceAll('&lt;', '<')
+          .replaceAll('&gt;', '>')
+          .replaceAll('&quot;', '"')
+          .replaceAll('&apos;', "'")
+          .replaceAll('&amp;', '&');
+
+      const extractXmlTag = (xml: string, tag: string): string | null => {
+        const re = new RegExp(`<(?:[a-zA-Z0-9]+:)?${tag}[^>]*>([\\s\\S]*?)<\\/(?:[a-zA-Z0-9]+:)?${tag}>`);
+        const match = re.exec(xml);
+        return match?.[1] !== undefined ? xmlUnescape(match[1].trim()) : null;
+      };
+
+      const upnpServer = http.createServer((req, res) => {
+        const addr = upnpServer.address() as AddressInfo;
+        const base = `http://127.0.0.1:${String(addr.port)}`;
+        if (req.method === 'GET' && req.url === '/desc.xml') {
+          res.writeHead(200, { 'content-type': 'text/xml; charset="utf-8"' });
+          res.end(
+            `<?xml version="1.0"?><root xmlns="urn:schemas-upnp-org:device-1-0"><device>` +
+              `<deviceType>urn:schemas-denon-com:device:ACT-Denon:1</deviceType>` +
+              `<friendlyName>Synthetic Reference Amp</friendlyName>` +
+              `<modelName>Reference Network Amp</modelName>` +
+              `<UDN>uuid:synthetic-adversarial-heos-qa</UDN>` +
+              `<serviceList>` +
+              `<service><serviceType>urn:schemas-denon-com:service:ACT:1</serviceType><controlURL>${base}/ACT</controlURL></service>` +
+              `<service><serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType><controlURL>${base}/AVT</controlURL></service>` +
+              `<service><serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType><controlURL>${base}/RC</controlURL></service>` +
+              `</serviceList></device></root>`,
+          );
+          return;
+        }
+
+        const chunks: Buffer[] = [];
+        req.on('data', (c: Buffer) => chunks.push(c));
+        req.on('end', () => {
+          const body = Buffer.concat(chunks).toString('utf8');
+          const soapAction = String(req.headers['soapaction'] ?? '');
+          soapActions.push(soapAction);
+
+          if (req.url === '/RC') {
+            renderingControlHits += 1;
+            res.writeHead(500).end();
+            return;
+          }
+          if (req.url === '/ACT') {
+            if (soapAction.includes('SetDevicePowerState') && body.includes('<devicePower>ON</devicePower>')) {
+              setPowerStateOnCalls += 1;
+              actPowerOn = true;
+              res.writeHead(200, { 'content-type': 'text/xml' });
+              res.end('<s:Envelope><s:Body><u:SetDevicePowerStateResponse/></s:Body></s:Envelope>');
+              return;
+            }
+            const pwr = actPowerOn ? 'ON' : 'OFF';
+            res.writeHead(200, { 'content-type': 'text/xml' });
+            res.end(`<s:Envelope><s:Body><devicePower>${pwr}</devicePower></s:Body></s:Envelope>`);
+            return;
+          }
+          if (req.url === '/AVT') {
+            if (soapAction.includes('#SetAVTransportURI')) {
+              const uri = extractXmlTag(body, 'CurrentURI') ?? '';
+              const didl = extractXmlTag(body, 'CurrentURIMetaData') ?? '';
+              if (didl.trim().length === 0) {
+                emptyMetadataViolations += 1;
+              }
+              capturedStreamUri = uri;
+              capturedDidlXml = didl;
+            } else if (soapAction.includes('#GetPositionInfo')) {
+              res.writeHead(200, { 'content-type': 'text/xml' });
+              res.end(
+                `<s:Envelope><s:Body><TrackURI>${capturedStreamUri}</TrackURI><RelTime>00:00:02</RelTime><TrackDuration>00:00:13</TrackDuration></s:Body></s:Envelope>`,
+              );
+              return;
+            } else if (soapAction.includes('#GetTransportInfo')) {
+              res.writeHead(200, { 'content-type': 'text/xml' });
+              res.end(
+                '<s:Envelope><s:Body><CurrentTransportState>PLAYING</CurrentTransportState></s:Body></s:Envelope>',
+              );
+              return;
+            }
+            res.writeHead(200, { 'content-type': 'text/xml' });
+            res.end('<s:Envelope><s:Body><u:Ok/></s:Body></s:Envelope>');
+            return;
+          }
+          res.writeHead(404).end();
+        });
+      });
+      trackSockets(upnpServer);
+
+      // 4. Synthetic HLS server serving 13.0s (2 x 6.5s = 573,300 frames -> 140 FLAC blocks > 128 UTF-8 boundary!)
+      //    Asymmetric Left (+16384 -> +0x400000 in I24) and Right (-8192 -> -0x200000 in I24) to catch any channel/endian swap.
+      const buildStereoWav16 = (sampleRate: number, frames: number, left16: number, right16: number): Buffer => {
+        const dataLen = frames * 4;
+        const buf = Buffer.allocUnsafe(44 + dataLen);
+        buf.write('RIFF', 0, 'ascii');
+        buf.writeUInt32LE(36 + dataLen, 4);
+        buf.write('WAVEfmt ', 8, 'ascii');
+        buf.writeUInt32LE(16, 16);
+        buf.writeUInt16LE(1, 20);
+        buf.writeUInt16LE(2, 22);
+        buf.writeUInt32LE(sampleRate, 24);
+        buf.writeUInt32LE(sampleRate * 4, 28);
+        buf.writeUInt16LE(4, 32);
+        buf.writeUInt16LE(16, 34);
+        buf.write('data', 36, 'ascii');
+        buf.writeUInt32LE(dataLen, 40);
+        for (let i = 0; i < frames; i += 1) {
+          const off = 44 + i * 4;
+          buf.writeInt16LE(left16, off);
+          buf.writeInt16LE(right16, off + 2);
+        }
+        return buf;
+      };
+
+      const segFrames = 286_650; // 6.5s * 44,100 Hz
+      const wavSegBuf = buildStereoWav16(44_100, segFrames, 16_384, -8_192);
+
+      const hlsServer = http.createServer((req, res) => {
+        const addr = hlsServer.address() as AddressInfo;
+        const origin = `http://127.0.0.1:${String(addr.port)}`;
+        if (req.url === '/playlist.m3u8') {
+          res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+          res.end(
+            `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:7\n` +
+              `#EXTINF:6.500000,\n${origin}/seg0.wav\n` +
+              `#EXTINF:6.500000,\n${origin}/seg1.wav\n` +
+              `#EXT-X-ENDLIST\n`,
+          );
+          return;
+        }
+        if (req.url === '/seg0.wav' || req.url === '/seg1.wav') {
+          res.writeHead(200, { 'content-type': 'audio/wav' });
+          res.end(wavSegBuf);
+          return;
+        }
+        res.writeHead(404).end();
+      });
+      trackSockets(hlsServer);
+
+      await Promise.all([
+        new Promise<void>((r) => mcuServer.listen(0, '127.0.0.1', () => r())),
+        new Promise<void>((r) => cliServer.listen(0, '127.0.0.1', () => r())),
+        new Promise<void>((r) => upnpServer.listen(0, '127.0.0.1', () => r())),
+        new Promise<void>((r) => hlsServer.listen(0, '127.0.0.1', () => r())),
+      ]);
+
+      const mcuPort = (mcuServer.address() as AddressInfo).port;
+      const cliPort = (cliServer.address() as AddressInfo).port;
+      const upnpPort = (upnpServer.address() as AddressInfo).port;
+      const hlsPort = (hlsServer.address() as AddressInfo).port;
+
+      // 5. Compile & spawn ephemeral Rust harness linking libsoundclud_receiver with loopback HeosDiscoverySeed
+      const homeDir = os.homedir();
+      const cargoBin = path.join(homeDir, '.cargo', 'bin');
+      const rustEnv = {
+        ...process.env,
+        PATH: `${cargoBin}${path.delimiter}${process.env['PATH'] ?? ''}`,
+      };
+      const cargoJson = execFileSync(
+        'cargo',
+        ['build', '--offline', '--message-format=json', '-p', 'soundclud-receiver', '--lib'],
+        { cwd: REPO_ROOT, env: rustEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+
+      let receiverRlib = '';
+      let tokioRlib = '';
+      for (const line of cargoJson.trim().split(/\r?\n/)) {
+        if (!line.startsWith('{')) {
+          continue;
+        }
+        const msg = JSON.parse(line) as {
+          readonly reason?: string;
+          readonly target?: { readonly name?: string };
+          readonly filenames?: readonly string[];
+        };
+        if (msg.reason === 'compiler-artifact' && Array.isArray(msg.filenames)) {
+          const rlib = msg.filenames.find((f) => f.endsWith('.rlib'));
+          if (rlib !== undefined && msg.target?.name === 'soundclud_receiver') {
+            receiverRlib = rlib;
+          } else if (rlib !== undefined && msg.target?.name === 'tokio') {
+            tokioRlib = rlib;
+          }
+        }
+      }
+      expect(receiverRlib.length).toBeGreaterThan(0);
+      expect(tokioRlib.length).toBeGreaterThan(0);
+
+      const harnessRsPath = path.join(tmpRoot, 'heos_qa_daemon.rs');
+      const harnessBinPath = path.join(tmpRoot, 'heos_qa_daemon');
+      const stateDir = path.join(tmpRoot, 'state');
+      await fsp.mkdir(stateDir, { recursive: true, mode: 0o700 });
+
+      const harnessSource = [
+        'use soundclud_receiver::backends::heos_discovery::HeosDiscoverySeed;',
+        'use soundclud_receiver::{ReceiverDaemonConfig, ReceiverServer};',
+        'use std::io::Read;',
+        'use std::net::{IpAddr, Ipv4Addr, SocketAddr};',
+        'use std::path::PathBuf;',
+        'use std::time::Duration;',
+        'fn main() {',
+        '  let args: Vec<String> = std::env::args().collect();',
+        '  let state_dir = PathBuf::from(&args[1]);',
+        '  let desc_url = args[2].clone();',
+        '  let cli_port: u16 = args[3].parse().unwrap();',
+        '  let mcu_port: u16 = args[4].parse().unwrap();',
+        '  let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();',
+        '  rt.block_on(async move {',
+        '    let mut cfg = ReceiverDaemonConfig {',
+        '      bind_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),',
+        '      state_dir,',
+        '      receiver_name: Some("HEOS QA Receiver".to_string()),',
+        '      enable_lan_discovery: false,',
+        '      ..Default::default()',
+        '    };',
+        '    cfg.local_mpv.spawn_mpv_process = false;',
+        '    cfg.local_mpv.injected_outputs = Some(Vec::new());',
+        '    cfg.heos.enable_lan_multicast = false;',
+        '    cfg.heos.poll_interval = Duration::from_millis(40);',
+        '    cfg.heos.keepalive_interval = Duration::from_millis(140);',
+        '    cfg.heos.mcu_port_override = Some(mcu_port);',
+        '    cfg.heos.discovery_seeds = vec![HeosDiscoverySeed { description_url: desc_url, cli_port }];',
+        '    let srv = ReceiverServer::start(cfg).await.unwrap();',
+        '    println!("listen={}", srv.local_addr());',
+        '    let _ = tokio::task::spawn_blocking(|| {',
+        '      let mut b = [0u8; 1];',
+        '      let _ = std::io::stdin().read(&mut b);',
+        '    }).await;',
+        '    srv.shutdown().await;',
+        '  });',
+        '}',
+        '',
+      ].join('\n');
+      await fsp.writeFile(harnessRsPath, harnessSource, 'utf8');
+
+      execFileSync(
+        'rustc',
+        [
+          '--edition=2021',
+          '-L',
+          `dependency=${path.join(REPO_ROOT, 'target', 'debug', 'deps')}`,
+          '--extern',
+          `soundclud_receiver=${receiverRlib}`,
+          '--extern',
+          `tokio=${tokioRlib}`,
+          harnessRsPath,
+          '-o',
+          harnessBinPath,
+        ],
+        { cwd: REPO_ROOT, env: rustEnv, stdio: 'pipe' },
+      );
+
+      const receiverChild = spawn(
+        harnessBinPath,
+        [stateDir, `http://127.0.0.1:${String(upnpPort)}/desc.xml`, String(cliPort), String(mcuPort)],
+        { cwd: REPO_ROOT, stdio: ['pipe', 'pipe', 'pipe'] },
+      );
+
+      const extFetch = createExtensionOriginFetch(SYNTHETIC_EXTENSION_ORIGIN);
+      const wsFactory = createObservedExtensionWebSocketFactory(SYNTHETIC_EXTENSION_ORIGIN);
+      const storage = {
+        local: createInMemoryStorageArea(),
+        session: createInMemoryStorageArea(),
+      };
+      const controller = new ReceiverWsController({
+        storage,
+        fetchImpl: extFetch,
+        createWebSocket: wsFactory.createWebSocket,
+        onStateChanged: () => undefined,
+        onForwardToMain: () => undefined,
+      });
+
+      try {
+        const listenAddr = await new Promise<string>((resolve, reject) => {
+          let out = '';
+          const timer = setTimeout(() => reject(new Error(`Timeout starting harness:\n${out}`)), 4_000);
+          const onData = (c: Buffer): void => {
+            out += c.toString('utf8');
+            const m = /listen=(127\.0\.0\.1:\d+)/.exec(out);
+            if (m?.[1] !== undefined) {
+              clearTimeout(timer);
+              resolve(m[1]);
+            }
+          };
+          receiverChild.stdout?.on('data', onData);
+          receiverChild.stderr?.on('data', onData);
+          receiverChild.once('exit', (code) => {
+            clearTimeout(timer);
+            reject(new Error(`Harness exited early (${String(code)}):\n${out}`));
+          });
+        });
+
+        const baseUrl = `http://${listenAddr}`;
+        const discovered = await discoverReceivers({
+          includeDefaultCandidates: false,
+          knownEndpoints: [baseUrl],
+          fetchImpl: extFetch,
+        });
+        expect(discovered).toHaveLength(1);
+        const rec = discovered[0];
+        if (rec === undefined) {
+          throw new Error('Expected discovered HEOS receiver');
+        }
+        const heosOutput = rec.outputs.find((o) => o.kind === 'heos_upnp');
+        expect(heosOutput).toBeDefined();
+        if (heosOutput === undefined) {
+          throw new Error('Expected discovered heos_upnp output');
+        }
+        expect(heosOutput.id.startsWith('heos_')).toBe(true);
+
+        const pairToken = await ensureTofuPairingToken(baseUrl, rec.receiverId, storage, extFetch);
+        await updateDurableLocalConfig(storage.local, (prev) => ({
+          ...prev,
+          handoffEnabled: true,
+          activeEndpointBaseUrl: baseUrl,
+          activeReceiverId: rec.receiverId,
+          activeReceiverName: rec.receiverName,
+        }));
+        await updateEphemeralSessionState(storage.session, (prev) => ({
+          ...prev,
+          discoveredReceivers: discovered,
+        }));
+        expect(await controller.ensureConnected()).toBe(true);
+
+        // Send load_track with literal `""` title & artist to verify sanitization in both DIDL-Lite and VORBIS_COMMENT
+        await controller.sendCommand({
+          type: 'load_track',
+          commandSeq: 1,
+          preferredOutputId: heosOutput.id,
+          locator: {
+            locatorId: 'loc-flac-qa-140',
+            track: {
+              trackId: '9090',
+              permalinkUrl: 'https://soundcloud.com/synthetic/flac-qa',
+              title: '  ""  ',
+              artist: '""',
+              durationMs: 13_000,
+            },
+            selected: {
+              resolveUrl: `http://127.0.0.1:${String(hlsPort)}/unused`,
+              preset: 'aac_256k',
+              protocol: 'hls',
+              mimeType: 'audio/wav',
+              quality: 'hq',
+              bitrateKbps: 256,
+              sampleRateHz: 44100,
+              initialPlaylistUrl: `http://127.0.0.1:${String(hlsPort)}/playlist.m3u8`,
+            },
+            fallbackTranscodings: [],
+            auth: {
+              clientId: 'cid_flac_qa',
+              accountTier: 'go_plus',
+            },
+            startPositionMs: 0,
+          },
+        });
+
+        const loadDeadline = Date.now() + 3_000;
+        while (Date.now() < loadDeadline && capturedStreamUri.length === 0) {
+          await new Promise<void>((r) => setTimeout(r, 20));
+        }
+        expect(capturedStreamUri).toContain('/heos/');
+        expect(capturedStreamUri).toContain('/stream.flac?start_ms=0');
+        expect(emptyMetadataViolations).toBe(0);
+        expect(capturedDidlXml).toContain('<dc:title>SoundCloud Track</dc:title>');
+        expect(capturedDidlXml).toContain('<dc:creator>SoundCloud</dc:creator>');
+        expect(capturedDidlXml).toContain('<upnp:artist>SoundCloud</upnp:artist>');
+        expect(capturedDidlXml).toContain('http-get:*:audio/flac:DLNA.ORG_OP=01;');
+
+        // Verify Host-MCU woke FIRST (`PW? -> PWON -> SI? -> SINET -> SLP? -> SLPOFF`), ACT woke once, and CLI bound pid=99
+        expect(mcuCommands.slice(0, 6)).toEqual(['PW?', 'PWON', 'SI?', 'SINET', 'SLP?', 'SLPOFF']);
+        expect(setPowerStateOnCalls).toBe(1);
+        const playAssertDeadline = Date.now() + 1_000;
+        while (
+          Date.now() < playAssertDeadline &&
+          !cliCommands.includes('heos://player/set_play_state?pid=99&state=play')
+        ) {
+          await new Promise<void>((r) => setTimeout(r, 20));
+        }
+        expect(cliCommands).toContain('heos://player/set_play_state?pid=99&state=play');
+
+        // Forged capability token must be rejected with HTTP 403
+        const forgedRes = await fetch(`${baseUrl}/heos/forged_capability_token/stream.flac`);
+        expect(forgedRes.status).toBe(403);
+
+        // HEAD probe on live /heos/{token}/stream.flac
+        const headRes = await fetch(capturedStreamUri, { method: 'HEAD' });
+        expect(headRes.status).toBe(200);
+        expect(headRes.headers.get('content-type')).toBe('audio/flac');
+        expect(headRes.headers.get('accept-ranges')).toBe('bytes');
+        expect(headRes.headers.get('transfermode.dlna.org')).toBe('Streaming');
+        expect(headRes.headers.get('contentfeatures.dlna.org')).toContain('DLNA.ORG_OP=01');
+        const expectedTotalBytes = Number(headRes.headers.get('content-length') ?? '0');
+        expect(expectedTotalBytes).toBeGreaterThan(3_400_000);
+        expect((await headRes.arrayBuffer()).byteLength).toBe(0);
+
+        // Full GET 200 FLAC stream + independent pure-TypeScript RFC 9639 bit/CRC/frame audit
+        const fullRes = await fetch(capturedStreamUri);
+        expect(fullRes.status).toBe(200);
+        const fullFlac = Buffer.from(await fullRes.arrayBuffer());
+        expect(fullFlac.length).toBe(expectedTotalBytes);
+        expect(fullFlac.subarray(0, 4).toString('ascii')).toBe('fLaC');
+
+        // Parse Metadata Blocks (RFC 9639 §8)
+        let cursor = 4;
+        let sawStreamInfo = false;
+        let sawSeekTable = false;
+        let sawVorbisComment = false;
+        let totalSamplesFromStreamInfo = 0;
+        const seekPoints: { readonly sampleNumber: bigint; readonly streamOffset: number; readonly frameSamples: number }[] = [];
+        const vorbisComments: string[] = [];
+
+        while (cursor < fullFlac.length) {
+          const hdrByte = fullFlac.readUInt8(cursor);
+          const isLast = (hdrByte & 0x80) !== 0;
+          const blockType = hdrByte & 0x7f;
+          const blockLenBE =
+            (fullFlac.readUInt8(cursor + 1) << 16) |
+            (fullFlac.readUInt8(cursor + 2) << 8) |
+            fullFlac.readUInt8(cursor + 3);
+          cursor += 4;
+          const blockEnd = cursor + blockLenBE;
+
+          if (blockType === 0) {
+            // STREAMINFO (34 bytes)
+            expect(blockLenBE).toBe(34);
+            const minBlock = fullFlac.readUInt16BE(cursor);
+            const maxBlock = fullFlac.readUInt16BE(cursor + 2);
+            const minFrameSz =
+              (fullFlac.readUInt8(cursor + 4) << 16) |
+              (fullFlac.readUInt8(cursor + 5) << 8) |
+              fullFlac.readUInt8(cursor + 6);
+            const maxFrameSz =
+              (fullFlac.readUInt8(cursor + 7) << 16) |
+              (fullFlac.readUInt8(cursor + 8) << 8) |
+              fullFlac.readUInt8(cursor + 9);
+            const packed64 = fullFlac.readBigUInt64BE(cursor + 10);
+            const sampleRate = Number((packed64 >> 44n) & 0xfffffn);
+            const channelsMinus1 = Number((packed64 >> 41n) & 0x7n);
+            const bpsMinus1 = Number((packed64 >> 36n) & 0x1fn);
+            const totalSamples = Number(packed64 & 0xfffffffffn);
+
+            expect(minBlock).toBe(4096);
+            expect(maxBlock).toBe(4096);
+            expect(minFrameSz).toBe(24_586); // Block 0..127 (1-byte UTF-8)
+            expect(maxFrameSz).toBe(24_587); // Block 128..139 (2-byte UTF-8)
+            expect(sampleRate).toBe(44_100);
+            expect(channelsMinus1 + 1).toBe(2);
+            expect(bpsMinus1 + 1).toBe(24);
+            expect(totalSamples).toBe(140 * 4096);
+            totalSamplesFromStreamInfo = totalSamples;
+            sawStreamInfo = true;
+          } else if (blockType === 3) {
+            // SEEKTABLE (n * 18 bytes, BE)
+            expect(blockLenBE % 18).toBe(0);
+            for (let p = cursor; p < blockEnd; p += 18) {
+              const sampleNumber = fullFlac.readBigUInt64BE(p);
+              const streamOffset = Number(fullFlac.readBigUInt64BE(p + 8));
+              const frameSamples = fullFlac.readUInt16BE(p + 16);
+              seekPoints.push({ sampleNumber, streamOffset, frameSamples });
+            }
+            sawSeekTable = true;
+          } else if (blockType === 4) {
+            // VORBIS_COMMENT (24-bit BE block header length, 32-bit LE internal lengths!)
+            let vcPos = cursor;
+            const vendorLenLE = fullFlac.readUInt32LE(vcPos);
+            vcPos += 4;
+            const vendor = fullFlac.subarray(vcPos, vcPos + vendorLenLE).toString('utf8');
+            expect(vendor).toBe('SoundClud');
+            vcPos += vendorLenLE;
+            const countLE = fullFlac.readUInt32LE(vcPos);
+            vcPos += 4;
+            for (let i = 0; i < countLE; i += 1) {
+              const cLenLE = fullFlac.readUInt32LE(vcPos);
+              vcPos += 4;
+              vorbisComments.push(fullFlac.subarray(vcPos, vcPos + cLenLE).toString('utf8'));
+              vcPos += cLenLE;
+            }
+            expect(vcPos).toBe(blockEnd);
+            sawVorbisComment = true;
+          }
+
+          cursor = blockEnd;
+          if (isLast) {
+            break;
+          }
+        }
+
+        const firstFrameOffset = cursor;
+        expect(sawStreamInfo).toBe(true);
+        expect(sawSeekTable).toBe(true);
+        expect(sawVorbisComment).toBe(true);
+        expect(vorbisComments).toContain('TITLE=SoundCloud Track');
+        expect(vorbisComments).toContain('ARTIST=SoundCloud');
+        expect(vorbisComments).toContain('ALBUM=SoundCloud');
+        expect(vorbisComments).toContain('GENRE=Music');
+
+        // Independent CRC-8 (poly 0x07) & CRC-16 (poly 0x8005) tables
+        const crc8Table = new Uint8Array(256);
+        for (let i = 0; i < 256; i += 1) {
+          let c = i;
+          for (let b = 0; b < 8; b += 1) {
+            c = (c & 0x80) !== 0 ? ((c << 1) ^ 0x07) & 0xff : (c << 1) & 0xff;
+          }
+          crc8Table[i] = c;
+        }
+        const crc16Table = new Uint16Array(256);
+        for (let i = 0; i < 256; i += 1) {
+          let c = i << 8;
+          for (let b = 0; b < 8; b += 1) {
+            c = (c & 0x8000) !== 0 ? ((c << 1) ^ 0x8005) & 0xffff : (c << 1) & 0xffff;
+          }
+          crc16Table[i] = c;
+        }
+
+        const calcCrc8 = (buf: Buffer, start: number, endExcl: number): number => {
+          let crc = 0;
+          for (let i = start; i < endExcl; i += 1) {
+            crc = crc8Table[(crc ^ buf.readUInt8(i)) & 0xff] ?? 0;
+          }
+          return crc;
+        };
+        const calcCrc16 = (buf: Buffer, start: number, endExcl: number): number => {
+          let crc = 0;
+          for (let i = start; i < endExcl; i += 1) {
+            const idx = ((crc >> 8) ^ buf.readUInt8(i)) & 0xff;
+            crc = (((crc << 8) & 0xffff) ^ (crc16Table[idx] ?? 0)) & 0xffff;
+          }
+          return crc;
+        };
+        const decodeCanonicalUtf8BlockNum = (
+          buf: Buffer,
+          off: number,
+        ): { readonly blockNum: number; readonly len: number } => {
+          const b0 = buf.readUInt8(off);
+          if (b0 < 0x80) {
+            return { blockNum: b0, len: 1 };
+          }
+          if ((b0 & 0xe0) === 0xc0) {
+            const b1 = buf.readUInt8(off + 1);
+            expect(b1 & 0xc0).toBe(0x80);
+            const val = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
+            expect(val).toBeGreaterThanOrEqual(0x80); // Reject overlong UTF-8
+            return { blockNum: val, len: 2 };
+          }
+          const b1 = buf.readUInt8(off + 1);
+          const b2 = buf.readUInt8(off + 2);
+          expect(b1 & 0xc0).toBe(0x80);
+          expect(b2 & 0xc0).toBe(0x80);
+          const val = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
+          expect(val).toBeGreaterThanOrEqual(0x800);
+          return { blockNum: val, len: 3 };
+        };
+        const readSigned24BE = (buf: Buffer, off: number): number => {
+          const u24 =
+            (buf.readUInt8(off) << 16) | (buf.readUInt8(off + 1) << 8) | buf.readUInt8(off + 2);
+          return (u24 & 0x800000) !== 0 ? u24 | ~0xffffff : u24;
+        };
+
+        // Verify SEEKTABLE ascending uniqueness + exact frame sync at firstFrameOffset + streamOffset
+        expect(seekPoints.length).toBe(100);
+        for (let i = 0; i < seekPoints.length; i += 1) {
+          const sp = seekPoints[i];
+          if (sp === undefined) {
+            continue;
+          }
+          if (i > 0) {
+            const prev = seekPoints[i - 1];
+            if (prev !== undefined) {
+              expect(sp.sampleNumber > prev.sampleNumber).toBe(true);
+              expect(sp.streamOffset).toBeGreaterThan(prev.streamOffset);
+            }
+          }
+          expect(sp.frameSamples).toBe(4096);
+          const targetPos = firstFrameOffset + sp.streamOffset;
+          expect(fullFlac.subarray(targetPos, targetPos + 4)).toEqual(
+            Buffer.from([0xff, 0xf8, 0xc9, 0x1c]),
+          );
+          const decodedNum = decodeCanonicalUtf8BlockNum(fullFlac, targetPos + 4);
+          expect(BigInt(decodedNum.blockNum) * 4096n).toBe(sp.sampleNumber);
+        }
+
+        // Verify all 140 audio frames (CRC-8, CRC-16, UTF-8 block index 0..139, BE 24-bit samples)
+        let framePos = firstFrameOffset;
+        let frameOffsets: number[] = [];
+        let decodedFramesCount = 0;
+        while (framePos < fullFlac.length) {
+          frameOffsets.push(framePos);
+          expect(fullFlac.subarray(framePos, framePos + 4)).toEqual(
+            Buffer.from([0xff, 0xf8, 0xc9, 0x1c]),
+          );
+          const { blockNum, len: utf8Len } = decodeCanonicalUtf8BlockNum(fullFlac, framePos + 4);
+          expect(blockNum).toBe(decodedFramesCount);
+          expect(utf8Len).toBe(blockNum < 128 ? 1 : 2);
+
+          const hdrCrcOffset = framePos + 4 + utf8Len;
+          expect(fullFlac.readUInt8(hdrCrcOffset)).toBe(calcCrc8(fullFlac, framePos, hdrCrcOffset));
+
+          const sub0Pos = hdrCrcOffset + 1;
+          expect(fullFlac.readUInt8(sub0Pos)).toBe(0x02); // SUBFRAME_VERBATIM (0 wasted bits)
+          const sub1Pos = sub0Pos + 1 + 4096 * 3;
+          expect(fullFlac.readUInt8(sub1Pos)).toBe(0x02); // SUBFRAME_VERBATIM (0 wasted bits)
+
+          // Spot-check asymmetric 24-bit BE samples in block 0, block 127, block 128, and tail zero-pad in block 139
+          if (blockNum === 0 || blockNum === 127 || blockNum === 128) {
+            const leftS24 = readSigned24BE(fullFlac, sub0Pos + 1);
+            const rightS24 = readSigned24BE(fullFlac, sub1Pos + 1);
+            expect(Math.abs(leftS24 - 0x400000)).toBeLessThanOrEqual(256);
+            expect(Math.abs(rightS24 - -0x200000)).toBeLessThanOrEqual(256);
+          } else if (blockNum === 139) {
+            // 573,300 total source frames -> block 139 has 4096 - 140 = 3956 audio samples + 140 zero-padded samples
+            const firstInLastL = readSigned24BE(fullFlac, sub0Pos + 1);
+            const paddedTailL = readSigned24BE(fullFlac, sub0Pos + 1 + 4095 * 3);
+            const paddedTailR = readSigned24BE(fullFlac, sub1Pos + 1 + 4095 * 3);
+            expect(Math.abs(firstInLastL - 0x400000)).toBeLessThanOrEqual(256);
+            expect(paddedTailL).toBe(0);
+            expect(paddedTailR).toBe(0);
+          }
+
+          const footerCrcPos = sub1Pos + 1 + 4096 * 3;
+          expect(fullFlac.readUInt16BE(footerCrcPos)).toBe(
+            calcCrc16(fullFlac, framePos, footerCrcPos),
+          );
+
+          framePos = footerCrcPos + 2;
+          decodedFramesCount += 1;
+        }
+        expect(decodedFramesCount).toBe(140);
+        expect(decodedFramesCount * 4096).toBe(totalSamplesFromStreamInfo);
+
+        // Verify HTTP 206 byte-range slicing across mid-header, cross-header, and across block 127->128 UTF-8 transition!
+        const frame127Start = frameOffsets[127] ?? 0;
+        const frame129Start = frameOffsets[129] ?? 0;
+        const mid127 = frame127Start + 9_999;
+        const mid129 = frame129Start + 5_432;
+
+        const rangeCases: readonly {
+          readonly header: string;
+          readonly expectedSlice: Buffer;
+        }[] = [
+          { header: 'bytes=0-41', expectedSlice: fullFlac.subarray(0, 42) },
+          { header: 'bytes=19-26000', expectedSlice: fullFlac.subarray(19, 26_001) },
+          {
+            header: `bytes=${String(mid127)}-${String(mid129)}`,
+            expectedSlice: fullFlac.subarray(mid127, mid129 + 1),
+          },
+          { header: 'bytes=-512', expectedSlice: fullFlac.subarray(fullFlac.length - 512) },
+        ];
+
+        for (const rc of rangeCases) {
+          const rRes = await fetch(capturedStreamUri, { headers: { Range: rc.header } });
+          expect(rRes.status).toBe(206);
+          const rBuf = Buffer.from(await rRes.arrayBuffer());
+          expect(Buffer.compare(rBuf, rc.expectedSlice)).toBe(0);
+        }
+
+        const invalidRangeRes = await fetch(capturedStreamUri, {
+          headers: { Range: `bytes=${String(fullFlac.length + 100)}-` },
+        });
+        expect(invalidRangeRes.status).toBe(416);
+
+        // Native macOS CoreAudio / AudioToolbox FLAC compatibility (`afinfo` + `afconvert`)
+        if (process.platform === 'darwin') {
+          const tmpFlacPath = path.join(tmpRoot, 'live_stream.flac');
+          const tmpWavPath = path.join(tmpRoot, 'coreaudio_decoded.wav');
+          await fsp.writeFile(tmpFlacPath, fullFlac);
+
+          const afinfoOut = execFileSync('/usr/bin/afinfo', [tmpFlacPath], {
+            encoding: 'utf8',
+            stdio: 'pipe',
+          });
+          expect(afinfoOut).toContain('File type ID:   flac');
+          expect(afinfoOut).toContain('2 ch,  44100 Hz');
+          expect(afinfoOut).toContain('from 24-bit source, 4096 frames/packet');
+          expect(afinfoOut).toContain('audio packets: 140');
+          expect(afinfoOut).toContain('source bit depth: I24');
+
+          execFileSync('/usr/bin/afconvert', ['-f', 'WAVE', '-d', 'LEI24', tmpFlacPath, tmpWavPath], {
+            stdio: 'pipe',
+          });
+          const decodedWav = await fsp.readFile(tmpWavPath);
+          const dataChunkIdx = decodedWav.indexOf(Buffer.from('data', 'ascii'));
+          expect(dataChunkIdx).toBeGreaterThanOrEqual(36);
+          const pcmOff = dataChunkIdx + 8;
+          const caLeft =
+            ((decodedWav.readUInt8(pcmOff) |
+              (decodedWav.readUInt8(pcmOff + 1) << 8) |
+              (decodedWav.readUInt8(pcmOff + 2) << 16)) <<
+              8) >>
+            8;
+          const caRight =
+            ((decodedWav.readUInt8(pcmOff + 3) |
+              (decodedWav.readUInt8(pcmOff + 4) << 8) |
+              (decodedWav.readUInt8(pcmOff + 5) << 16)) <<
+              8) >>
+            8;
+          expect(Math.abs(caLeft - 0x400000)).toBeLessThanOrEqual(256);
+          expect(Math.abs(caRight - -0x200000)).toBeLessThanOrEqual(256);
+        }
+
+        // Verify keepalive cannot be starved by repeated seeks (< 140ms keepalive_interval)
+        const slpoffBefore = mcuCommands.filter((c) => c === 'SLPOFF').length;
+        const heartbeatsBefore = cliCommands.filter((c) => c.includes('heart_beat')).length;
+        for (let step = 0; step < 3; step += 1) {
+          await new Promise<void>((r) => setTimeout(r, 55));
+          await controller.sendCommand({
+            type: 'seek',
+            commandSeq: 10 + step,
+            positionMs: 2_000 + step * 1_000,
+          });
+        }
+        await new Promise<void>((r) => setTimeout(r, 90));
+        expect(mcuCommands.filter((c) => c === 'SLPOFF').length).toBeGreaterThan(slpoffBefore);
+        expect(cliCommands.filter((c) => c.includes('heart_beat')).length).toBeGreaterThan(
+          heartbeatsBefore,
+        );
+        expect(setPowerStateOnCalls).toBe(1); // Poller NEVER calls SetDevicePowerState!
+
+        // Remote PWSTANDBY on Host-MCU (:23) must stop cleanly to Idle WITHOUT re-waking!
+        const pwonBeforeStandby = mcuCommands.filter((c) => c === 'PWON').length;
+        forceRemoteStandby = true;
+        const idleDeadline = Date.now() + 1_500;
+        let sawIdle = false;
+        while (Date.now() < idleDeadline) {
+          const stRes = await extFetch(`${baseUrl}${API_V1_STATUS_PATH}`, {
+            headers: { Authorization: `Bearer ${pairToken}`, Accept: 'application/json' },
+          });
+          const parsedSt = parseStatusResponse(await stRes.json());
+          if (parsedSt.ok && parsedSt.value.telemetry.phase === 'idle') {
+            sawIdle = true;
+            break;
+          }
+          await new Promise<void>((r) => setTimeout(r, 40));
+        }
+        expect(sawIdle).toBe(true);
+        expect(mcuCommands.filter((c) => c === 'PWON').length).toBe(pwonBeforeStandby);
+        expect(setPowerStateOnCalls).toBe(1);
+
+        // Zero volume/mute mutations across UPnP, Host-MCU, and HEOS CLI
+        expect(renderingControlHits).toBe(0);
+        expect(mcuCommands.some((c) => c.startsWith('MV') || c.startsWith('MU'))).toBe(false);
+        expect(
+          cliCommands.some((c) => c.toLowerCase().includes('volume') || c.toLowerCase().includes('mute')),
+        ).toBe(false);
+        expect(
+          soapActions.some((a) => a.toLowerCase().includes('volume') || a.toLowerCase().includes('mute')),
+        ).toBe(false);
+      } finally {
+        await controller.disconnect();
+        receiverChild.stdin?.end();
+        if (receiverChild.exitCode === null && receiverChild.signalCode === null) {
+          await new Promise<void>((resolve) => {
+            const t = setTimeout(() => {
+              receiverChild.kill('SIGKILL');
+              resolve();
+            }, 500);
+            receiverChild.once('exit', () => {
+              clearTimeout(t);
+              resolve();
+            });
+          });
+        }
+        for (const s of openTcpSockets) {
+          s.destroy();
+        }
+        await Promise.all([
+          new Promise<void>((r) => mcuServer.close(() => r())),
+          new Promise<void>((r) => cliServer.close(() => r())),
+          new Promise<void>((r) => upnpServer.close(() => r())),
+          new Promise<void>((r) => hlsServer.close(() => r())),
+        ]);
         await fsp.rm(tmpRoot, { recursive: true, force: true });
       }
     },

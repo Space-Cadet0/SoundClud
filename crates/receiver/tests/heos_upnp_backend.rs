@@ -9,7 +9,10 @@ use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use soundclud_receiver::backends::heos_discovery::HeosDiscoverySeed;
-use soundclud_receiver::backends::heos_soap::{extract_xml_tag_text, DLNA_WAV_FEATURES};
+use soundclud_receiver::backends::heos_soap::{
+    extract_xml_tag_text, DLNA_FLAC_FEATURES, DLNA_WAV_FEATURES,
+};
+use soundclud_receiver::flac_streamer::{compute_flac_stream_plan, FLAC_BLOCK_SAMPLES};
 use soundclud_receiver::protocol::{
     AccountTier, ClientWsCommand, DiscoverResponse, EphemeralSoundCloudAuth, OutputCapabilities,
     OutputDevice, OutputDeviceKind, OutputTransport, PairRequest, PairResponse, PlayableProtocol,
@@ -18,10 +21,18 @@ use soundclud_receiver::protocol::{
 };
 use soundclud_receiver::security::RedactedSecret;
 use soundclud_receiver::{ReceiverDaemonConfig, ReceiverServer};
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::errors::Error as SymphoniaError;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio_tungstenite::tungstenite::Message;
@@ -72,8 +83,88 @@ struct MockHeosDevice {
     volume_mutations: AtomicUsize,
 }
 
+struct DecodedFlacSummary {
+    sample_rate: u32,
+    channels: usize,
+    bits_per_sample: u32,
+    total_frames: usize,
+    peak_abs: f32,
+    tags: Vec<(String, String)>,
+}
+
+fn decode_flac_with_symphonia(flac_bytes: Vec<u8>) -> DecodedFlacSummary {
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+    let mss = MediaSourceStream::new(
+        Box::new(Cursor::new(flac_bytes)),
+        MediaSourceStreamOptions::default(),
+    );
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .expect("symphonia must probe RFC 9639 FLAC stream");
+
+    let mut tags = Vec::new();
+    if let Some(rev) = probed.format.metadata().current() {
+        for t in rev.tags() {
+            tags.push((t.key.to_ascii_uppercase(), t.value.to_string()));
+        }
+    }
+    if let Some(mut md) = probed.metadata.get() {
+        if let Some(rev) = md.skip_to_latest() {
+            for t in rev.tags() {
+                tags.push((t.key.to_ascii_uppercase(), t.value.to_string()));
+            }
+        }
+    }
+
+    let track = probed.format.default_track().expect("default FLAC track");
+    let track_id = track.id;
+    let sample_rate = track.codec_params.sample_rate.expect("sample_rate");
+    let channels = track.codec_params.channels.expect("channels").count();
+    let bits_per_sample = track.codec_params.bits_per_sample.expect("bits_per_sample");
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .expect("FLAC decoder");
+
+    let mut total_frames = 0usize;
+    let mut peak_abs = 0.0f32;
+    loop {
+        let packet = match probed.format.next_packet() {
+            Ok(p) => p,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(other) => panic!("unexpected FLAC decode error (CRC/sync failure?): {other}"),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .expect("FLAC frame CRC-8/CRC-16 & verbatim decode must succeed");
+        total_frames += decoded.frames();
+        let mut sbuf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+        sbuf.copy_interleaved_ref(decoded);
+        for &s in sbuf.samples() {
+            peak_abs = peak_abs.max(s.abs());
+        }
+    }
+
+    DecodedFlacSummary {
+        sample_rate,
+        channels,
+        bits_per_sample,
+        total_frames,
+        peak_abs,
+        tags,
+    }
+}
+
 #[tokio::test]
-async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touches_volume_or_mpv() {
+async fn wakes_heos_from_standby_streams_24bit_44100_flac_scrubs_and_never_touches_volume_or_mpv() {
     // 1. Spy AF_UNIX socket to prove LocalMpvBackend is NEVER touched in HEOS mode
     let temp = tempfile::tempdir().expect("tempdir");
     let mpv_spy_path = temp.path().join("spy-mpv.sock");
@@ -113,6 +204,10 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
                             }]
                         });
                         let _ = w.write_all(format!("{resp}\r\n").as_bytes()).await;
+                    } else {
+                        let _ = w
+                            .write_all(b"{\"heos\":{\"result\":\"success\"}}\r\n")
+                            .await;
                     }
                 }
             });
@@ -416,6 +511,23 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
         .unwrap()
         .clone()
         .expect("CurrentURI");
+    assert!(
+        stream_uri.contains("/stream.flac?start_ms=0"),
+        "expected /stream.flac URI, got {stream_uri}"
+    );
+    let expected_plan = compute_flac_stream_plan(
+        &TrackMetadata {
+            track_id: "555".to_string(),
+            permalink_url: "https://soundcloud.com/ensemble/warm".to_string(),
+            title: "Warm & Clear <HQ>".to_string(),
+            artist: "Studio Ensemble".to_string(),
+            artwork_url: Some("https://i1.sndcdn.com/artworks-hq.jpg".to_string()),
+            duration_ms: 2_000,
+            waveform_url: None,
+        },
+        2_000,
+        0,
+    );
     let didl = heos_state
         .last_didl
         .lock()
@@ -427,11 +539,12 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
     assert!(didl.contains("<upnp:artist>Studio Ensemble</upnp:artist>"));
     assert!(didl.contains("<upnp:album>SoundCloud</upnp:album>"));
     assert!(didl.contains("<upnp:genre>Music</upnp:genre>"));
-    assert!(didl.contains(&format!("http-get:*:audio/wav:{DLNA_WAV_FEATURES}")));
-    assert!(didl.contains("size=\"529244\""));
-    assert!(didl.contains("bitrate=\"264600\""));
+    assert!(didl.contains(&format!("http-get:*:audio/flac:{DLNA_FLAC_FEATURES}")));
+    assert!(didl.contains(&format!("size=\"{}\"", expected_plan.total_file_bytes)));
+    assert!(didl.contains("bitrate=\"2116800\""));
+    assert!(didl.contains("duration=\"00:00:02\""));
 
-    // Verify Stop was issued before SetAVTransportURI
+    // Verify Stop was issued before SetAVTransportURI and CLI play state was asserted
     {
         let actions = heos_state.soap_actions.lock().unwrap();
         let stop_idx = actions
@@ -444,72 +557,126 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
             .expect("AVTransport#SetAVTransportURI");
         assert!(stop_idx < set_uri_idx);
     }
+    assert!(
+        cli_cmds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == "heos://player/set_play_state?pid=42&state=play"),
+        "must assert state=play on HEOS CLI for bound pid"
+    );
 
-    // Verify capability-token enforcement on /heos/<token>/stream.wav
-    let forged = client
-        .get(format!(
-            "http://{srv_addr}/heos/forged_capability_token/stream.wav"
-        ))
+    // Verify capability-token enforcement on both /stream.flac and /stream.wav
+    for ext in ["flac", "wav"] {
+        let forged = client
+            .get(format!(
+                "http://{srv_addr}/heos/forged_capability_token/stream.{ext}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forged.status().as_u16(), 403);
+    }
+
+    // Verify HEAD probe returns exact DLNA & Content-Length headers with empty body
+    let head_flac = client.head(&stream_uri).send().await.unwrap();
+    assert_eq!(head_flac.status().as_u16(), 200);
+    assert_eq!(
+        head_flac.headers().get("content-type").unwrap(),
+        "audio/flac"
+    );
+    assert_eq!(
+        head_flac.headers().get("contentfeatures.dlna.org").unwrap(),
+        DLNA_FLAC_FEATURES
+    );
+    assert_eq!(
+        head_flac.headers().get("transfermode.dlna.org").unwrap(),
+        "Streaming"
+    );
+    assert_eq!(
+        head_flac
+            .headers()
+            .get("content-length")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected_plan.total_file_bytes.to_string()
+    );
+    assert!(head_flac.bytes().await.unwrap().is_empty());
+
+    // Fetch full FLAC stream and decode through symphonia, verifying 44.1kHz/24-bit/stereo + VORBIS_COMMENT + 0dB PCM
+    let full_flac = client.get(&stream_uri).send().await.unwrap();
+    assert_eq!(full_flac.status().as_u16(), 200);
+    assert_eq!(
+        full_flac.headers().get("content-type").unwrap(),
+        "audio/flac"
+    );
+    assert_eq!(full_flac.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(
+        full_flac.headers().get("contentfeatures.dlna.org").unwrap(),
+        DLNA_FLAC_FEATURES
+    );
+    let flac_bytes = full_flac.bytes().await.unwrap();
+    assert_eq!(flac_bytes.len() as u64, expected_plan.total_file_bytes);
+    assert_eq!(&flac_bytes[0..4], b"fLaC");
+
+    let summary = decode_flac_with_symphonia(flac_bytes.to_vec());
+    assert_eq!(summary.sample_rate, 44_100);
+    assert_eq!(summary.channels, 2);
+    assert_eq!(summary.bits_per_sample, 24);
+    assert_eq!(
+        summary.total_frames,
+        (expected_plan.total_blocks as usize) * usize::from(FLAC_BLOCK_SAMPLES)
+    );
+    assert!(
+        (summary.peak_abs - 0.5).abs() < 0.02,
+        "expected ~0.5 peak amplitude (0 dB unity gain), got {}",
+        summary.peak_abs
+    );
+    assert!(summary
+        .tags
+        .contains(&("TITLE".to_string(), "Warm & Clear <HQ>".to_string())));
+    assert!(summary
+        .tags
+        .contains(&("ARTIST".to_string(), "Studio Ensemble".to_string())));
+    assert!(summary
+        .tags
+        .contains(&("ALBUM".to_string(), "SoundCloud".to_string())));
+    assert!(summary
+        .tags
+        .contains(&("GENRE".to_string(), "Music".to_string())));
+
+    // Verify HTTP 206 mid-stream byte-range request (jump into mid-audio block 11 ~ 1.0s)
+    // and prove prefix + mid-audio range reassembles to a byte-identical valid symphonia FLAC!
+    let mid_byte = expected_plan.header_bytes.len() as u64 + 11 * 24_586 + 1_337;
+    let range_resp = client
+        .get(&stream_uri)
+        .header("Range", format!("bytes={mid_byte}-"))
         .send()
         .await
         .unwrap();
-    assert_eq!(forged.status().as_u16(), 403);
+    assert_eq!(range_resp.status().as_u16(), 206);
+    let tail_range_bytes = range_resp.bytes().await.unwrap();
+    assert_eq!(
+        tail_range_bytes.len() as u64,
+        expected_plan.total_file_bytes - mid_byte
+    );
+    assert!(tail_range_bytes.iter().any(|&b| b != 0));
 
-    // Verify HEAD probe returns exact DLNA & Content-Length headers with empty body
-    let head_wav = client.head(&stream_uri).send().await.unwrap();
+    let mut stitched = Vec::with_capacity(flac_bytes.len());
+    stitched.extend_from_slice(&flac_bytes[..usize::try_from(mid_byte).unwrap()]);
+    stitched.extend_from_slice(&tail_range_bytes);
+    let stitched_summary = decode_flac_with_symphonia(stitched);
+    assert_eq!(stitched_summary.total_frames, summary.total_frames);
+
+    // Also verify legacy /stream.wav endpoint remains functional alongside /stream.flac
+    let wav_uri = stream_uri.replace("/stream.flac", "/stream.wav");
+    let head_wav = client.head(&wav_uri).send().await.unwrap();
     assert_eq!(head_wav.status().as_u16(), 200);
     assert_eq!(
         head_wav.headers().get("contentfeatures.dlna.org").unwrap(),
         DLNA_WAV_FEATURES
     );
-    assert_eq!(
-        head_wav.headers().get("transfermode.dlna.org").unwrap(),
-        "Streaming"
-    );
-    assert_eq!(head_wav.headers().get("content-length").unwrap(), "529244");
-    assert!(head_wav.bytes().await.unwrap().is_empty());
-
-    // Fetch WAV header + PCM samples and verify 44.1 kHz / 24-bit stereo RIFF WAVE + exact length
-    let full_wav = client.get(&stream_uri).send().await.unwrap();
-    assert_eq!(full_wav.status().as_u16(), 200);
-    assert_eq!(full_wav.headers().get("content-type").unwrap(), "audio/wav");
-    assert_eq!(full_wav.headers().get("accept-ranges").unwrap(), "bytes");
-    assert_eq!(
-        full_wav.headers().get("contentfeatures.dlna.org").unwrap(),
-        DLNA_WAV_FEATURES
-    );
-    let wav_bytes = full_wav.bytes().await.unwrap();
-    assert_eq!(wav_bytes.len(), 529_244);
-    assert_eq!(&wav_bytes[0..4], b"RIFF");
-    assert_eq!(&wav_bytes[8..12], b"WAVE");
-    assert_eq!(u16::from_le_bytes([wav_bytes[20], wav_bytes[21]]), 1); // PCM
-    assert_eq!(u16::from_le_bytes([wav_bytes[22], wav_bytes[23]]), 2); // 2 channels
-    assert_eq!(
-        u32::from_le_bytes([wav_bytes[24], wav_bytes[25], wav_bytes[26], wav_bytes[27]]),
-        44_100
-    );
-    assert_eq!(
-        u32::from_le_bytes([wav_bytes[28], wav_bytes[29], wav_bytes[30], wav_bytes[31]]),
-        264_600
-    );
-    assert_eq!(u16::from_le_bytes([wav_bytes[32], wav_bytes[33]]), 6);
-    assert_eq!(u16::from_le_bytes([wav_bytes[34], wav_bytes[35]]), 24);
-    assert!(
-        wav_bytes[44..4044].iter().any(|&b| b != 0),
-        "PCM must contain non-zero audio"
-    );
-
-    // Verify HTTP Range request (jump into segment 1 @ 1.0s = byte 44 + 264_600)
-    let range_resp = client
-        .get(&stream_uri)
-        .header("Range", "bytes=264644-270643")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(range_resp.status().as_u16(), 206);
-    let range_bytes = range_resp.bytes().await.unwrap();
-    assert_eq!(range_bytes.len(), 6_000);
-    assert!(range_bytes.iter().any(|&b| b != 0));
 
     // Verify REL_TIME seek under 650ms
     let t_seek = Instant::now();

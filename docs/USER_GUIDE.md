@@ -92,6 +92,8 @@ Open **`SoundClud.app`** (from **Applications** or by clicking the waveform icon
 - **HEOS amplifier doesn't appear under Detected Hi-Fi Outputs**:
   1. Ensure **Network Control / Network Standby** is set to **On** in your amplifier's menu (on Marantz PM7000N: **Setup -> Network -> Network Control -> On**; note that **Pure Mode 2 / Network Off** shuts off the HEOS network card—use **Optical TOSLINK** when Network is Off).
   2. Verify your Mac and amplifier are on the same home network (not an isolated Guest Wi-Fi SSID), then click **`Refresh`** in `SoundClud.app`.
+- **Amplifier Auto-Standby while paused for >15 minutes**:
+  SoundClud automatically keeps Denon/Marantz HEOS amplifiers awake throughout active playback (`60s` Host-MCU & HEOS playback heartbeats). When playback is **paused or stopped** for 15+ minutes on EU models with **Auto-Standby** enabled, the amplifier will enter energy-saving standby as designed—pressing **Play** on `soundcloud.com` wakes it back up automatically. (To keep the amplifier powered on even while paused indefinitely, set **Setup -> General -> Auto-Standby -> Off** on the amplifier.)
 - **Optical TOSLINK not listed on Mac Mini**:
   Ensure the Mini-TOSLINK optical plug is firmly seated—macOS CoreAudio only exposes `Built-in Digital Output` while an optical connector is physically inserted.
 

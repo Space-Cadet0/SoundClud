@@ -2,7 +2,8 @@ use crate::backends::heos_upnp::HeosBackendConfig;
 use crate::backends::local_mpv::LocalMpvConfig;
 use crate::coordinator::ReceiverCoordinator;
 use crate::media_routes::{
-    get_heos_wav_stream, get_hls_init_mp4, get_hls_key_bin, get_hls_playlist, get_hls_segment,
+    get_heos_flac_stream, get_heos_wav_stream, get_hls_init_mp4, get_hls_key_bin, get_hls_playlist,
+    get_hls_segment,
 };
 use crate::protocol::{
     ApiErrorResponse, AudioDevicesResponse, DiscoverResponse, PairRequest, PairResponse,
@@ -179,6 +180,10 @@ pub fn build_router(coord: Arc<ReceiverCoordinator>) -> Router {
         .route(
             "/heos/{capability_token}/stream.wav",
             get(get_heos_wav_stream),
+        )
+        .route(
+            "/heos/{capability_token}/stream.flac",
+            get(get_heos_flac_stream),
         )
         .with_state(coord)
 }

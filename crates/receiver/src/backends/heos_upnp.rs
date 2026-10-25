@@ -2,20 +2,21 @@ use crate::backends::heos_discovery::{
     discover_heos_endpoints, HeosDiscoveredEndpoint, HeosDiscoverySeed,
 };
 use crate::backends::heos_mcu::{
-    activate_host_mcu_zone, extract_device_ip, keepalive_host_mcu, ping_heos_cli_keepalive,
-    resolve_mcu_port, McuPowerStatus,
+    activate_host_mcu_zone, assert_heos_cli_play_state, check_host_mcu_power, extract_device_ip,
+    keepalive_host_mcu, ping_heos_cli_keepalive, resolve_heos_player_pid, resolve_mcu_port,
+    McuPowerStatus,
 };
 use crate::backends::heos_soap::{
     avt_get_position_info, avt_get_transport_info, avt_pause, avt_play, avt_seek_rel_time,
-    avt_set_transport_uri, avt_stop, build_didl_lite_metadata, get_device_power_state,
+    avt_set_transport_uri, avt_stop, build_flac_didl_lite_metadata, get_device_power_state,
     set_device_power_state_on,
 };
 use crate::backends::{
     AudioBackend, BackendEvent, BackendFuture, BackendLoadRequest, BackendStatusSnapshot,
 };
+use crate::flac_streamer::compute_flac_stream_plan;
 use crate::hls_proxy::HlsSession;
 use crate::protocol::{OutputDevice, OutputDeviceKind, PlaybackPhase, StandbyState};
-use crate::wav_streamer::{compute_total_pcm_bytes, WAV_BYTE_RATE};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
@@ -38,7 +39,7 @@ impl Default for HeosBackendConfig {
             enable_lan_multicast: true,
             discovery_seeds: Vec::new(),
             poll_interval: Duration::from_millis(250),
-            keepalive_interval: Duration::from_secs(180),
+            keepalive_interval: Duration::from_secs(60),
             mcu_port_override: None,
         }
     }
@@ -69,6 +70,7 @@ struct SharedHeosState {
     snapshot: BackendStatusSnapshot,
     endpoints: HashMap<String, HeosDiscoveredEndpoint>,
     transition_guard_until: Option<Instant>,
+    last_keepalive_at: Option<Instant>,
 }
 
 pub struct HeosUpnpBackend {
@@ -95,6 +97,7 @@ impl HeosUpnpBackend {
                 snapshot: BackendStatusSnapshot::default(),
                 endpoints: HashMap::new(),
                 transition_guard_until: None,
+                last_keepalive_at: None,
             })),
             transport_lock: Mutex::new(()),
             active: Mutex::new(None),
@@ -139,7 +142,41 @@ impl HeosUpnpBackend {
         found.ok_or_else(|| format!("HEOS output '{output_id}' not found"))
     }
 
-    async fn ensure_device_awake(&self, endpoint: &HeosDiscoveredEndpoint) -> Result<(), String> {
+    fn emit_waking_phase(&self, emitted: &mut bool) {
+        if *emitted {
+            return;
+        }
+        *emitted = true;
+        let waking_snap = {
+            let mut s = self
+                .shared
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.snapshot.phase = PlaybackPhase::WakingDevice;
+            s.snapshot.clone()
+        };
+        let _ = self.event_tx.send(BackendEvent::StateChanged(waking_snap));
+    }
+
+    async fn ensure_device_awake(
+        &self,
+        endpoint: &mut HeosDiscoveredEndpoint,
+    ) -> Result<(), String> {
+        let device_ip = extract_device_ip(&endpoint.avt_control_url, endpoint.ip);
+        let wake_started = Instant::now();
+        let mut emitted_waking = false;
+
+        // 1. Wake Host-MCU (:23) FIRST (`PWON` + `SINET` + `SLPOFF`) so UART link is ready
+        let mut woke_mcu = false;
+        if let Some(mcu_port) = resolve_mcu_port(device_ip, self.config.mcu_port_override) {
+            if activate_host_mcu_zone(device_ip, mcu_port).await {
+                woke_mcu = true;
+                self.emit_waking_phase(&mut emitted_waking);
+            }
+        }
+
+        // 2. Check ACT:1 power state (`:60006/ACT/control`) and wake ONLY when Off
+        let mut woke_act = false;
         if let Some(act_url) = &endpoint.act_control_url {
             let current = get_device_power_state(&self.client, act_url)
                 .await
@@ -149,22 +186,16 @@ impl HeosUpnpBackend {
                     output_id = %endpoint.output_id,
                     "waking HEOS device from network standby"
                 );
-                let waking_snap = {
-                    let mut s = self
-                        .shared
-                        .write()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    s.snapshot.phase = PlaybackPhase::WakingDevice;
-                    s.snapshot.clone()
-                };
-                let _ = self.event_tx.send(BackendEvent::StateChanged(waking_snap));
+                self.emit_waking_phase(&mut emitted_waking);
 
                 set_device_power_state_on(&self.client, act_url).await?;
+                woke_act = true;
                 let mut woke = false;
                 for _ in 0..80 {
                     if let Ok(StandbyState::On) =
                         get_device_power_state(&self.client, act_url).await
                     {
+                        endpoint.standby_state = StandbyState::On;
                         if let Some(ep) = self
                             .shared
                             .write()
@@ -182,13 +213,61 @@ impl HeosUpnpBackend {
                 if !woke {
                     return Err("HEOS device did not wake from standby within timeout".to_string());
                 }
+            } else if current == StandbyState::On {
+                endpoint.standby_state = StandbyState::On;
             }
         }
 
-        let device_ip = extract_device_ip(&endpoint.avt_control_url, endpoint.ip);
-        if let Some(mcu_port) = resolve_mcu_port(device_ip, self.config.mcu_port_override) {
-            activate_host_mcu_zone(device_ip, mcu_port).await;
+        // 3. Wait for HEOS CLI (`:1255` `get_players`) `pid` binding so AIOS bridges metadata & state
+        if (woke_mcu || woke_act || endpoint.heos_pid.is_none()) && endpoint.cli_port > 0 {
+            let pid_budget = if woke_mcu || woke_act {
+                Duration::from_millis(3_500)
+            } else {
+                Duration::from_millis(700)
+            };
+            let pid_deadline = tokio::time::Instant::now() + pid_budget;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= pid_deadline {
+                    break;
+                }
+                let per_try = (pid_deadline - now).min(Duration::from_millis(700));
+                if let Some(pid) =
+                    resolve_heos_player_pid(device_ip, endpoint.cli_port, per_try).await
+                {
+                    endpoint.heos_pid = Some(pid);
+                    if let Some(ep) = self
+                        .shared
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .endpoints
+                        .get_mut(&endpoint.output_id)
+                    {
+                        ep.heos_pid = Some(pid);
+                    }
+                    break;
+                }
+                let after = tokio::time::Instant::now();
+                if after >= pid_deadline {
+                    break;
+                }
+                tokio::time::sleep((pid_deadline - after).min(Duration::from_millis(150))).await;
+            }
         }
+
+        // 4. Allow Host-MCU <-> AIOS UART registration settle after waking from standby
+        if woke_mcu {
+            let min_settle = if device_ip.is_loopback() {
+                Duration::from_millis(40)
+            } else {
+                Duration::from_millis(1_200)
+            };
+            let elapsed = wake_started.elapsed();
+            if elapsed < min_settle {
+                tokio::time::sleep(min_settle - elapsed).await;
+            }
+        }
+
         Ok(())
     }
 
@@ -211,7 +290,10 @@ impl HeosUpnpBackend {
         let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(1_200);
         while tokio::time::Instant::now() < settle_deadline {
             match avt_get_transport_info(&self.client, &endpoint.avt_control_url).await {
-                Ok(state) if state.eq_ignore_ascii_case("TRANSITIONING") => {
+                Ok(state)
+                    if state.eq_ignore_ascii_case("TRANSITIONING")
+                        || state.eq_ignore_ascii_case("PAUSED_PLAYBACK") =>
+                {
                     tokio::time::sleep(Duration::from_millis(80)).await;
                 }
                 _ => break,
@@ -224,11 +306,22 @@ impl HeosUpnpBackend {
             IpAddr::V6(v6) => format!("[{v6}]"),
         };
         let stream_url = format!(
-            "http://{host_fmt}:{local_http_port}/heos/{capability_token}/stream.wav?start_ms={start_ms}"
+            "http://{host_fmt}:{local_http_port}/heos/{capability_token}/stream.flac?start_ms={start_ms}"
         );
         let track_dur_ms = session.effective_duration_ms();
-        let pcm_bytes = compute_total_pcm_bytes(track_dur_ms, start_ms);
-        let didl = build_didl_lite_metadata(&session.track, &stream_url, start_ms, pcm_bytes);
+        let plan = compute_flac_stream_plan(&session.track, track_dur_ms, start_ms);
+        let rem_ms = track_dur_ms.saturating_sub(start_ms);
+        let didl_dur_ms = if rem_ms == 0 {
+            plan.window_duration_ms
+        } else {
+            rem_ms.min(plan.window_duration_ms)
+        };
+        let didl = build_flac_didl_lite_metadata(
+            &session.track,
+            &stream_url,
+            plan.total_file_bytes,
+            didl_dur_ms,
+        );
         avt_set_transport_uri(&self.client, &endpoint.avt_control_url, &stream_url, &didl).await?;
 
         let mut last_play_err = String::new();
@@ -251,11 +344,18 @@ impl HeosUpnpBackend {
             return Err(last_play_err);
         }
 
+        if let Some(pid) = endpoint.heos_pid {
+            if endpoint.cli_port > 0 {
+                let device_ip = extract_device_ip(&endpoint.avt_control_url, endpoint.ip);
+                assert_heos_cli_play_state(device_ip, endpoint.cli_port, pid).await;
+            }
+        }
+
         tracing::info!(
             output_id = %endpoint.output_id,
             start_ms,
-            pcm_bytes,
-            "started HEOS UPnP WAV transport"
+            total_file_bytes = plan.total_file_bytes,
+            "started HEOS UPnP FLAC transport"
         );
         Ok(stream_url)
     }
@@ -271,8 +371,7 @@ impl HeosUpnpBackend {
         tokio::spawn(async move {
             let device_ip = extract_device_ip(&params.endpoint.avt_control_url, params.endpoint.ip);
             let mcu_port = resolve_mcu_port(device_ip, mcu_port_override);
-            let enable_keepalive = !device_ip.is_loopback() || mcu_port_override.is_some();
-            let mut last_keepalive_at = tokio::time::Instant::now();
+            let enable_keepalive = mcu_port.is_some() || params.endpoint.cli_port > 0;
             let mut saw_playing = false;
             let mut consecutive_stopped_polls: u8 = 0;
             let mut last_track_uri: Option<String> = None;
@@ -378,12 +477,56 @@ impl HeosUpnpBackend {
                                     let near_end = params.track_dur_ms == 0
                                         || cur_pos_ms.saturating_add(5_000) >= params.track_dur_ms;
                                     if near_end {
+                                        shared
+                                            .write()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                            .last_keepalive_at = None;
                                         let _ = event_tx.send(BackendEvent::TrackEnded {
                                             track_id: params.track_id,
                                             locator_id: params.locator_id,
                                         });
                                         break;
-                                    } else if !logged_premature_stop {
+                                    }
+                                    let mcu_standby = match mcu_port {
+                                        Some(mp) => {
+                                            check_host_mcu_power(device_ip, mp).await
+                                                == McuPowerStatus::Standby
+                                        }
+                                        None => false,
+                                    };
+                                    let act_standby = if mcu_standby {
+                                        false
+                                    } else if let Some(act_url) = &params.endpoint.act_control_url {
+                                        matches!(
+                                            get_device_power_state(&client, act_url).await,
+                                            Ok(StandbyState::Off)
+                                        )
+                                    } else {
+                                        false
+                                    };
+                                    if mcu_standby || act_standby {
+                                        tracing::info!(
+                                            output_id = %params.endpoint.output_id,
+                                            "HEOS device entered standby after STOPPED; transitioning to Idle"
+                                        );
+                                        let idle_snap = {
+                                            let mut s = shared
+                                                .write()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                            s.snapshot = BackendStatusSnapshot::default();
+                                            s.last_keepalive_at = None;
+                                            if let Some(ep) =
+                                                s.endpoints.get_mut(&params.endpoint.output_id)
+                                            {
+                                                ep.standby_state = StandbyState::Off;
+                                            }
+                                            s.snapshot.clone()
+                                        };
+                                        let _ =
+                                            event_tx.send(BackendEvent::StateChanged(idle_snap));
+                                        break;
+                                    }
+                                    if !logged_premature_stop {
                                         logged_premature_stop = true;
                                         tracing::warn!(
                                             output_id = %params.endpoint.output_id,
@@ -403,40 +546,59 @@ impl HeosUpnpBackend {
                     }
                 }
 
-                if enable_keepalive && last_keepalive_at.elapsed() >= keepalive_interval {
-                    let is_playing = shared
+                let due_for_keepalive = enable_keepalive && {
+                    let s = shared
                         .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .snapshot
-                        .phase
-                        == PlaybackPhase::Playing;
-                    if is_playing {
-                        last_keepalive_at = tokio::time::Instant::now();
-                        if let Some(act_url) = &params.endpoint.act_control_url {
-                            let _ = set_device_power_state_on(&client, act_url).await;
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    s.snapshot.phase == PlaybackPhase::Playing
+                        && s.last_keepalive_at
+                            .is_some_and(|t| t.elapsed() >= keepalive_interval)
+                };
+                if due_for_keepalive {
+                    let current_pid = {
+                        let mut s = shared
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        s.last_keepalive_at = Some(Instant::now());
+                        s.endpoints
+                            .get(&params.endpoint.output_id)
+                            .and_then(|ep| ep.heos_pid)
+                            .or(params.endpoint.heos_pid)
+                    };
+                    if let Some(mp) = mcu_port {
+                        if keepalive_host_mcu(device_ip, mp).await == McuPowerStatus::Standby {
+                            tracing::info!(
+                                output_id = %params.endpoint.output_id,
+                                "HEOS host amplifier entered standby; stopping active stream"
+                            );
+                            let _ = avt_stop(&client, &params.endpoint.avt_control_url).await;
+                            let idle_snap = {
+                                let mut s = shared
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                s.snapshot = BackendStatusSnapshot::default();
+                                s.last_keepalive_at = None;
+                                if let Some(ep) = s.endpoints.get_mut(&params.endpoint.output_id) {
+                                    ep.standby_state = StandbyState::Off;
+                                }
+                                s.snapshot.clone()
+                            };
+                            let _ = event_tx.send(BackendEvent::StateChanged(idle_snap));
+                            break;
                         }
-                        ping_heos_cli_keepalive(
-                            device_ip,
-                            params.endpoint.cli_port,
-                            params.endpoint.heos_pid,
-                        )
-                        .await;
-                        if let Some(mp) = mcu_port {
-                            if keepalive_host_mcu(device_ip, mp).await == McuPowerStatus::Standby {
-                                tracing::info!(
-                                    output_id = %params.endpoint.output_id,
-                                    "HEOS host amplifier entered standby; stopping active stream"
-                                );
-                                let _ = avt_stop(&client, &params.endpoint.avt_control_url).await;
-                                let idle_snap = {
-                                    let mut s = shared
-                                        .write()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    s.snapshot = BackendStatusSnapshot::default();
-                                    s.snapshot.clone()
-                                };
-                                let _ = event_tx.send(BackendEvent::StateChanged(idle_snap));
-                                break;
+                    }
+                    if let Some(resolved_pid) =
+                        ping_heos_cli_keepalive(device_ip, params.endpoint.cli_port, current_pid)
+                            .await
+                    {
+                        if current_pid != Some(resolved_pid) {
+                            if let Some(ep) = shared
+                                .write()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .endpoints
+                                .get_mut(&params.endpoint.output_id)
+                            {
+                                ep.heos_pid = Some(resolved_pid);
                             }
                         }
                     }
@@ -506,7 +668,7 @@ impl AudioBackend for HeosUpnpBackend {
                 self.record_load_error(&msg);
                 return Err(msg);
             };
-            let endpoint = match self.resolve_endpoint(&req.output_id).await {
+            let mut endpoint = match self.resolve_endpoint(&req.output_id).await {
                 Ok(ep) => ep,
                 Err(e) => {
                     self.record_load_error(&e);
@@ -535,9 +697,10 @@ impl AudioBackend for HeosUpnpBackend {
                     error_code: None,
                     error_message: None,
                 };
+                s.last_keepalive_at.get_or_insert_with(Instant::now);
             }
 
-            if let Err(e) = self.ensure_device_awake(&endpoint).await {
+            if let Err(e) = self.ensure_device_awake(&mut endpoint).await {
                 self.record_load_error(&e);
                 return Err(e);
             }
@@ -646,6 +809,16 @@ impl AudioBackend for HeosUpnpBackend {
                             .position_ms,
                     )
                 } else {
+                    if let Some(pid) = active.endpoint.heos_pid {
+                        if active.endpoint.cli_port > 0 {
+                            let device_ip = extract_device_ip(
+                                &active.endpoint.avt_control_url,
+                                active.endpoint.ip,
+                            );
+                            assert_heos_cli_play_state(device_ip, active.endpoint.cli_port, pid)
+                                .await;
+                        }
+                    }
                     None
                 };
 
@@ -720,8 +893,12 @@ impl AudioBackend for HeosUpnpBackend {
                 active.paused_position_ms = position_ms;
             } else {
                 let track_dur_ms = active.session.effective_duration_ms();
-                let window_pcm = compute_total_pcm_bytes(track_dur_ms, active.anchor_start_ms);
-                let window_dur_ms = (u64::from(window_pcm) * 1_000) / u64::from(WAV_BYTE_RATE);
+                let window_dur_ms = compute_flac_stream_plan(
+                    &active.session.track,
+                    track_dur_ms,
+                    active.anchor_start_ms,
+                )
+                .window_duration_ms;
                 let can_rel_seek = position_ms >= active.anchor_start_ms
                     && (position_ms - active.anchor_start_ms) < window_dur_ms;
 
@@ -797,6 +974,7 @@ impl AudioBackend for HeosUpnpBackend {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.snapshot = BackendStatusSnapshot::default();
                 s.transition_guard_until = None;
+                s.last_keepalive_at = None;
                 s.snapshot.clone()
             };
             let _ = self.event_tx.send(BackendEvent::StateChanged(snap));

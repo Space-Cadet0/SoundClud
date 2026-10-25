@@ -2,6 +2,13 @@
 
 use axum::routing::get;
 use axum::Router;
+use soundclud_receiver::backends::heos_soap::{
+    avt_set_transport_uri, build_didl_lite_metadata, build_flac_didl_lite_metadata,
+};
+use soundclud_receiver::flac_streamer::{
+    audio_byte_offset_for_block, build_flac_header, compute_flac_stream_plan, flac_frame_byte_len,
+    locate_flac_audio_byte, spawn_flac_byte_stream, MAX_FLAC_WINDOW_BLOCKS,
+};
 use soundclud_receiver::hls_proxy::HlsProxy;
 use soundclud_receiver::protocol::{
     AccountTier, EphemeralSoundCloudAuth, PlayableProtocol, SelectedTranscodingDescriptor,
@@ -10,7 +17,14 @@ use soundclud_receiver::protocol::{
 use soundclud_receiver::wav_streamer::{
     build_wav_header, parse_http_byte_range, spawn_wav_byte_stream,
 };
+use std::io::Cursor;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use tokio::net::TcpListener;
 
 fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -250,7 +264,7 @@ async fn decodes_fragmented_mp4_init_plus_m4s_into_bit_perfect_0db_24bit_wav() {
 
     let proxy = HlsProxy::new();
     let session = proxy.create_session(locator, None).await.unwrap();
-    let mut rx = spawn_wav_byte_stream(session, 0, None);
+    let mut rx = spawn_wav_byte_stream(session.clone(), 0, None);
     let mut out = Vec::new();
     while let Some(Ok(chunk)) = rx.recv().await {
         out.extend_from_slice(&chunk);
@@ -275,10 +289,115 @@ async fn decodes_fragmented_mp4_init_plus_m4s_into_bit_perfect_0db_24bit_wav() {
         "expected ~-0.5 unity gain, got {s1_i32}"
     );
 
+    // Also stream as 0 dB SUBFRAME_VERBATIM 44.1kHz/24-bit FLAC and decode via symphonia!
+    let mut flac_rx = spawn_flac_byte_stream(session, 0, None);
+    let mut flac_out = Vec::new();
+    while let Some(Ok(chunk)) = flac_rx.recv().await {
+        flac_out.extend_from_slice(&chunk);
+    }
+    let mut hint = Hint::new();
+    hint.with_extension("flac");
+    let mss = MediaSourceStream::new(
+        Box::new(Cursor::new(flac_out)),
+        MediaSourceStreamOptions::default(),
+    );
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .expect("probe fMP4->FLAC output");
+    let track_params = probed.format.default_track().unwrap().codec_params.clone();
+    assert_eq!(track_params.sample_rate, Some(44_100));
+    assert_eq!(track_params.bits_per_sample, Some(24));
+    let mut dec = symphonia::default::get_codecs()
+        .make(&track_params, &DecoderOptions::default())
+        .unwrap();
+    let mut decoded_l = Vec::new();
+    while let Ok(pkt) = probed.format.next_packet() {
+        let buf = dec.decode(&pkt).unwrap();
+        let mut sbuf = SampleBuffer::<f32>::new(buf.capacity() as u64, *buf.spec());
+        sbuf.copy_interleaved_ref(buf);
+        for &[l, _] in sbuf.samples().as_chunks::<2>().0 {
+            decoded_l.push(l);
+        }
+    }
+    assert_eq!(decoded_l.len(), 3 * 4_096); // ceil(8820 / 4096) = 3 blocks = 12,288 frames
+    assert!((decoded_l[0] - 0.5).abs() < 0.001);
+    assert!((decoded_l[4_410] + 0.5).abs() < 0.001);
+    assert!(decoded_l[8_820..].iter().all(|&s| s == 0.0));
+
     assert!(parse_http_byte_range("bytes=44-103", 52_964).is_ok());
     assert!(parse_http_byte_range("bytes=999999-", 52_964).is_err());
 
     task.abort();
+}
+
+#[tokio::test]
+async fn verifies_flac_utf8_block_offset_inverse_boundaries_2gib_cap_and_quote_sanitization() {
+    let boundaries: &[u32] = &[0, 1, 127, 128, 2047, 2048, 65535, 65536, 87300, 87319];
+    for &b in boundaries {
+        let start = audio_byte_offset_for_block(u64::from(b));
+        let flen = usize::try_from(flac_frame_byte_len(u64::from(b))).unwrap();
+        assert_eq!(locate_flac_audio_byte(start), (b, 0));
+        assert_eq!(locate_flac_audio_byte(start + 12_345), (b, 12_345));
+        assert_eq!(
+            locate_flac_audio_byte(start + (flen as u64) - 1),
+            (b, flen - 1)
+        );
+        assert_eq!(locate_flac_audio_byte(start + (flen as u64)), (b + 1, 0));
+    }
+
+    // Verify closed-form O(1) sum matches incremental frame_len sum across all 4 UTF-8 buckets
+    let mut running_offset = 0u64;
+    for b in 0..=65_600u64 {
+        assert_eq!(audio_byte_offset_for_block(b), running_offset);
+        running_offset += flac_frame_byte_len(b);
+    }
+
+    // Verify 4-hour mix caps at MAX_FLAC_WINDOW_BLOCKS (87,300) strictly below i32::MAX
+    let quoted_track = TrackMetadata {
+        track_id: "777".to_string(),
+        permalink_url: "https://soundcloud.com/t/777".to_string(),
+        title: "  \"\"  ".to_string(),
+        artist: "\"\"".to_string(),
+        artwork_url: None,
+        duration_ms: 4 * 3_600 * 1_000,
+        waveform_url: None,
+    };
+    let plan = compute_flac_stream_plan(&quoted_track, quoted_track.duration_ms, 0);
+    assert_eq!(plan.total_blocks, MAX_FLAC_WINDOW_BLOCKS);
+    assert!(plan.total_file_bytes < i32::MAX as u64);
+
+    let hdr = build_flac_header(&quoted_track, 10);
+    let hdr_lossy = String::from_utf8_lossy(&hdr);
+    assert!(hdr_lossy.contains("TITLE=SoundCloud Track"));
+    assert!(hdr_lossy.contains("ARTIST=SoundCloud"));
+
+    let flac_didl = build_flac_didl_lite_metadata(
+        &quoted_track,
+        "http://127.0.0.1:9/s.flac",
+        plan.total_file_bytes,
+        plan.window_duration_ms,
+    );
+    assert!(flac_didl.contains("<dc:title>SoundCloud Track</dc:title>"));
+    assert!(flac_didl.contains("<dc:creator>SoundCloud</dc:creator>"));
+
+    let wav_didl = build_didl_lite_metadata(&quoted_track, "http://127.0.0.1:9/s.wav", 0, 529_200);
+    assert!(wav_didl.contains("<dc:title>SoundCloud Track</dc:title>"));
+    assert!(wav_didl.contains("<dc:creator>SoundCloud</dc:creator>"));
+
+    let client = reqwest::Client::new();
+    let empty_err = avt_set_transport_uri(
+        &client,
+        "http://127.0.0.1:9/AVT",
+        "http://127.0.0.1:9/s.flac",
+        "  ",
+    )
+    .await;
+    assert!(empty_err.is_err());
 }
 
 #[tokio::test]
