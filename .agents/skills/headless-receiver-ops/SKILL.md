@@ -1,38 +1,28 @@
 ---
 name: headless-receiver-ops
 description: >-
-  Build, inspect, deploy, and troubleshoot the SoundClud headless audio receiver
-  daemon (`crates/receiver`), including macOS 12 Monterey Intel (`x86_64`) cross-builds,
-  44.1 kHz Bit-Perfect `0 dB` CoreAudio/TOSLINK S/PDIF (`'spdf'`) persistent UID selection,
-  optical carrier keepalive, Local HLS AES-128/fMP4 proxy, Wi-Fi resilience, and
-  `launchd`/`systemd` services. Use when working on receiver audio, optical output,
+  Build, inspect, deploy, and troubleshoot the SoundClud receiver daemon
+  (`crates/receiver`), including Use Case 1 (44.1 kHz Bit-Perfect `0 dB`
+  CoreAudio/TOSLINK S/PDIF `'spdf'`) and Use Case 2 (Universal Denon/Marantz HEOS
+  Direct Network `ACT-Denon:1` / UPnP `44.1 kHz / 24-bit` WAV streaming), macOS 12
+  Monterey Intel (`x86_64`) cross-builds, Local HLS AES-128/fMP4 proxy, and
+  `launchd`/`systemd` services. Use when working on receiver audio, TOSLINK, HEOS,
   discovery, or daemon packaging.
 ---
 
-# Headless Receiver Operations & Bit-Perfect CoreAudio/TOSLINK Guide
+# Receiver Operations — CoreAudio/TOSLINK & Universal HEOS Direct Guide
 
-## Critical Hardware, Clocking & OS Invariants
-1. **Late 2014 Intel Mac Mini (`Macmini7,1`)**:
-   - Maximum official Apple OS is **macOS 12 Monterey**.
-   - **Never invoke `brew`** in receiver install/setup scripts: Homebrew 4.4+ dropped Monterey bottles and triggers multi-hour source compilations.
-   - Always compile `x86_64-apple-darwin` binaries with `MACOSX_DEPLOYMENT_TARGET=11.0` and provision standalone SHA-256-verified `mpv` binaries into `~/.local/share/soundclud/bin/`.
-2. **True Bit-Perfect `0 dB` Default & `44,100 Hz` Physical TOSLINK Clock**:
-   - Bind audio devices by **persistent CoreAudio UID** (`--audio-device=coreaudio/<UID>`), never numeric device index. On `AppleHDA`, Mini-TOSLINK insertion switches `BuiltInOutputDevice` data source FourCC to `'spdf'` ("Digital Out").
-   - **Default Volume Mode = `bit_perfect` (`0 dB` Unity Gain)**: Lock `mpv` `volume=100` and `ao-volume=100` with zero DSP or active-playback dither so attenuation happens exclusively in the Hi-Fi amplifier (`software_24bit` remains an optional fallback toggle).
-   - **Default Physical Sample Rate = `44,100 Hz` + `--coreaudio-change-physical-format=yes`**:
-     - `99.99%` of SoundCloud tracks (`aac_256k` Go+ HQ, `aac_160k` SQ, `aac_96k`, `mp3_1_0`) are native **`44,100 Hz`**.
-     - Passing `--audio-samplerate=44100 --coreaudio-change-physical-format=yes` switches `kAudioStreamPropertyPhysicalFormat` on the physical `'spdf'` optical substream to `44,100 Hz` (otherwise macOS `coreaudiod` silently resamples `44.1 -> 48 kHz`), restoring `original_asbd` cleanly on exit.
-3. **Eliminating macOS TOSLINK Optical Sleep Pops & Wi-Fi Buffering**:
-   - Keep `mpv` open with `--ao=coreaudio --idle=yes --keep-open=yes --audio-stream-silence=yes --gapless-audio=yes --cache=yes --demuxer-max-bytes=32MiB --cache-pause-initial=no`.
-   - Seed idle carrier with `av://lavfi:anullsrc=r=44100:cl=stereo` (or idle-only `-120 dBFS` `anoisesrc=r=44100` when `spdif_dither_keepalive` is enabled—never mixed into active Bit-Perfect tracks) and hold `/usr/bin/caffeinate -s -w <pid>`.
-4. **Local HLS Proxy (`127.0.0.1`) & Wi-Fi Security**:
-   - Rewrite `#EXT-X-MAP`, `#EXT-X-KEY` (`METHOD=AES-128`), and segment URLs to loopback endpoints, caching `init.mp4` and 16-byte AES keys in session RAM.
-   - Attach `client_id` / `track_authorization` / `secret_token` / `Authorization: OAuth <token>` **strictly** to `api-v2.soundcloud.com` (never to `*.soundcloud.cloud` or `*.sndcdn.com` signed CDN URLs).
-   - Hold `oauthToken` in a RAM-only `RedactedSecret` (zeroed on disconnect; never logged or persisted to disk), and enforce `Host`/`Origin` + automatic TOFU client bearer token checks over Wi-Fi.
-
-## Useful Verification Commands
-```bash
-MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release -p soundclud-receiver --target aarch64-apple-darwin
-MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release -p soundclud-receiver --target x86_64-apple-darwin
-system_profiler SPAudioDataType -json
-```
+## Critical Hardware, Backend Independence & OS Invariants
+1. **Strict Backend Independence & `0 dB` Amp-Volume Law**:
+   - `LocalMpvBackend` (Use Case 1: CoreAudio/TOSLINK/ALSA) and `HeosUpnpBackend` (Use Case 2: Denon/Marantz HEOS Direct Network) are **100% decoupled**: selecting TOSLINK never sends HEOS power/input commands, and selecting HEOS never opens CoreAudio devices.
+   - **Both** backends operate strictly at **`0 dB` Bit-Perfect Unity Gain** (`44,100 Hz / 24-bit` PCM)—volume is adjusted exclusively via the physical Hi-Fi amplifier knob or remote (`HeosUpnpBackend` never calls `set_volume` or `RenderingControl::SetVolume`).
+2. **Use Case 1 — `LocalMpvBackend` (2014 Mac Mini TOSLINK & Linux ALSA/PipeWire)**:
+   - Late 2014 Intel Mac Minis (`Macmini7,1`) cap out at **macOS 12 Monterey** (never invoke `brew`; compile `x86_64-apple-darwin` with `MACOSX_DEPLOYMENT_TARGET=11.0` + standalone SHA-256-verified `mpv`).
+   - Bind persistent CoreAudio UID (`--audio-device=coreaudio/<UID>`) with `--ao=coreaudio --audio-samplerate=44100 --coreaudio-change-physical-format=yes --volume=100 --idle=yes --keep-open=yes --audio-stream-silence=yes --gapless-audio=yes --cache=yes --demuxer-max-bytes=32MiB --cache-pause-initial=no`.
+   - Seed idle carrier with `av://lavfi:anullsrc=r=44100:cl=stereo` + `caffeinate -s` to prevent macOS optical sleep pops.
+3. **Use Case 2 — `HeosUpnpBackend` (Universal Denon/Marantz HEOS Direct Network)**:
+   - Auto-discover any HEOS Built-in device on the LAN via SSDP (`urn:schemas-denon-com:device:ACT-Denon:1` / `AiosDevice:1`), mDNS (`_heos-audio._tcp`), and HEOS CLI (`TCP 1255` `heos://player/get_players`). Works whether `soundclud-receiver` runs on a LAN Mac Mini or locally on `127.0.0.1` on the user's laptop (zero `mpv` required in pure-Rust HEOS mode!).
+   - Wake from Network Standby on Play when `ACT:1#GetDevicePowerState == "OFF"` via `ACT:1#SetDevicePowerState("ON")` (`:60006/ACT/control`), push `DIDL-Lite` Track Title/Artist/Artwork metadata to the amplifier's front OLED via `AVTransport::SetAVTransportURI`, and serve seekable `44,100 Hz / 24-bit` `0 dB` uncompressed WAV (`audio/wav`) over LAN HTTP (`~350–650 ms` warm start & `REL_TIME` byte-range scrub).
+   - Derive opaque `heos_<digest>` IDs from UDN/serial; never log or expose raw serials, MACs, or HEOS `service_username`s.
+4. **Local HLS Proxy & Wi-Fi Security**:
+   - Cache `#EXT-X-MAP` (`init.mp4`) and `#EXT-X-KEY` (`METHOD=AES-128`) in session RAM, refresh expiring CloudFront URLs transparently, attach `OAuth` strictly to `api-v2.soundcloud.com` (never `*.soundcloud.cloud`/`*.sndcdn.com`), hold `oauthToken` in RAM-only `RedactedSecret`, and enforce `Host`/`Origin` + TOFU bearer tokens.

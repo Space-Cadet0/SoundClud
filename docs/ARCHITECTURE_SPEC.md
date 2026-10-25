@@ -1,25 +1,27 @@
-# SoundClud — Project Brief & Technical Architecture Specification (v1.1)
+# SoundClud — Project Brief & Technical Architecture Specification (v1.2)
 
 > [!IMPORTANT]
-> **Universal Portability Mandate (Zero Per-Track / Per-User / Per-Machine Patches)**:
-> Every subsystem in `SoundClud` is designed from first principles to work out-of-the-box on a fresh installation for **any user**, with **any SoundCloud account** (unauthenticated, Free, or Go+ `256 kbps` HQ), over **Wi-Fi or Ethernet LANs**, across macOS (Intel macOS 12 Monterey+ and Apple Silicon) and Linux receivers and any **Chromium** desktop browser (`Chrome`, `Brave`, `Arc`, `Edge`). Zero static IPs, personal paths, numeric audio device indices, or track-specific workarounds are permitted.
+> **Universal Portability Mandate (Zero Per-Track / Per-Device / Per-User / Per-Machine Patches)**:
+> Every subsystem in `SoundClud` is designed from first principles to work out-of-the-box on a fresh installation for **any user**, with **any SoundCloud account** (unauthenticated, Free, or Go+ `256 kbps` HQ), over **Wi-Fi or Ethernet LANs**, across macOS (Intel macOS 12 Monterey+ and Apple Silicon) and Linux receivers, **any Denon/Marantz HEOS Built-in amplifier or speaker**, and any **Chromium** desktop browser (`Chrome`, `Brave`, `Arc`, `Edge`). Zero static IPs, personal paths, numeric audio device indices, hardcoded HEOS device names/PIDs, or track-specific workarounds are permitted.
 
 ---
 
-## 1. Locked Architectural Decisions (v1.1)
+## 1. Dual Core Use Cases & Locked Architectural Decisions (v1.2)
 
-1. **Default TOSLINK Output Mode — True Bit-Perfect `0 dB` @ Physical `44,100 Hz`**:
-   - Receiver digital output defaults strictly to **Bit-Perfect `0 dB` Unity Gain** (`volume=100`, `ao-volume=100`, zero DSP, zero active-playback dither) so volume attenuation occurs exclusively in the external Hi-Fi amplifier (with an opt-in `software_24bit` fallback toggle available in settings for non-amp outputs).
-   - Byte-level inspection of SoundCloud `init.mp4` (`esds` ISO 14496-3 `AudioSpecificConfig`) confirms `99.99%` of SoundCloud streams (`aac_256k` Go+ HQ, `aac_160k` SQ, `aac_96k`, `mp3_1_0`) are native **`44,100 Hz`**. On macOS CoreAudio, `soundclud-receiver` locks physical S/PDIF hardware clocking to **`24-bit / 44,100 Hz`** via `--audio-samplerate=44100 --coreaudio-change-physical-format=yes` so `44.1 kHz` Go+ HQ tracks pass through CoreAudio with **zero sample-rate conversion (`1:1` sample frames)**.
-2. **Client Browser Target — Chromium Manifest V3 Exclusively**:
-   - Targets Chromium (`Google Chrome`, `Brave`, `Arc`, `Edge`, `minimum_chrome_version: "116"`) with zero cross-browser polyfill shims and **zero `"cookies"` permission** in `manifest.json`.
-3. **Wi-Fi First-Class Operation & Zero-Click TOFU Security**:
-   - **Zero Wi-Fi Audio Glitches**: Because stream fetching and decoding run locally on the receiver (with a `32 MiB` RAM segment cache and `--cache-pause-initial=no`), **zero audio packets cross Wi-Fi between laptop and receiver**—only ~150-byte JSON control/state frames. Closing the laptop lid or experiencing Wi-Fi airtime spikes never interrupts audio.
-   - **Wi-Fi Multicast Resilience**: After initial Bonjour/mDNS discovery, reconnects race `hostname.local` against the cached unicast LAN IP (`Promise.any`) over TCP, bypassing 802.11 multicast packet loss (with explicit diagnostics if router Guest/AP Client Isolation is enabled).
-   - **Wi-Fi Security**: Uses **zero-click Trust-On-First-Use (TOFU)** cryptographic bearer token pairing + strict `Host` & `Origin` (`chrome-extension://<id>`) verification to block DNS-rebinding and Cross-Site WebSocket Hijacking on Wi-Fi, plus an optional `--require-pin` mode for shared networks.
-4. **Always-Default SoundCloud Go+ High Quality (`aac_256k`) With Zero Separate Login**:
-   - Piggybacks 100% natively on the user's existing `https://soundcloud.com` login session—no separate OAuth flow or credential entry in SoundClud.
-   - Bypasses SoundCloud Web's client-side `"sq"` default (`localStorage["V2::local::settings"].streamingQuality === null`) to select **`aac_256k` (`quality: "hq"`, 256 kbps AAC-LC @ 44.1 kHz)** automatically whenever Go+ is present.
+`SoundClud` lets listeners browse, queue, scrub waveforms, and press hardware media keys directly inside the native first-party `https://soundcloud.com` web interface while selecting between **two strictly independent, `0 dB` Bit-Perfect Hi-Fi output modes** directly from the Chromium extension:
+
+1. **Use Case 1 — Headless Direct Digital Output (`LocalMpvBackend`: TOSLINK S/PDIF / CoreAudio / ALSA)**:
+   - Offloads all SoundCloud stream fetching, decoding, and digital audio output to a headless machine wired directly to an amplifier—such as a Late 2014 Intel Mac Mini (`Macmini7,1`, macOS 12 Monterey) connected via optical Mini-TOSLINK S/PDIF (`'spdf'`).
+   - Locks physical CoreAudio hardware clocking to **`24-bit / 44,100 Hz`** (`--audio-samplerate=44100 --coreaudio-change-physical-format=yes`) at **`0 dB` Unity Gain** (`volume=100`, `ao-volume=100`) with continuous idle optical carrier keepalive (`anullsrc`), achieving `~40–180 ms` play/scrub latency and full compatibility with amplifier "Pure Modes" (where internal amp network circuitry is powered off).
+2. **Use Case 2 — Direct Denon/Marantz HEOS Network Output (`HeosUpnpBackend`: e.g., Marantz PM7000N)**:
+   - Auto-discovers any Denon/Marantz HEOS Built-in device on the LAN (`urn:schemas-denon-com:device:ACT-Denon:1` / `_heos-audio._tcp` / `TCP 1255`) and exposes it as a 1-click target inside the Chromium extension—working identically whether `soundclud-receiver` runs **24/7 on a headless Mac Mini** or **locally on `127.0.0.1` on the client laptop** (requiring zero second computer and zero `mpv` binary in pure-Rust HEOS mode).
+   - Automatically wakes the HEOS amplifier from Network Standby (`ACT:1#SetDevicePowerState("ON")`), switches its input to Network/HEOS, displays live **Track Title, Artist & Elapsed Time** on the amplifier's front OLED via UPnP `DIDL-Lite`, and streams byte-range seekable **`44,100 Hz / 24-bit` `0 dB` uncompressed WAV/LPCM (`audio/wav`)** asynchronously over Ethernet/Wi-Fi (`~350–650 ms` warm start & scrub, clocked by the amplifier's internal master crystal oscillator).
+3. **Strict Backend Independence & `0 dB` Amp-Knob / Remote-Only Volume**:
+   - **Amp Knob / Remote Only**: Both `LocalMpvBackend` (`TOSLINK`) and `HeosUpnpBackend` (`HEOS Direct`) output strictly **`0 dB` Bit-Perfect digital PCM** and **never** mutate hardware or software volume (`heos://player/set_volume` and `RenderingControl::SetVolume` are never called)—leaving attenuation 100% to the physical amplifier knob or remote.
+   - **Zero Cross-Coupling**: Selecting TOSLINK never sends HEOS power or input-switch commands, and selecting HEOS never touches CoreAudio/optical outputs.
+4. **Chromium-Only Manifest V3, Wi-Fi Resilience & Always-Default Go+ `256 kbps` HQ**:
+   - Targets Chromium Manifest V3 (`minimum_chrome_version: "116"`, zero `"cookies"` permission).
+   - Piggybacks seamlessly on the user's native `soundcloud.com` login in RAM (`chrome.storage.session` + `RedactedSecret` on receiver) to automatically select **Go+ `aac_256k` (`quality: "hq"`, 256 kbps AAC-LC @ 44.1 kHz)** even when SoundCloud Web defaulted to `sq`.
 
 ---
 
@@ -27,11 +29,11 @@
 
 | Flawed Naive Assumption | Why It Fails in Reality | SoundClud First-Principles Architecture |
 | :--- | :--- | :--- |
-| **1. Backend `yt-dlp` stream extraction** | Spawns Python + scrapes SoundCloud JS bundles (`1,500–3,500 ms` cold start per click), fails on Go+ / private tracks without fragile cookie exports, and breaks whenever SoundCloud rotates `client_id`. | **Browser Stream-Locator Handoff**: The authenticated browser tab already holds `api-v2` `media.transcodings[]`, `track_authorization`, and `OAuth` session context—forwarding the stream locator in `<5 ms` with zero Python/`yt-dlp` dependency. |
-| **2. Passing raw SoundCloud `.m3u8` URLs directly to `mpv`** | SoundCloud HLS playlists are VOD (`#EXT-X-ENDLIST`) whose CloudFront `#EXT-X-MAP` (`init.mp4`), `#EXT-X-KEY`, and segment URLs expire after **~15–30 minutes**. `mpv` caches VOD playlists once at `t=0`, crashing mid-mix on 1–3 hour DJ sets (or after a 20-minute pause) with `HTTP 403 Forbidden`. | **Embedded `127.0.0.1` Local HLS Refresh & AES-128 Proxy**: Rewrites `#EXT-X-MAP`, `#EXT-X-KEY`, and segment URLs to loopback endpoints, caches `init.mp4` & 16-byte AES-128 keys in RAM, and transparently refreshes expired segment signatures before TTL expiry or on `403`. |
-| **3. Tampermonkey Userscript or Page-World LAN `fetch`/`WebSocket`** | `https://soundcloud.com` -> `http://` or `ws://` on Wi-Fi/LAN is blocked by **Mixed Content**, **Chrome 142+ Local Network Access (LNA)**, and **Brave Shields**. Putting `ws://*/*` in MV3 `manifest.json` throws an invalid match-scheme error at load time. | **3-World Chromium Manifest V3 Extension**: All LAN `http://` & `ws://` I/O runs exclusively inside the **MV3 Service Worker** (`host_permissions` using valid `http://` patterns), bridged via `chrome.runtime.connect` `Port` and nonce-verified `CustomEvent`s. |
-| **4. Naively calling `audio.pause()` or trusting SoundCloud Web's default stream** | Pausing `HTMLAudioElement` freezes SoundCloud's UI progress bar and stops queue auto-advance; silencing tab media kills MacBook hardware media keys; reusing Maestro's default `.m3u8` serves `160 kbps` `sq` even to paying Go+ subscribers because SoundCloud Web defaults `streamingQuality` to `null` (`"sq"`). | **Clean Maestro MSE Virtualization + Go+ HQ Ranker + `-100 dBFS` Hardware-Key Loop**: Selects `aac_256k` `hq` directly from `media.transcodings[]`, keeps `nativeAudio` paused in C++ after `sourceopen`, drives UI/auto-advance from remote ticks, and loops a 10s `-100 dBFS` WAV for macOS media keys. |
-| **5. Homebrew setup script + `48 kHz` CoreAudio default + TOSLINK idle sleep** | Late 2014 Intel Mac Minis (`Macmini7,1`) max out at **macOS 12 Monterey**, which **Homebrew 4.4+ dropped**. Without `--coreaudio-change-physical-format=yes` at `44.1 kHz`, macOS `coreaudiod` resamples `44.1 -> 48 kHz`. Idle macOS TOSLINK powers off its optical laser after ~7–30s, causing loud DAC pops. | **Zero-Homebrew Static Rust Daemon + Standalone `mpv` + Physical `44.1 kHz` `0 dB` Clock + Optical Carrier Keepalive**: Targets `MACOSX_DEPLOYMENT_TARGET=11.0`, locks physical `'spdf'` clock to `44,100 Hz` unity gain, and streams zero-CPU `anullsrc` silence while idle. |
+| **1. Backend `yt-dlp` stream extraction** | Spawns Python + scrapes SoundCloud JS bundles (`1,500–3,500 ms` cold start per click), fails on Go+ / private tracks without fragile cookie exports, and breaks whenever SoundCloud rotates `client_id`. | **Browser Stream-Locator Handoff**: The authenticated browser tab forwards `api-v2` `media.transcodings[]`, `track_authorization`, and ephemeral `OAuth` session context in `<5 ms` with zero Python/`yt-dlp` dependency. |
+| **2. Passing raw SoundCloud `.m3u8` URLs directly to `mpv` or HEOS UPnP** | SoundCloud VOD `.m3u8` URLs (`#EXT-X-MAP` `init.mp4`, `#EXT-X-KEY`, `.m4s`) expire after **~15–30 minutes** (`HTTP 403` mid-DJ-mix). Furthermore, Denon/Marantz AIOS (`GetProtocolInfo`) supports **zero** HLS (`.m3u8`), fMP4 (`#EXT-X-MAP`), `AES-128`, or Opus MIME types. | **Embedded HLS Refresh Proxy + Pure-Rust `44.1 kHz / 24-bit` WAV Streamer**: Refreshes expiring CloudFront signatures transparently, feeding rewritten HLS to local `mpv` (`TOSLINK`) or continuous `44.1 kHz / 24-bit` `0 dB` `audio/wav` over HTTP to HEOS (`AVTransport`). |
+| **3. Pure Browser Extension -> HEOS Direct or HEOS Built-In SoundCloud (`sid = 9`)** | Chromium MV3 has no raw TCP (`1255`) or UDP multicast (`1900` SSDP) sockets. Meanwhile, HEOS CLI's built-in `sid = 9` **has no `seek`/scrub command**, cannot play arbitrary `soundcloud.com` or `?secret_token=` URLs, requires static HEOS-app login, and cannot guarantee Go+ `aac_256k` HQ. | **Unified `soundclud-receiver` Multi-Output Gateway** (on LAN server or `127.0.0.1`): Discovers HEOS via SSDP/mDNS/`TCP 1255`, wakes via `ACT:1`, and drives `:60006` `AVTransport` with full `REL_TIME` waveform scrubbing and `DIDL-Lite` OLED metadata. |
+| **4. Streaming compressed `256 kbps` AAC over HTTP to HEOS `AVTransport`** | Denon/Marantz AIOS pre-buffers ~`128 KB` before unmuting the DAC; at `256 kbps` (`32 KB/s`), every play or scrub lags by **`~4.0 seconds`**. | **Uncompressed `44,100 Hz / 24-bit` `0 dB` WAV (`264.6 KB/s`)**: Fills AIOS's `128 KB` buffer in **`~0.48 seconds` (`~350–650 ms` warm play/scrub)** with deterministic `O(1)` byte-offset seeking (`44 + frame * 6`). |
+| **5. Homebrew setup + `48 kHz` CoreAudio default + TOSLINK idle sleep** | Late 2014 Mac Minis max out at **macOS 12 Monterey** (dropped by Homebrew 4.4+). Without `--coreaudio-change-physical-format=yes` at `44.1 kHz`, `coreaudiod` resamples `44.1 -> 48 kHz`; idle TOSLINK powers off its laser after ~7–30s, causing loud DAC pops. | **Zero-Homebrew Static Rust Daemon (`MACOSX_DEPLOYMENT_TARGET=11.0`) + Physical `44.1 kHz` `0 dB` Clock + Idle `anullsrc` Optical Carrier Keepalive**. |
 
 ---
 
@@ -42,26 +44,32 @@ flowchart LR
     subgraph Client["Client Machine on Wi-Fi (Chromium MV3 — Chrome / Brave / Arc / Edge)"]
         SC["soundcloud.com (Maestro SPA)"]
         MW["MAIN World (Go+ HQ Locator + MSE Virtualizer + -100dBFS MediaKey Loop)"]
-        IW["ISOLATED World (Nonce Bridge + Shadow DOM Cast Pill)"]
-        SW["MV3 Service Worker (Discovery + TOFU WS + chrome.storage)"]
+        IW["ISOLATED World (Nonce Bridge + Shadow DOM Output Picker & Cast Pill)"]
+        SW["MV3 Service Worker (127.0.0.1 + mDNS Discovery + TOFU WS)"]
         SC <--> MW
         MW <-->|"Nonce CustomEvent"| IW
         IW <-->|"chrome.runtime Port"| SW
     end
 
-    subgraph Receiver["Headless Receiver on Wi-Fi / Ethernet (e.g., 2014 Mac Mini macOS 12+ or Linux)"]
-        AX["Rust Daemon: soundclud-receiver (Axum REST + WS + TOFU Guard + mDNS)"]
-        HP["Local HLS Refresh & AES-128 Proxy (127.0.0.1 + init/key RAM Cache)"]
-        MPV["Managed mpv (AF_UNIX IPC + 32MiB Cache + Physical 44.1kHz 0dB)"]
-        OPT["TOSLINK Optical S/PDIF -> Hi-Fi Amplifier (External Volume)"]
+    subgraph Gateway["soundclud-receiver (Rust — On Headless Mac Mini OR Local 127.0.0.1)"]
+        AX["Axum REST + WS + TOFU Guard + mDNS / SSDP Directory"]
+        HP["Go+ HLS Refresh & AES-128 Cache (init.mp4 + 16B Keys in RAM)"]
+        B1["Backend 1: LocalMpvBackend\n(AF_UNIX IPC + Physical 44.1kHz 0dB)"]
+        B2["Backend 2: HeosUpnpBackend\n(Pure-Rust fMP4/AAC -> 44.1kHz/24b 0dB WAV\n+ ACT:1 Auto-Wake + DIDL OLED Metadata)"]
         AX <--> HP
-        AX <-->|"AF_UNIX IPC (<1.5ms)"| MPV
-        HP -->|"Rewritten fMP4 / AES-128 Stream"| MPV
-        MPV -->|"Bit-Perfect 24-bit / 44.1kHz 0dB PCM"| OPT
+        HP --> B1
+        HP --> B2
     end
 
-    SW <-->|"Wi-Fi Unicast WS + REST (/api/v1)"| AX
-    HP -->|"Origin-Scoped Auth (api-v2) & Clean CDN Fetch (soundcloud.cloud)"| CDN["SoundCloud API v2 & Media CDNs"]
+    subgraph HiFi["Hi-Fi Amplifier (e.g., Marantz PM7000N — AK4490EQ DAC, Amp Volume Only)"]
+        OPT["OPTICAL 1 Input (TOSLINK S/PDIF)"]
+        HEOS["HEOS Network Module (TCP 1255 + UPnP :60006)"]
+    end
+
+    SW <-->|"Unicast WS + REST (/api/v1)"| AX
+    HP -->|"Origin-Scoped Auth (api-v2) & Clean CDN Fetch"| CDN["SoundCloud API v2 & Media CDNs"]
+    B1 -->|"Use Case 1: Mini-TOSLINK Fiber"| OPT
+    B2 -->|"Use Case 2: LAN HTTP audio/wav + SOAP"| HEOS
 ```
 
 ---
@@ -69,70 +77,61 @@ flowchart LR
 ## 4. Detailed Subsystem Specifications
 
 ### 4.1 Zero-Friction SoundCloud Go+ Authentication & Stream Selection
-1. **Why SoundCloud Web Defaults to Low/Standard Quality (`sq`) — And How We Fix It**:
-   - SoundCloud's web client stores streaming quality in `window.localStorage["V2::local::settings"]` with `streamingQuality: null` by default, which its `getCurrentQuality()` helper maps to `"sq"`—causing SoundCloud's player to discard `quality: "hq"` client-side unless the user manually toggled `soundcloud.com/settings/streaming`.
-   - Crucially, **`api-v2.soundcloud.com` always includes `quality: "hq"` (`aac_256k`) entries in `track.media.transcodings[]`** whenever an authenticated Go+ `Authorization: OAuth <token>` header or `oauth_token` cookie is present—even when the web UI setting is still `null`/`"sq"`.
-   - **Two-Layer Go+ HQ Guarantee**:
-     1. SoundClud's `MAIN`-world Stream-Locator ranks all `media.transcodings[]` directly and **always selects `quality: "hq"` (`aac_256k`)** first. An in-tab `.m3u8` already fetched by Maestro is reused *only* if its transcoding URL matches SoundClud's #1 ranked transcoding; otherwise, the receiver resolves the `hq` `transcoding.url` directly (~40–80 ms) so Go+ users never accidentally receive Maestro's `sq` stream.
-     2. When `window.__sc_hydration` `features` contains `"hq_audio"` and `V2::local::settings` `streamingQuality` is unset/`null`, SoundClud automatically promotes it to `"hq"` so local playback uses Go+ HQ as well.
+1. **Why SoundCloud Web Defaults to `sq` — And How SoundClud Guarantees Go+ `hq` (`aac_256k`)**:
+   - SoundCloud Web stores streaming preferences in `localStorage["V2::local::settings"]` with `streamingQuality: null` -> `"sq"` by default, discarding `"hq"` client-side even though **`api-v2.soundcloud.com` always includes `quality: "hq"` (`aac_256k`) in `media.transcodings[]`** for authenticated Go+ sessions.
+   - SoundClud's `MAIN`-world Stream-Locator ranks `media.transcodings[]` directly (`aac_256k` Go+ HQ > `aac_160k` SQ > `mp3_1_0` 128k > `aac_96k` LQ > `opus_0_0` 64k), skips broken `abr_*` `404` stubs, only reuses Maestro's in-tab `.m3u8` if it matches our #1 ranked transcoding, and promotes unset `V2::local::settings.streamingQuality` to `"hq"` when `"hq_audio"` is present.
 2. **100% Seamless Session Piggybacking (Zero Separate Login & Zero `"cookies"` Permission)**:
-   - On initial SSR load, `MAIN` world reads `window.__sc_hydration` (`apiClient.id` -> `client_id`, `features` -> `"hq_audio"`, `meUser`, hydrated `sound`/`playlist` models) and `document.cookie` (`oauth_token` is non-`HttpOnly` on `soundcloud.com`).
-   - During SPA browsing, `MAIN` world passively observes `Authorization: OAuth <token>` headers and `client_id` query params on `https://api-v2.soundcloud.com/*` requests—automatically tracking mid-session logins/logouts and SoundCloud's modern expiring JWT `TokenExpiryManager` refreshes.
-   - **Ephemeral Zero-PII Credential Handling**: Session auth is held strictly in `chrome.storage.session` (RAM-only in Chromium) and inside a `RedactedSecret` wrapper in ephemeral session RAM on `soundclud-receiver` (never logged, never returned on `/api/v1/status`, never written to disk, and zeroed immediately on `stop` or disconnect).
-3. **2026 Codec, Encryption (`AES-128` vs Widevine CENC) & Broken-Stub Filtering**:
-   - **Reject Broken Stubs**: Skip `preset.startsWith("abr")` (`abr_sq` / `abr_hq` `audio/mpegurl` entries return `HTTP 404` on `api-v2`).
-   - **Distinguish Playable HLS `AES-128` from Non-Playable Hardware DRM**:
-     - **Playable on Receiver**: `format.protocol` in `["hls", "encrypted-hls", "progressive"]` (`"encrypted-hls"` uses standard HLS `#EXT-X-KEY:METHOD=AES-128` with a 16-byte key—fully supported by `mpv`/FFmpeg without a browser CDM, preferring `"hls"` > `"encrypted-hls"` > `"progressive"` within the same tier).
-     - **Hardware CDM Only (Skip for Receiver)**: `format.protocol` in `["ctr-encrypted-hls", "cbc-encrypted-hls"]` (Widevine CENC / FairPlay CBCS).
-   - **Deterministic Quality Ranking** (preferring `!snipped` full tracks):
-     1. **`aac_256k`** *(legacy alias: `aac_hq` / `hq_aac`, `quality: "hq"`, **256 kbps AAC-LC @ 44,100 Hz**)*
-     2. **`aac_160k`** *(`quality: "sq"`, **160 kbps AAC-LC @ 44,100 Hz**)*
-     3. **`mp3_1_0` / `mp3_0_0`** *(`quality: "sq"`, **128 kbps MP3 @ 44,100 Hz**)*
-     4. **`aac_96k`** *(`quality: "lq"`, **96 kbps AAC-LC @ 44,100 Hz**)*
-     5. **`opus_0_0`** *(`quality: "sq"`, **64 kbps Opus @ 48,000 Hz**)*
-   - **Mixed-Queue Widevine Fallback (`drm_local_fallback`)**: Certain major-label catalog tracks expose *only* `ctr-`/`cbc-encrypted-hls` for full-length playback (with only a 30s `snipped: true` preview in plain `hls`). Rather than playing a truncated 30s snippet or failing, SoundClud marks that track `drm_local_fallback`, lets Chromium's Widevine CDM play that single track locally (`Widevine DRM • Playing Locally`), and **automatically resumes headless receiver handoff on the next non-DRM track in the queue**.
+   - Passively observes `window.__sc_hydration` (`apiClient.id`, `features`, `meUser`) and `Authorization: OAuth <token>` / `document.cookie` `oauth_token` (including mid-session logins and expiring JWT refreshes).
+   - Holds auth strictly in `chrome.storage.session` (Chromium RAM) and `RedactedSecret` session RAM on `soundclud-receiver` (zeroed on `stop`/disconnect; never logged or persisted to disk).
+3. **Playable `encrypted-hls` (`AES-128`) vs Mixed-Queue Widevine Fallback (`drm_local_fallback`)**:
+   - Accepts `format.protocol` in `["hls", "encrypted-hls", "progressive"]` (`hls` > `encrypted-hls` > `progressive`), rejecting hardware-CDM-only `"ctr-encrypted-hls"` / `"cbc-encrypted-hls"`.
+   - When a major-label track offers *only* Widevine/FairPlay CENC full streams, SoundClud marks that track `drm_local_fallback` (`Widevine DRM • Playing Locally`) so it plays full-length in Chromium rather than a 30s preview, then **automatically resumes TOSLINK or HEOS handoff on the next non-DRM track**.
 
-### 4.2 Embedded `127.0.0.1` Local HLS Refresh & AES-128 Proxy (`crates/receiver`)
-1. **Complete Playlist Directive Rewriting & RAM Caching**:
-   - Serves `http://127.0.0.1:<loopback_port>/hls/<session_id>/playlist.m3u8` (guarded by a random per-session capability token).
-   - Rewrites **all three** expiring URI classes inside `.m3u8` manifests:
-     - `#EXT-X-MAP:URI="..."` -> `/hls/<session_id>/init` (`init.mp4` cached in session RAM so arbitrary seeks 45+ minutes into a DJ mix never `403`).
-     - `#EXT-X-KEY:METHOD=AES-128,URI="..."` -> `/hls/<session_id>/key/<idx>` (16-byte AES key fetched once and cached in session RAM).
-     - Media segments (`.m4s` / `.ts` / `.mp3`) -> `/hls/<session_id>/seg/<seq>` (with segment #0/#1 RAM pre-fetch and automatic upstream `.m3u8` re-resolution via `transcoding.url` or WS `refresh_locator_request` before CloudFront signature expiry or on upstream `401`/`403`).
-2. **Strict Origin-Scoped Authentication (Preventing CDN `HTTP 403`)**:
-   - Attaches `client_id`, `track_authorization`, `secret_token`, and `Authorization: OAuth <token>` **strictly** to `api-v2.soundcloud.com` / `api.soundcloud.com` requests.
-   - **Never** appends query parameters or `Authorization` headers to signed CDN URLs (`playback.media-streaming.soundcloud.cloud`, `*.sndcdn.com`), preserving CloudFront custom-policy signature validity.
+### 4.2 Shared HLS Refresh & AES-128 Session Cache (`crates/receiver`)
+- Caches `#EXT-X-MAP` (`init.mp4`) and `#EXT-X-KEY` (`METHOD=AES-128` 16-byte key) in session RAM so arbitrary seeks 45+ minutes into a DJ mix never `HTTP 403`.
+- Proactively refreshes upstream `.m3u8` segment URLs via `transcoding.url` (or WS `refresh_locator_request`) before CloudFront TTL expiry or on `401`/`403`.
+- **Strict Origin-Scoped Auth**: Sends `client_id`, `track_authorization`, `secret_token`, and `Authorization: OAuth <token>` **strictly** to `api-v2.soundcloud.com` / `api.soundcloud.com`—never to signed CDN hosts (`playback.media-streaming.soundcloud.cloud`, `*.sndcdn.com`).
 
-### 4.3 Clean Maestro MSE Virtualization, Cast Telemetry & Hardware Media Keys
-1. **3-Mode Lifecycle (`OFF` <-> `HANDOFF_ACTIVE` <-> `DRM_LOCAL_FALLBACK`)**:
-   - Seamless mid-track `OFF <-> ON` timestamp handoff (`nativeAudio.currentTime <-> startPositionSec`).
-   - Keeps `nativeAudio` paused in C++ after initial `MediaSource` `sourceopen`, virtualizes `paused`/`currentTime`/`seeking`/`buffered` (`SourceBuffer.prototype.buffered` reports `[0, min(duration, virtualCurrentTime + 60)]` so Maestro stops downloading segments on the laptop), coalesces waveform scrub drags (`~60 ms`), and fires native `ended` on remote EOF for automatic queue advancement.
-   - Loops a 10-second, 8 kHz `-100 dBFS` in-memory PCM WAV (`muted = false`, `volume = 0.01`, `__soundcludKeepalive = true`) in lockstep with remote play/pause so MacBook Air hardware Play/Pause/Next/Prev keys and macOS Control Center Now Playing work continuously.
-2. **Transparent Quality & Bit-Perfect Status Pill**:
-   - Displays exact active stream & output truth in SoundCloud's bottom bar and the extension popup:
-     - `Go+ HQ • AAC 256k • 44.1kHz 0dB Bit-Perfect`
-     - `Standard • AAC 160k • 44.1kHz 0dB` *(or `(Source Max)` / `(HQ is Widevine DRM)`)*
-     - `Widevine DRM • Playing Locally` *(auto-resumes receiver next track)*
-     - Subtle sign-in hint in Popup when guest/unauthenticated.
+### 4.3 Dual Independent Audio Backends (`AudioBackend` Trait)
 
-### 4.4 Wi-Fi Discovery, Security & Bit-Perfect CoreAudio/TOSLINK Output
-1. **3-Tier Wi-Fi-Resilient Discovery & TOFU Pairing**:
-   - Native macOS Bonjour (`dns-sd` / `DNSServiceRegister`) + Linux `mdns-sd` advertising `soundclud.local` and `_soundclud._tcp.local.`, backed by peer-gossip `GET /api/v1/discover` (auto-connecting when 1 receiver is on Wi-Fi; 1-click picker when 2+ exist).
-   - Dual persistence (`hostname.local` + cached unicast IP `Promise.any` race) eliminates Wi-Fi 802.11 multicast packet-loss delays on reconnect, with bounded `/24` unicast scan fallback and clear diagnostics for macOS 15+ Local Network Privacy or router Guest/AP Isolation.
-   - Automatic TOFU client token exchange on first connect + strict `Host`/`Origin` validation protects the receiver on Wi-Fi with zero extra clicks (`--require-pin` optional for shared networks).
-2. **True `44.1 kHz` Bit-Perfect `0 dB` TOSLINK & Zero-Pop Carrier Keepalive**:
-   - Binds persistent CoreAudio UID (`--audio-device=coreaudio/<UID>`, auto-selecting `'spdf'` optical Digital Out when present) with:
-     `--ao=coreaudio --audio-samplerate=44100 --coreaudio-change-physical-format=yes --volume=100 --idle=yes --keep-open=yes --audio-stream-silence=yes --gapless-audio=yes --cache=yes --demuxer-max-bytes=32MiB --cache-pause-initial=no`.
-   - Streams `av://lavfi:anullsrc=r=44100:cl=stereo` while idle (plus optional idle-only `-120 dBFS` `anoisesrc` for auto-muting external DACs—never active during music playback) + `caffeinate -s` power assertion, preventing macOS `ao_coreaudio` 7s idle shutdown and 30s optical laser sleep pops.
+#### Backend 1 — `LocalMpvBackend` (CoreAudio / TOSLINK S/PDIF / PipeWire / ALSA)
+- Binds persistent device UID (`--audio-device=coreaudio/<UID>`, auto-detecting `'spdf'` optical Digital Out on macOS) via `AF_UNIX` JSON IPC:
+  `--ao=coreaudio --audio-samplerate=44100 --coreaudio-change-physical-format=yes --volume=100 --idle=yes --keep-open=yes --audio-stream-silence=yes --gapless-audio=yes --cache=yes --demuxer-max-bytes=32MiB --cache-pause-initial=no`.
+- Streams `av://lavfi:anullsrc=r=44100:cl=stereo` while idle (plus optional idle-only `-120 dBFS` `anoisesrc`) and holds `caffeinate -s` to prevent macOS optical laser sleep pops.
+- Never issues HEOS network calls when selected.
+
+#### Backend 2 — `HeosUpnpBackend` (Universal Denon/Marantz HEOS Direct Network)
+- **Zero-Config Discovery**: Discovers all HEOS Built-in amps/speakers on the LAN via SSDP `M-SEARCH` (`urn:schemas-denon-com:device:ACT-Denon:1` / `AiosDevice:1`), Bonjour (`_heos-audio._tcp`), and HEOS CLI (`TCP 1255` `heos://player/get_players`). Identifies devices via salted SHA-256 opaque IDs (`heos_<16-hex>`) derived from UDN/serial—never persisting raw serials, MACs, or HEOS `service_username`s.
+- **Hands-Free Standby Auto-Wake & OLED Metadata**:
+  - Queries `ACT:1#GetDevicePowerState` (`:60006/ACT/control`); if `"OFF"`, invokes `ACT:1#SetDevicePowerState("ON")` and awaits transport readiness before issuing `AVTransport::SetAVTransportURI` (embedding clean `DIDL-Lite` Track Title, Artist, and Artwork XML so the amplifier's front OLED displays live track details) + `Play`.
+- **Pure-Rust `44,100 Hz / 24-bit` `0 dB` WAV HTTP Streamer**:
+  - Unwraps fMP4 (`init.mp4` + `.m4s` `moof`/`mdat`), decrypts `AES-128` segments if present, and decodes AAC-LC / MP3 in safe Rust (`symphonia`, with `mpv` PCM fallback if present for rare legacy `opus_0_0`) into continuous **`44,100 Hz / 24-bit` `0 dB` stereo WAV (`audio/wav`)** served at `http://<receiver_lan_ip>:<ephemeral_port>/heos/<capability_token>/stream.wav`.
+  - Supports HTTP `Range: bytes=...` + `?start_ms=` stream re-anchoring so `AVTransport::Seek(REL_TIME)` scrubs deterministically across multi-hour mixes in `~400–750 ms`.
+- **Strict Amp-Volume Invariant**: Outputs `0 dB` unity-gain PCM samples and **never** calls `heos://player/set_volume` or `RenderingControl::SetVolume`. Never touches local CoreAudio outputs when selected.
+
+### 4.4 Clean Maestro MSE Virtualization, Multi-Output Picker & Wi-Fi Resilience
+- **Unified Output Picker (Popup `<dialog>` + Player Bar Shadow DOM Cast Pill)**:
+  - Probes `http://127.0.0.1:9876/api/v1/discover`, `http://soundclud.local:9876/api/v1/discover`, and cached unicast LAN endpoints (`Promise.any`) with zero-click **TOFU** bearer token security + strict `Host`/`Origin` checks.
+  - Lists all discovered **CoreAudio/TOSLINK** and **HEOS Direct** outputs (`e.g., Optical Out • 44.1kHz 0dB` and `Marantz PM7000N • HEOS 44.1kHz 0dB`), adapting scrub drag debounce automatically per backend (`60 ms` for TOSLINK; `180 ms` for HEOS UPnP) and displaying `Waking Amplifier...` during cold HEOS relay wake.
+  - Loops a 10s `-100 dBFS` in-memory WAV (`muted = false`, `volume = 0.01`) so Chromium routes MacBook hardware Play/Pause/Next/Prev keys (`navigator.mediaSession`).
 
 ---
 
-## 5. Phased Implementation Plan & Quantitative Acceptance Gates
+## 5. Wire Protocol Summary (`v1`, Default Port `9876`)
+
+- **`GET /api/v1/discover`** — Receiver identity, capabilities, peer-discovered LAN receivers, and discovered `OutputDevice[]` targets (`kind: "coreaudio" | "alsa" | "heos_upnp"`, `id`, `name`, `model`, `transport`, `capabilities: { autoWake, seekDebounceMs }`).
+- **`GET /api/v1/audio/devices` & `POST /api/v1/config`** — Inspect and select the active `OutputDevice` (`id`) and optical idle keepalive options (volume mode is locked to `bit_perfect` `0 dB`).
+- **`GET /api/v1/status` & `ws://<host>:9876/api/v1/ws`** — Full-duplex commands (`hello`, `load_track`, `set_paused`, `seek`, `preload_next`, `stop`, `select_output`, `refresh_locator_response`, `ping`) and events (`welcome`, `state_tick` including `waking_device` state + Go+ tier/codec telemetry, `track_ended`, `outputs_updated`, `refresh_locator_request`, `session_claimed`, `pong`).
+- **`GET /hls/:session_id/*` (`127.0.0.1` only)** & **`GET /heos/:capability_token/stream.wav` (LAN capability-guarded)** — Internal media feeds for `LocalMpvBackend` and `HeosUpnpBackend`.
+
+---
+
+## 6. Phased Implementation Plan & Quantitative Acceptance Gates
 
 | Phase | Scope & Specialist Owner(s) | Quantitative Acceptance Gate |
 | :--- | :--- | :--- |
 | **Phase 0 (Complete)** | Workspace foundation, 6 specialist subagents, 4 workflow skills, `OfflineNetworkGuard`, Zero-PII gates, GitHub SSH repo (`Space-Cadet0/SoundClud`). | `npm run verify` 100% green; `0` PII/secret leaks; clean `x86_64` Monterey + `aarch64` Rust checks. |
-| **Phase 1 — Shared Wire Protocol (`v1`)** | `protocol-contracts-architect` (`packages/protocol` + Rust `protocol` module): REST/WS schemas including Go+ tier telemetry, TOFU auth, `drm_local_fallback`, and `bit_perfect` `44.1 kHz` config. | 100% TypeScript <-> Rust serde roundtrip parity; `0` `any` types. |
-| **Phase 2 — Rust Headless Receiver Daemon** | `receiver-daemon-architect` (`crates/receiver`): `mpv` JSON IPC (`44.1 kHz` physical format + `0 dB` Bit-Perfect + `32 MiB` Wi-Fi cache), `127.0.0.1` HLS/AES-128/fMP4 proxy, Bonjour `/api/v1/discover`, TOFU/Origin guard. | Warm Wi-Fi play/seek `< 200 ms`; mid-mix `HTTP 403` + `#EXT-X-MAP`/`#EXT-X-KEY` expiry recovered with `0` drops; `RedactedSecret` zero-leak tests pass. |
-| **Phase 3 — Chromium MV3 Extension** | `extension-maestro-engineer` (`packages/extension`): 3-world Chromium MV3, zero-login Go+ `aac_256k` selector, `V2::local::settings` HQ sync, MSE virtualizer, Widevine local fallback, `-100 dBFS` media-key loop, Cast Pill & `<dialog>` UI. | Always picks `aac_256k` `hq` over `sq`; `0` local decode CPU during handoff; mixed DRM queue auto-recovers; zero `"cookies"` permission. |
-| **Phase 4 — Zero-Homebrew Packaging & Adversarial QA** | `packaging-service-ci-engineer` + `adversarial-qa-hygiene-verifier`: Monterey+ (`x86_64`/`aarch64`) & Linux `install.sh`, `launchd`/`systemd` units, `CHROMEWEBSTORE.md`, release CI, full chaos & latency benchmark suite. | Fresh install `< 15 s` without Homebrew; `100%` offline test suite `< 5 s`; `SHA256SUMS.txt` verified artifacts. |
+| **Phase 1 — Shared Wire Protocol (`v1`)** | `protocol-contracts-architect` (`packages/protocol` + Rust `protocol` module): Unified `OutputDevice` (`coreaudio`/`alsa`/`heos_upnp`), Go+ locator, TOFU auth, `waking_device`, `drm_local_fallback`, `0 dB` `44.1 kHz` contracts. | 100% TypeScript <-> Rust serde roundtrip parity; `0` `any` types. |
+| **Phase 2 — Rust Receiver (`TOSLINK` + `HEOS`)** | `receiver-daemon-architect` (`crates/receiver`): HLS/AES-128 RAM cache + `LocalMpvBackend` (`44.1 kHz` physical `0 dB` TOSLINK) + `HeosUpnpBackend` (SSDP/mDNS/`TCP 1255`, `ACT:1` auto-wake, `DIDL` OLED, pure-Rust `44.1 kHz/24b` WAV streamer). | TOSLINK `< 180 ms` & HEOS `< 650 ms` warm start/scrub against offline mock `mpv` + mock HEOS `:1255`/`:60006` servers; `0` `set_volume` calls; `0` `403` mid-mix drops. |
+| **Phase 3 — Chromium MV3 Extension** | `extension-maestro-engineer` (`packages/extension`): 3-world Chromium MV3, zero-login Go+ `aac_256k` ranker, MSE virtualizer, Widevine local fallback, `-100 dBFS` media-key loop, unified TOSLINK/HEOS Output Picker & Cast Pill. | Always picks `aac_256k` `hq` over `sq`; dynamic `60ms`/`180ms` scrub debounce; `0` local decode CPU during handoff; zero `"cookies"` permission. |
+| **Phase 4 — Zero-Homebrew Packaging & Adversarial QA** | `packaging-service-ci-engineer` + `adversarial-qa-hygiene-verifier`: Monterey+ (`x86_64`/`aarch64`) & Linux `install.sh`, `launchd`/`systemd` units, `CHROMEWEBSTORE.md`, release CI, full offline chaos & Zero-PII verification. | Fresh install `< 15 s` without Homebrew; `100%` offline test suite `< 5 s`; `SHA256SUMS.txt` verified artifacts. |
