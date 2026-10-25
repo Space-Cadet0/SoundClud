@@ -1,13 +1,13 @@
 use crate::hls_proxy::HlsSession;
-use crate::protocol::{BIT_PERFECT_BIT_DEPTH, BIT_PERFECT_SAMPLE_RATE_HZ};
+use crate::protocol::{PlayableProtocol, BIT_PERFECT_BIT_DEPTH, BIT_PERFECT_SAMPLE_RATE_HZ};
 use bytes::Bytes;
-use std::io::Cursor;
+use std::io::Read;
 use std::sync::Arc;
 use symphonia::core::audio::{AudioBufferRef, SampleBuffer};
-use symphonia::core::codecs::{Decoder, DecoderOptions};
+use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
+use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions, ReadOnlySource};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tokio::sync::mpsc;
@@ -17,7 +17,16 @@ pub const WAV_CHANNELS: u16 = 2;
 pub const WAV_BYTES_PER_SAMPLE: u16 = 3; // 24-bit = 3 bytes
 pub const WAV_BLOCK_ALIGN: u16 = WAV_CHANNELS * WAV_BYTES_PER_SAMPLE; // 6 bytes/frame
 pub const WAV_BYTE_RATE: u32 = BIT_PERFECT_SAMPLE_RATE_HZ * (WAV_BLOCK_ALIGN as u32); // 264,600 B/s
-const MAX_RIFF_DATA_BYTES: u64 = (u32::MAX as u64) - 36;
+
+/// Capped below signed 32-bit `i32::MAX` (`2,147,483,647`) minus the 44-byte RIFF header,
+/// aligned to `WAV_BLOCK_ALIGN = 6` bytes (`357,913,930` frames, ~`2h 15m 15s` per window)
+/// so 32-bit ARM DLNA/UPnP renderers never overflow signed 32-bit `Content-Length` or `size`.
+pub const MAX_WAV_PCM_WINDOW_BYTES: u32 = 2_147_483_580;
+pub const MAX_WAV_WINDOW_DURATION_MS: u64 =
+    (MAX_WAV_PCM_WINDOW_BYTES as u64 * 1_000) / (WAV_BYTE_RATE as u64);
+
+pub const DLNA_WAV_FEATURES: &str =
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteRangeSpec {
@@ -30,9 +39,10 @@ pub fn compute_total_pcm_bytes(duration_ms: u64, start_ms: u64) -> u32 {
     let rem_ms = duration_ms.saturating_sub(start_ms);
     let effective_ms = if rem_ms == 0 { 3_600_000 } else { rem_ms };
     let frames = (u128::from(effective_ms) * u128::from(BIT_PERFECT_SAMPLE_RATE_HZ)) / 1_000;
-    let raw_bytes = (frames * u128::from(WAV_BLOCK_ALIGN)).min(u128::from(MAX_RIFF_DATA_BYTES));
+    let raw_bytes =
+        (frames * u128::from(WAV_BLOCK_ALIGN)).min(u128::from(MAX_WAV_PCM_WINDOW_BYTES));
     let aligned = (raw_bytes / u128::from(WAV_BLOCK_ALIGN)) * u128::from(WAV_BLOCK_ALIGN);
-    u32::try_from(aligned).unwrap_or(u32::MAX - 39)
+    u32::try_from(aligned).unwrap_or(MAX_WAV_PCM_WINDOW_BYTES)
 }
 
 /// Builds a standard 44-byte RIFF `WAVE` (`WAVE_FORMAT_PCM`, `44,100 Hz`, `24-bit`, stereo) header.
@@ -105,14 +115,14 @@ pub fn parse_http_byte_range(
     })
 }
 
-struct LinearStereoResampler {
+pub(crate) struct LinearStereoResampler {
     src_rate: u32,
     pos_in_curr: f64,
     prev_frame: Option<(f32, f32)>,
 }
 
 impl LinearStereoResampler {
-    fn new(src_rate: u32) -> Self {
+    pub(crate) fn new(src_rate: u32) -> Self {
         Self {
             src_rate,
             pos_in_curr: 0.0,
@@ -120,7 +130,7 @@ impl LinearStereoResampler {
         }
     }
 
-    fn process(&mut self, stereo_in: &[(f32, f32)], out: &mut Vec<(f32, f32)>) {
+    pub(crate) fn process(&mut self, stereo_in: &[(f32, f32)], out: &mut Vec<(f32, f32)>) {
         if self.src_rate == BIT_PERFECT_SAMPLE_RATE_HZ || stereo_in.is_empty() {
             out.extend_from_slice(stereo_in);
             return;
@@ -152,7 +162,7 @@ impl LinearStereoResampler {
 }
 
 #[inline]
-fn sample_f32_to_i24_le(sample: f32) -> [u8; 3] {
+pub(crate) fn sample_f32_to_i24_le(sample: f32) -> [u8; 3] {
     let clamped = sample.clamp(-1.0, 1.0);
     #[allow(clippy::cast_possible_truncation)]
     let scaled = (f64::from(clamped) * 8_388_608.0)
@@ -162,7 +172,7 @@ fn sample_f32_to_i24_le(sample: f32) -> [u8; 3] {
     [le[0], le[1], le[2]]
 }
 
-fn extract_stereo_frames(decoded: AudioBufferRef<'_>, out_stereo: &mut Vec<(f32, f32)>) {
+pub(crate) fn extract_stereo_frames(decoded: AudioBufferRef<'_>, out_stereo: &mut Vec<(f32, f32)>) {
     let spec = *decoded.spec();
     let channels = spec.channels.count();
     if channels == 0 || decoded.frames() == 0 {
@@ -185,7 +195,8 @@ fn extract_stereo_frames(decoded: AudioBufferRef<'_>, out_stereo: &mut Vec<(f32,
 }
 
 /// Spawns an asynchronous `0 dB` `44,100 Hz / 24-bit` WAV byte stream for `session`,
-/// honoring `start_ms` AND optional HTTP byte `range`.
+/// honoring `start_ms` AND optional HTTP byte `range`, and zero-padding any tail shortfall
+/// so `Content-Length` is satisfied to the exact byte.
 #[must_use]
 pub fn spawn_wav_byte_stream(
     session: Arc<HlsSession>,
@@ -196,9 +207,7 @@ pub fn spawn_wav_byte_stream(
 
     tokio::spawn(async move {
         let playlist = session.playlist_snapshot();
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let fallback_dur_ms = (playlist.total_duration_secs * 1000.0).round() as u64;
-        let track_dur_ms = session.track.duration_ms.max(fallback_dur_ms);
+        let track_dur_ms = session.effective_duration_ms();
         let pcm_total = compute_total_pcm_bytes(track_dur_ms, start_ms);
         let total_file_bytes = WAV_HEADER_BYTES + u64::from(pcm_total);
         let effective_range = range.unwrap_or(ByteRangeSpec {
@@ -231,166 +240,266 @@ pub fn spawn_wav_byte_stream(
 
         let pcm_byte_offset = effective_range.start.saturating_sub(WAV_HEADER_BYTES);
         let frame_offset = pcm_byte_offset / u64::from(WAV_BLOCK_ALIGN);
-        let mut skip_subframe_bytes =
+        let skip_subframe_bytes =
             usize::try_from(pcm_byte_offset % u64::from(WAV_BLOCK_ALIGN)).unwrap_or(0);
 
         let target_time_secs = (start_ms as f64 / 1000.0)
             + (frame_offset as f64 / f64::from(BIT_PERFECT_SAMPLE_RATE_HZ));
+
+        if session.active_descriptor().protocol == PlayableProtocol::Progressive {
+            if !stream_progressive_to_wav(
+                &session,
+                &tx,
+                target_time_secs,
+                skip_subframe_bytes,
+                &mut remaining_to_emit,
+            )
+            .await
+            {
+                return;
+            }
+            emit_zero_padding(&tx, &mut remaining_to_emit).await;
+            return;
+        }
+
         let Some((start_seg_idx, intra_seg_secs)) = playlist.locate_time(target_time_secs) else {
+            emit_zero_padding(&tx, &mut remaining_to_emit).await;
             return;
         };
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let mut frames_to_skip_in_first_seg =
-            (intra_seg_secs * f64::from(BIT_PERFECT_SAMPLE_RATE_HZ)).round() as usize;
-
-        let init_mp4 = session.init_mp4_bytes();
-        let mime_hint = session.active_descriptor().mime_type;
-        let mut persistent_decoder: Option<(u32, Box<dyn Decoder>)> = None;
-        let mut resampler: Option<LinearStereoResampler> = None;
+        let skip_frames = (intra_seg_secs * f64::from(BIT_PERFECT_SAMPLE_RATE_HZ)).round() as usize;
+        let mut skip_bytes_remaining = skip_frames
+            .saturating_mul(usize::from(WAV_BLOCK_ALIGN))
+            .saturating_add(skip_subframe_bytes);
 
         for seg_idx in start_seg_idx..playlist.segments.len() {
             if remaining_to_emit == 0 {
                 break;
             }
-            let Ok(seg_bytes) = session.fetch_decrypted_segment(seg_idx).await else {
+            let Ok(seg_pcm) = session.get_or_decode_segment_pcm(seg_idx).await else {
                 break;
             };
-            let combined = if let Some(init) = &init_mp4 {
-                let mut v = Vec::with_capacity(init.len() + seg_bytes.len());
-                v.extend_from_slice(init);
-                v.extend_from_slice(&seg_bytes);
-                v
-            } else {
-                seg_bytes.to_vec()
-            };
-
-            let pcm_chunk = decode_segment_to_pcm24(
-                combined,
-                &mime_hint,
-                init_mp4.is_some(),
-                &mut persistent_decoder,
-                &mut resampler,
-                &mut frames_to_skip_in_first_seg,
-                &mut skip_subframe_bytes,
-                &mut remaining_to_emit,
-            );
-
-            for piece in pcm_chunk.chunks(32_768) {
-                if tx.send(Ok(Bytes::copy_from_slice(piece))).await.is_err() {
+            if skip_bytes_remaining >= seg_pcm.len() {
+                skip_bytes_remaining -= seg_pcm.len();
+                continue;
+            }
+            let start_in_seg = skip_bytes_remaining;
+            skip_bytes_remaining = 0;
+            let avail_len = seg_pcm.len() - start_in_seg;
+            let take = usize::try_from(remaining_to_emit.min(avail_len as u64)).unwrap_or(0);
+            let mut cursor = 0usize;
+            while cursor < take {
+                let end = (cursor + 32_768).min(take);
+                let chunk = seg_pcm.slice((start_in_seg + cursor)..(start_in_seg + end));
+                if tx.send(Ok(chunk)).await.is_err() {
                     return;
                 }
+                cursor = end;
             }
+            remaining_to_emit -= take as u64;
         }
+
+        emit_zero_padding(&tx, &mut remaining_to_emit).await;
     });
 
     rx
 }
 
-#[allow(clippy::too_many_arguments)]
-fn decode_segment_to_pcm24(
-    segment_container_bytes: Vec<u8>,
-    mime_type: &str,
-    is_fmp4: bool,
-    persistent_decoder: &mut Option<(u32, Box<dyn Decoder>)>,
-    resampler: &mut Option<LinearStereoResampler>,
-    frames_to_skip: &mut usize,
-    skip_subframe_bytes: &mut usize,
+async fn emit_zero_padding(
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
     remaining_to_emit: &mut u64,
-) -> Vec<u8> {
-    let mut hint = Hint::new();
-    if is_fmp4 || mime_type.contains("mp4") {
-        hint.with_extension("mp4");
-    } else if mime_type.contains("mpeg") || mime_type.contains("mp3") {
-        hint.with_extension("mp3");
-    } else if mime_type.contains("aac") {
-        hint.with_extension("aac");
-    } else if mime_type.contains("wav") {
-        hint.with_extension("wav");
-    }
-
-    let mss = MediaSourceStream::new(
-        Box::new(Cursor::new(segment_container_bytes)),
-        MediaSourceStreamOptions::default(),
-    );
-    let Ok(probed) = symphonia::default::get_probe().format(
-        &hint,
-        mss,
-        &FormatOptions::default(),
-        &MetadataOptions::default(),
-    ) else {
-        return Vec::new();
-    };
-
-    let mut format = probed.format;
-    let Some(track) = format.default_track() else {
-        return Vec::new();
-    };
-    let track_id = track.id;
-    let codec_params = track.codec_params.clone();
-
-    if persistent_decoder.is_none() {
-        let Ok(dec) =
-            symphonia::default::get_codecs().make(&codec_params, &DecoderOptions::default())
-        else {
-            return Vec::new();
-        };
-        *persistent_decoder = Some((track_id, dec));
-    }
-
-    let mut out_bytes = Vec::new();
-    let mut raw_stereo = Vec::new();
-    let mut resampled_stereo = Vec::new();
-
-    loop {
-        if *remaining_to_emit == 0 {
-            break;
+) {
+    const ZERO_CHUNK_LEN: usize = 32_768;
+    static ZEROS: [u8; ZERO_CHUNK_LEN] = [0u8; ZERO_CHUNK_LEN];
+    while *remaining_to_emit > 0 {
+        let len = usize::try_from((*remaining_to_emit).min(ZERO_CHUNK_LEN as u64))
+            .unwrap_or(ZERO_CHUNK_LEN);
+        if tx
+            .send(Ok(Bytes::from_static(&ZEROS[..len])))
+            .await
+            .is_err()
+        {
+            return;
         }
-        let packet = match format.next_packet() {
-            Ok(p) => p,
-            Err(SymphoniaError::IoError(_)) => break,
-            Err(SymphoniaError::ResetRequired) => {
-                if let Some((_, dec)) = persistent_decoder.as_mut() {
-                    dec.reset();
-                }
-                continue;
+        *remaining_to_emit -= len as u64;
+    }
+}
+
+struct ChannelChunkReader {
+    rx: mpsc::Receiver<Bytes>,
+    current: Bytes,
+}
+
+impl Read for ChannelChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.current.is_empty() {
+            match self.rx.blocking_recv() {
+                Some(chunk) => self.current = chunk,
+                None => return Ok(0),
             }
-            Err(_) => break,
-        };
-        if packet.track_id() != track_id {
-            continue;
         }
-        let Some((_, decoder)) = persistent_decoder.as_mut() else {
-            break;
-        };
-        let Ok(decoded) = decoder.decode(&packet) else {
-            continue;
-        };
-        let packet_rate = decoded.spec().rate;
-        let rs = resampler.get_or_insert_with(|| LinearStereoResampler::new(packet_rate));
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current[..n]);
+        self.current = self.current.slice(n..);
+        Ok(n)
+    }
+}
 
-        raw_stereo.clear();
-        resampled_stereo.clear();
-        extract_stereo_frames(decoded, &mut raw_stereo);
-        rs.process(&raw_stereo, &mut resampled_stereo);
+async fn stream_progressive_to_wav(
+    session: &Arc<HlsSession>,
+    tx: &mpsc::Sender<Result<Bytes, std::io::Error>>,
+    target_time_secs: f64,
+    initial_subframe_skip: usize,
+    remaining_to_emit: &mut u64,
+) -> bool {
+    let desc = session.active_descriptor();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let approx_byte = if target_time_secs >= 2.0 && desc.bitrate_kbps > 0 {
+        Some((target_time_secs * f64::from(desc.bitrate_kbps) * 125.0).floor() as u64)
+    } else {
+        None
+    };
 
-        let start_frame = (*frames_to_skip).min(resampled_stereo.len());
-        *frames_to_skip -= start_frame;
+    let Ok((mut resp, honored_range)) = session.open_progressive_stream(approx_byte).await else {
+        return true;
+    };
 
-        for &(l, r) in &resampled_stereo[start_frame..] {
-            if *remaining_to_emit == 0 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let initial_frames_to_skip = if honored_range {
+        0usize
+    } else {
+        (target_time_secs.max(0.0) * f64::from(BIT_PERFECT_SAMPLE_RATE_HZ)).round() as usize
+    };
+
+    let (http_tx, http_rx) = mpsc::channel::<Bytes>(8);
+    let pump_task = tokio::spawn(async move {
+        while let Ok(Some(chunk)) = resp.chunk().await {
+            if !chunk.is_empty() && http_tx.send(chunk).await.is_err() {
                 break;
             }
-            let lb = sample_f32_to_i24_le(l);
-            let rb = sample_f32_to_i24_le(r);
-            let frame_bytes = [lb[0], lb[1], lb[2], rb[0], rb[1], rb[2]];
-            let sub_start = (*skip_subframe_bytes).min(6);
-            *skip_subframe_bytes = 0;
-            let avail = &frame_bytes[sub_start..];
-            let take = usize::try_from((*remaining_to_emit).min(avail.len() as u64)).unwrap_or(0);
-            out_bytes.extend_from_slice(&avail[..take]);
-            *remaining_to_emit -= take as u64;
         }
-    }
+    });
 
-    out_bytes
+    let tx_clone = tx.clone();
+    let mime = desc.mime_type;
+    let max_emit = *remaining_to_emit;
+
+    let decode_res = tokio::task::spawn_blocking(move || -> (u64, bool) {
+        let mut hint = Hint::new();
+        let lower = mime.to_ascii_lowercase();
+        if lower.contains("mpeg") || lower.contains("mp3") {
+            hint.with_extension("mp3");
+        } else if lower.contains("aac") {
+            hint.with_extension("aac");
+        } else if lower.contains("wav") {
+            hint.with_extension("wav");
+        }
+
+        let reader = ChannelChunkReader {
+            rx: http_rx,
+            current: Bytes::new(),
+        };
+        let mss = MediaSourceStream::new(
+            Box::new(ReadOnlySource::new(reader)),
+            MediaSourceStreamOptions::default(),
+        );
+        let Ok(probed) = symphonia::default::get_probe().format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        ) else {
+            return (0, true);
+        };
+
+        let mut format = probed.format;
+        let Some(track) = format.default_track() else {
+            return (0, true);
+        };
+        let track_id = track.id;
+        let Ok(mut decoder) =
+            symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default())
+        else {
+            return (0, true);
+        };
+
+        let mut emitted_total = 0u64;
+        let mut frames_to_skip = initial_frames_to_skip;
+        let mut sub_skip = initial_subframe_skip;
+        let mut resampler: Option<LinearStereoResampler> = None;
+        let mut raw_stereo = Vec::new();
+        let mut resampled_stereo = Vec::new();
+        let mut chunk_buf = Vec::with_capacity(32_768 + 6);
+
+        loop {
+            if emitted_total >= max_emit {
+                break;
+            }
+            let packet = match format.next_packet() {
+                Ok(p) => p,
+                Err(SymphoniaError::IoError(_)) => break,
+                Err(SymphoniaError::ResetRequired) => {
+                    decoder.reset();
+                    continue;
+                }
+                Err(_) => break,
+            };
+            if packet.track_id() != track_id {
+                continue;
+            }
+            let Ok(decoded) = decoder.decode(&packet) else {
+                continue;
+            };
+            let rs =
+                resampler.get_or_insert_with(|| LinearStereoResampler::new(decoded.spec().rate));
+            raw_stereo.clear();
+            resampled_stereo.clear();
+            extract_stereo_frames(decoded, &mut raw_stereo);
+            rs.process(&raw_stereo, &mut resampled_stereo);
+
+            let skip_now = frames_to_skip.min(resampled_stereo.len());
+            frames_to_skip -= skip_now;
+
+            for &(l, r) in &resampled_stereo[skip_now..] {
+                if emitted_total >= max_emit {
+                    break;
+                }
+                let lb = sample_f32_to_i24_le(l);
+                let rb = sample_f32_to_i24_le(r);
+                let frame = [lb[0], lb[1], lb[2], rb[0], rb[1], rb[2]];
+                let s = sub_skip.min(6);
+                sub_skip = 0;
+                let avail = &frame[s..];
+                let take = usize::try_from((max_emit - emitted_total).min(avail.len() as u64))
+                    .unwrap_or(0);
+                chunk_buf.extend_from_slice(&avail[..take]);
+                emitted_total += take as u64;
+                if chunk_buf.len() >= 32_768 {
+                    let payload = Bytes::copy_from_slice(&chunk_buf);
+                    chunk_buf.clear();
+                    if tx_clone.blocking_send(Ok(payload)).is_err() {
+                        return (emitted_total, false);
+                    }
+                }
+            }
+        }
+
+        if !chunk_buf.is_empty() && tx_clone.blocking_send(Ok(Bytes::from(chunk_buf))).is_err() {
+            return (emitted_total, false);
+        }
+        (emitted_total, true)
+    })
+    .await;
+
+    pump_task.abort();
+    match decode_res {
+        Ok((emitted, receiver_open)) => {
+            *remaining_to_emit = remaining_to_emit.saturating_sub(emitted);
+            receiver_open
+        }
+        Err(_) => true,
+    }
 }

@@ -7,6 +7,10 @@
 
 import { isAllowedSoundCloudApiAuthUrl } from '@soundclud/protocol';
 import { isKeepaliveAudioElement } from './mediaKeyKeepalive.js';
+import {
+  installMsePrototypeHooks,
+  type MseVirtualizerRegistry,
+} from './mseVirtualizer.js';
 import type {
   MaestroVirtualizerController,
   NativeMediaBridge,
@@ -18,14 +22,59 @@ import type {
 import type { SoundCloudTrackCatalog } from './trackCatalog.js';
 
 const HOOKS_INSTALLED_FLAG = '__soundcludMainHooksInstalledV1' as const;
+const MEDIA_PATCHED_FLAG = '__soundcludMediaProtoPatchedV1' as const;
+
+interface InstalledMediaHooksSingleton {
+  setController(controller: MaestroVirtualizerController): void;
+  readonly nativeBridge: NativeMediaBridge;
+}
+
+let installedMediaSingleton: InstalledMediaHooksSingleton | null = null;
+let activeNetworkSessionObserver: SoundCloudSessionObserver | null = null;
+let activeNetworkCatalog: SoundCloudTrackCatalog | null = null;
+
+function isLikelyHlsPlaylistUrl(rawUrl: string): boolean {
+  if (typeof rawUrl !== 'string' || rawUrl.length === 0) {
+    return false;
+  }
+  try {
+    const parsed = new URL(rawUrl, 'https://soundcloud.com');
+    return parsed.pathname.toLowerCase().endsWith('.m3u8');
+  } catch {
+    return false;
+  }
+}
 
 export function installMediaPrototypeHooks(
   controller: MaestroVirtualizerController,
 ): NativeMediaBridge {
+  let activeController = controller;
+
+  const mseRegistry: MseVirtualizerRegistry = installMsePrototypeHooks({
+    shouldVirtualizeSourceBuffer: () => activeController.shouldVirtualizeSourceBuffer(),
+    getBufferedTimeRanges: () => activeController.getBufferedTimeRanges(),
+    getDurationSeconds: (fallback) => activeController.getDurationSeconds(fallback),
+  });
+
+  if (
+    installedMediaSingleton !== null &&
+    typeof HTMLMediaElement !== 'undefined' &&
+    (HTMLMediaElement.prototype.play as unknown as Record<string, unknown>)[
+      MEDIA_PATCHED_FLAG
+    ] === true
+  ) {
+    installedMediaSingleton.setController(controller);
+    return installedMediaSingleton.nativeBridge;
+  }
+
   const mediaProto = HTMLMediaElement.prototype;
   const origPlay = mediaProto.play;
   const origPause = mediaProto.pause;
+  const origLoad = mediaProto.load;
+  const origRemoveAttribute = mediaProto.removeAttribute;
+  const origSetAttribute = mediaProto.setAttribute;
 
+  const srcDesc = Object.getOwnPropertyDescriptor(mediaProto, 'src');
   const currentTimeDesc = Object.getOwnPropertyDescriptor(mediaProto, 'currentTime');
   const durationDesc = Object.getOwnPropertyDescriptor(mediaProto, 'duration');
   const pausedDesc = Object.getOwnPropertyDescriptor(mediaProto, 'paused');
@@ -42,11 +91,23 @@ export function installMediaPrototypeHooks(
         origPause.call(element);
       }
     },
+    playElement(element: EventTarget): void {
+      if (element instanceof HTMLMediaElement) {
+        void origPlay.call(element).catch(() => {
+          // Ignore autoplay rejections when resuming local fallback.
+        });
+      }
+    },
     getNativeCurrentTimeSeconds(element: EventTarget): number {
       if (element instanceof HTMLMediaElement && currentTimeDesc?.get !== undefined) {
         return Number(currentTimeDesc.get.call(element)) || 0;
       }
       return 0;
+    },
+    setNativeCurrentTimeSeconds(element: EventTarget, seconds: number): void {
+      if (element instanceof HTMLMediaElement && currentTimeDesc?.set !== undefined) {
+        currentTimeDesc.set.call(element, seconds);
+      }
     },
     getNativePaused(element: EventTarget): boolean {
       if (element instanceof HTMLMediaElement && pausedDesc?.get !== undefined) {
@@ -56,43 +117,123 @@ export function installMediaPrototypeHooks(
     },
   };
 
-  mediaProto.play = function patchedPlay(this: HTMLMediaElement): Promise<void> {
+  const patchedPlay = function patchedPlay(this: HTMLMediaElement): Promise<void> {
     if (isKeepaliveAudioElement(this)) {
       return origPlay.call(this);
     }
     const mediaSrc = this.currentSrc || this.src || undefined;
-    const outcome = controller.interceptPlay(this, mediaSrc);
+    if (typeof mediaSrc === 'string' && mediaSrc.startsWith('blob:')) {
+      mseRegistry.bindElementMediaSource(this, mediaSrc);
+    }
+    const outcome = activeController.interceptPlay(this, mediaSrc);
     if (outcome.handledRemotely) {
       origPause.call(this);
       return Promise.resolve();
     }
     return origPlay.call(this);
   };
+  Object.defineProperty(patchedPlay, MEDIA_PATCHED_FLAG, {
+    value: true,
+    configurable: true,
+    enumerable: false,
+    writable: false,
+  });
+  mediaProto.play = patchedPlay;
 
   mediaProto.pause = function patchedPause(this: HTMLMediaElement): void {
     if (isKeepaliveAudioElement(this)) {
       origPause.call(this);
       return;
     }
-    if (controller.interceptPause(this)) {
+    if (activeController.interceptPause(this)) {
       origPause.call(this);
       return;
     }
     origPause.call(this);
   };
 
+  if (typeof origLoad === 'function') {
+    mediaProto.load = function patchedLoad(this: HTMLMediaElement): void {
+      if (isKeepaliveAudioElement(this)) {
+        origLoad.call(this);
+        return;
+      }
+      activeController.interceptMediaElementLoad(this);
+      origLoad.call(this);
+    };
+  }
+
+  if (srcDesc?.get !== undefined && srcDesc.set !== undefined) {
+    Object.defineProperty(mediaProto, 'src', {
+      configurable: true,
+      enumerable: true,
+      get(this: HTMLMediaElement): string {
+        return String(srcDesc.get?.call(this) ?? '');
+      },
+      set(this: HTMLMediaElement, value: string): void {
+        if (isKeepaliveAudioElement(this)) {
+          srcDesc.set?.call(this, value);
+          return;
+        }
+        const strVal = String(value ?? '');
+        if (strVal.startsWith('blob:')) {
+          mseRegistry.bindElementMediaSource(this, strVal);
+        }
+        activeController.interceptMediaSourceReset(this, strVal);
+        srcDesc.set?.call(this, strVal);
+      },
+    });
+  }
+
+  if (typeof origRemoveAttribute === 'function') {
+    mediaProto.removeAttribute = function patchedRemoveAttribute(
+      this: HTMLMediaElement,
+      qualifiedName: string,
+    ): void {
+      if (
+        !isKeepaliveAudioElement(this) &&
+        typeof qualifiedName === 'string' &&
+        qualifiedName.toLowerCase() === 'src'
+      ) {
+        activeController.interceptMediaSourceReset(this, '');
+      }
+      origRemoveAttribute.call(this, qualifiedName);
+    };
+  }
+
+  if (typeof origSetAttribute === 'function') {
+    mediaProto.setAttribute = function patchedSetAttribute(
+      this: HTMLMediaElement,
+      qualifiedName: string,
+      value: string,
+    ): void {
+      if (
+        !isKeepaliveAudioElement(this) &&
+        typeof qualifiedName === 'string' &&
+        qualifiedName.toLowerCase() === 'src'
+      ) {
+        const strVal = String(value ?? '');
+        if (strVal.startsWith('blob:')) {
+          mseRegistry.bindElementMediaSource(this, strVal);
+        }
+        activeController.interceptMediaSourceReset(this, strVal);
+      }
+      origSetAttribute.call(this, qualifiedName, value);
+    };
+  }
+
   if (currentTimeDesc?.get !== undefined && currentTimeDesc.set !== undefined) {
     Object.defineProperty(mediaProto, 'currentTime', {
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): number {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getCurrentTimeSeconds();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getCurrentTimeSeconds();
         }
         return Number(currentTimeDesc.get?.call(this)) || 0;
       },
       set(this: HTMLMediaElement, value: number): void {
-        if (controller.interceptSeekSeconds(this, value)) {
+        if (activeController.interceptSeekSeconds(this, value)) {
           return;
         }
         currentTimeDesc.set?.call(this, value);
@@ -106,8 +247,8 @@ export function installMediaPrototypeHooks(
       enumerable: true,
       get(this: HTMLMediaElement): number {
         const nativeVal = Number(durationDesc.get?.call(this));
-        if (controller.isElementVirtualized(this)) {
-          return controller.getDurationSeconds(nativeVal);
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getDurationSeconds(nativeVal);
         }
         return nativeVal;
       },
@@ -119,8 +260,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): boolean {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getPaused();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getPaused();
         }
         return Boolean(pausedDesc.get?.call(this));
       },
@@ -132,8 +273,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): boolean {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getSeeking();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getSeeking();
         }
         return Boolean(seekingDesc.get?.call(this));
       },
@@ -145,8 +286,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): boolean {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getEnded();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getEnded();
         }
         return Boolean(endedDesc.get?.call(this));
       },
@@ -158,7 +299,7 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): number {
-        if (controller.isElementVirtualized(this)) {
+        if (activeController.isElementVirtualized(this)) {
           return 4; // HTMLMediaElement.HAVE_ENOUGH_DATA
         }
         return Number(readyStateDesc.get?.call(this));
@@ -171,8 +312,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): TimeRanges {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getBufferedTimeRanges();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getBufferedTimeRanges();
         }
         return bufferedDesc.get!.call(this) as TimeRanges;
       },
@@ -184,8 +325,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): number {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getVirtualVolume();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getVirtualVolume();
         }
         return Number(volumeDesc.get?.call(this));
       },
@@ -194,8 +335,8 @@ export function installMediaPrototypeHooks(
           volumeDesc.set?.call(this, val);
           return;
         }
-        controller.recordLocalUiVolumeMutation(val, undefined);
-        if (!controller.isElementVirtualized(this)) {
+        activeController.recordLocalUiVolumeMutation(val, undefined);
+        if (!activeController.isElementVirtualized(this)) {
           volumeDesc.set?.call(this, val);
         }
       },
@@ -207,8 +348,8 @@ export function installMediaPrototypeHooks(
       configurable: true,
       enumerable: true,
       get(this: HTMLMediaElement): boolean {
-        if (controller.isElementVirtualized(this)) {
-          return controller.getVirtualMuted();
+        if (activeController.isElementVirtualized(this)) {
+          return activeController.getVirtualMuted();
         }
         return Boolean(mutedDesc.get?.call(this));
       },
@@ -217,74 +358,20 @@ export function installMediaPrototypeHooks(
           mutedDesc.set?.call(this, val);
           return;
         }
-        controller.recordLocalUiVolumeMutation(undefined, val);
-        if (!controller.isElementVirtualized(this)) {
+        activeController.recordLocalUiVolumeMutation(undefined, val);
+        if (!activeController.isElementVirtualized(this)) {
           mutedDesc.set?.call(this, val);
         }
       },
     });
   }
 
-  if (typeof SourceBuffer !== 'undefined') {
-    const sbProto = SourceBuffer.prototype;
-    const origAppendBuffer = sbProto.appendBuffer;
-    const sbBufferedDesc = Object.getOwnPropertyDescriptor(sbProto, 'buffered');
-    const sbUpdatingDesc = Object.getOwnPropertyDescriptor(sbProto, 'updating');
-    const virtualUpdatingSet = new WeakSet<SourceBuffer>();
-
-    sbProto.appendBuffer = function patchedAppendBuffer(
-      this: SourceBuffer,
-      data: BufferSource,
-    ): void {
-      if (!controller.shouldVirtualizeSourceBuffer()) {
-        origAppendBuffer.call(this, data);
-        return;
-      }
-
-      // Suppress local audio segment decode during remote handoff (`0%` local decode CPU).
-      virtualUpdatingSet.add(this);
-      try {
-        this.dispatchEvent(new Event('updatestart'));
-      } catch {
-        // Ignore non-fatal dispatch errors.
-      }
-      queueMicrotask(() => {
-        virtualUpdatingSet.delete(this);
-        try {
-          this.dispatchEvent(new Event('update'));
-          this.dispatchEvent(new Event('updateend'));
-        } catch {
-          // Ignore detached SourceBuffer errors.
-        }
-      });
-    };
-
-    if (sbBufferedDesc?.get !== undefined) {
-      Object.defineProperty(sbProto, 'buffered', {
-        configurable: true,
-        enumerable: true,
-        get(this: SourceBuffer): TimeRanges {
-          if (controller.shouldVirtualizeSourceBuffer()) {
-            return controller.getBufferedTimeRanges();
-          }
-          return sbBufferedDesc.get!.call(this) as TimeRanges;
-        },
-      });
-    }
-
-    if (sbUpdatingDesc?.get !== undefined) {
-      Object.defineProperty(sbProto, 'updating', {
-        configurable: true,
-        enumerable: true,
-        get(this: SourceBuffer): boolean {
-          if (virtualUpdatingSet.has(this)) {
-            return true;
-          }
-          return Boolean(sbUpdatingDesc.get?.call(this));
-        },
-      });
-    }
-  }
+  installedMediaSingleton = {
+    setController(nextController: MaestroVirtualizerController): void {
+      activeController = nextController;
+    },
+    nativeBridge,
+  };
 
   return nativeBridge;
 }
@@ -293,6 +380,9 @@ export function installNetworkPassiveObservers(
   sessionObserver: SoundCloudSessionObserver,
   catalog: SoundCloudTrackCatalog,
 ): void {
+  activeNetworkSessionObserver = sessionObserver;
+  activeNetworkCatalog = catalog;
+
   const winRecord = window as unknown as Record<string, unknown>;
   if (winRecord[HOOKS_INSTALLED_FLAG] === true) {
     return;
@@ -304,6 +394,9 @@ export function installNetworkPassiveObservers(
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
+    const obs = activeNetworkSessionObserver ?? sessionObserver;
+    const cat = activeNetworkCatalog ?? catalog;
+
     const rawUrl =
       typeof input === 'string'
         ? input
@@ -318,12 +411,14 @@ export function installNetworkPassiveObservers(
         : undefined);
 
     try {
-      sessionObserver.observeCookieString(document.cookie);
+      obs.observeCookieString(document.cookie);
       if (isAllowedSoundCloudApiAuthUrl(rawUrl)) {
-        sessionObserver.observeApiRequest(rawUrl, headers);
+        obs.observeApiRequest(rawUrl, headers);
         if (rawUrl.includes('/stream/')) {
-          catalog.observeResolveAttemptUrl(rawUrl);
+          cat.observeResolveAttemptUrl(rawUrl);
         }
+      } else if (isLikelyHlsPlaylistUrl(rawUrl)) {
+        cat.observeFetchedPlaylistUrl(rawUrl);
       }
     } catch {
       // Never disrupt page fetch on observer edge cases.
@@ -337,8 +432,8 @@ export function installNetworkPassiveObservers(
           try {
             const cloned = response.clone();
             const json: unknown = await cloned.json();
-            sessionObserver.ingestUserOrSessionPayload(json, rawUrl);
-            catalog.ingestPayload(json, rawUrl);
+            obs.ingestUserOrSessionPayload(json, rawUrl);
+            cat.ingestPayload(json, rawUrl);
           } catch {
             // Ignore aborted or non-JSON responses.
           }
@@ -388,41 +483,47 @@ export function installNetworkPassiveObservers(
     this: XMLHttpRequest,
     body?: Document | XMLHttpRequestBodyInit | null,
   ): void {
+    const obs = activeNetworkSessionObserver ?? sessionObserver;
+    const cat = activeNetworkCatalog ?? catalog;
     const meta = xhrMeta.get(this);
-    if (meta !== undefined && isAllowedSoundCloudApiAuthUrl(meta.url)) {
-      sessionObserver.observeCookieString(document.cookie);
-      sessionObserver.observeApiRequest(meta.url, meta.headers);
-      if (meta.url.includes('/stream/')) {
-        catalog.observeResolveAttemptUrl(meta.url);
-      }
-      this.addEventListener(
-        'load',
-        () => {
-          try {
-            if (
-              this.responseType === '' ||
-              this.responseType === 'text'
-            ) {
-              const text = this.responseText;
-              if (text.startsWith('{') || text.startsWith('[')) {
-                const parsed: unknown = JSON.parse(text);
-                sessionObserver.ingestUserOrSessionPayload(parsed, meta.url);
-                catalog.ingestPayload(parsed, meta.url);
+    if (meta !== undefined) {
+      if (isAllowedSoundCloudApiAuthUrl(meta.url)) {
+        obs.observeCookieString(document.cookie);
+        obs.observeApiRequest(meta.url, meta.headers);
+        if (meta.url.includes('/stream/')) {
+          cat.observeResolveAttemptUrl(meta.url);
+        }
+        this.addEventListener(
+          'load',
+          () => {
+            try {
+              if (
+                this.responseType === '' ||
+                this.responseType === 'text'
+              ) {
+                const text = this.responseText;
+                if (text.startsWith('{') || text.startsWith('[')) {
+                  const parsed: unknown = JSON.parse(text);
+                  obs.ingestUserOrSessionPayload(parsed, meta.url);
+                  cat.ingestPayload(parsed, meta.url);
+                }
+              } else if (
+                this.responseType === 'json' &&
+                this.response !== null &&
+                this.response !== undefined
+              ) {
+                obs.ingestUserOrSessionPayload(this.response, meta.url);
+                cat.ingestPayload(this.response, meta.url);
               }
-            } else if (
-              this.responseType === 'json' &&
-              this.response !== null &&
-              this.response !== undefined
-            ) {
-              sessionObserver.ingestUserOrSessionPayload(this.response, meta.url);
-              catalog.ingestPayload(this.response, meta.url);
+            } catch {
+              // Ignore malformed XHR payloads.
             }
-          } catch {
-            // Ignore malformed XHR payloads.
-          }
-        },
-        { once: true },
-      );
+          },
+          { once: true },
+        );
+      } else if (isLikelyHlsPlaylistUrl(meta.url)) {
+        cat.observeFetchedPlaylistUrl(meta.url);
+      }
     }
     origSend.call(this, body ?? null);
   };

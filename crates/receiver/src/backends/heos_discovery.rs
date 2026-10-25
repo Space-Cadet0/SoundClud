@@ -32,6 +32,7 @@ pub struct HeosDiscoveredEndpoint {
     pub act_control_url: Option<String>,
     pub avt_control_url: String,
     pub cli_port: u16,
+    pub heos_pid: Option<i64>,
     pub standby_state: StandbyState,
 }
 
@@ -52,10 +53,22 @@ impl HeosDiscoveredEndpoint {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HeosCliPlayerInfo {
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub pid: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeosCliMetaHeader {
+    message: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct HeosCliPlayersEnvelope {
-    #[serde(default)]
-    payload: Vec<HeosCliPlayerEntry>,
+    heos: Option<HeosCliMetaHeader>,
+    payload: Option<Vec<HeosCliPlayerEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -63,6 +76,7 @@ struct HeosCliPlayerEntry {
     name: Option<String>,
     model: Option<String>,
     ip: Option<String>,
+    pid: Option<i64>,
 }
 
 fn find_service_control_url(xml: &str, base_url: &Url, service_urn: &str) -> Option<String> {
@@ -130,17 +144,19 @@ pub fn parse_upnp_description_xml(
         act_control_url,
         avt_control_url,
         cli_port,
+        heos_pid: None,
         standby_state: StandbyState::Unknown,
     })
 }
 
-/// Queries HEOS CLI (`TCP 1255` `heos://player/get_players`) to enrich player name/model.
-pub async fn query_heos_cli_player_info(
-    ip: IpAddr,
-    cli_port: u16,
-) -> Option<(Option<String>, Option<String>)> {
+/// Queries HEOS CLI (`TCP 1255` `heos://player/get_players`) to enrich player name/model/pid,
+/// skipping async `"command under process"` frames until a JSON object with `"payload"` arrives.
+pub async fn query_heos_cli_player_info(ip: IpAddr, cli_port: u16) -> Option<HeosCliPlayerInfo> {
+    if cli_port == 0 {
+        return None;
+    }
     let addr = SocketAddr::new(ip, cli_port);
-    let stream = tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(addr))
+    let stream = tokio::time::timeout(Duration::from_millis(350), TcpStream::connect(addr))
         .await
         .ok()?
         .ok()?;
@@ -150,20 +166,44 @@ pub async fn query_heos_cli_player_info(
         .await
         .ok()?;
     let mut lines = BufReader::new(read_half).lines();
-    let line = tokio::time::timeout(Duration::from_millis(350), lines.next_line())
-        .await
-        .ok()?
-        .ok()??;
-    let parsed = serde_json::from_str::<HeosCliPlayersEnvelope>(&line).ok()?;
-    let matching = parsed
-        .payload
-        .iter()
-        .find(|p| p.ip.as_deref() == Some(&ip.to_string()))
-        .or_else(|| parsed.payload.first())?;
-    Some((
-        matching.name.clone().filter(|s| !s.trim().is_empty()),
-        matching.model.clone().filter(|s| !s.trim().is_empty()),
-    ))
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(900);
+
+    for _ in 0..6 {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Ok(Ok(Some(line))) = tokio::time::timeout(deadline - now, lines.next_line()).await
+        else {
+            break;
+        };
+        let Ok(parsed) = serde_json::from_str::<HeosCliPlayersEnvelope>(&line) else {
+            continue;
+        };
+        let under_process = parsed
+            .heos
+            .as_ref()
+            .and_then(|h| h.message.as_deref())
+            .is_some_and(|m| m.to_ascii_lowercase().contains("command under process"));
+        if under_process && parsed.payload.is_none() {
+            continue;
+        }
+        let Some(payload) = parsed.payload else {
+            continue;
+        };
+        if let Some(matching) = payload
+            .iter()
+            .find(|p| p.ip.as_deref() == Some(&ip.to_string()))
+            .or_else(|| payload.first())
+        {
+            return Some(HeosCliPlayerInfo {
+                name: matching.name.clone().filter(|s| !s.trim().is_empty()),
+                model: matching.model.clone().filter(|s| !s.trim().is_empty()),
+                pid: matching.pid,
+            });
+        }
+    }
+    None
 }
 
 async fn ssdp_discover_locations() -> Vec<String> {
@@ -269,15 +309,14 @@ pub async fn discover_heos_endpoints(
             continue;
         };
 
-        if let Some((cli_name, cli_model)) =
-            query_heos_cli_player_info(endpoint.ip, endpoint.cli_port).await
-        {
-            if let Some(name) = cli_name {
+        if let Some(cli_info) = query_heos_cli_player_info(endpoint.ip, endpoint.cli_port).await {
+            if let Some(name) = cli_info.name {
                 endpoint.friendly_name = name;
             }
             if endpoint.model_name.is_none() {
-                endpoint.model_name = cli_model;
+                endpoint.model_name = cli_info.model;
             }
+            endpoint.heos_pid = cli_info.pid;
         }
 
         if let Some(act_url) = &endpoint.act_control_url {

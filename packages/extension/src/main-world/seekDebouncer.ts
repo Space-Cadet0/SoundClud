@@ -11,6 +11,7 @@ import { TOSLINK_SEEK_DEBOUNCE_MS } from '@soundclud/protocol';
 export interface SeekDebouncerOptions {
   readonly initialDebounceMs?: number | undefined;
   readonly ackPinTimeoutMs?: number | undefined;
+  readonly ackPinProximityMs?: number | undefined;
   readonly allocateCommandSeq: () => number;
   readonly onCommitSeek: (positionMs: number, commandSeq: number) => void;
   readonly onSeekSettled?: (() => void) | undefined;
@@ -18,12 +19,14 @@ export interface SeekDebouncerOptions {
 }
 
 const DEFAULT_ACK_PIN_TIMEOUT_MS = 3000;
+const DEFAULT_ACK_PIN_PROXIMITY_MS = 3000;
 const MIN_DEBOUNCE_MS = 15;
 const MAX_DEBOUNCE_MS = 1000;
 
 export class SeekDebouncer {
   private debounceMs: number;
   private readonly ackPinTimeoutMs: number;
+  private readonly ackPinProximityMs: number;
   private readonly allocateCommandSeq: () => number;
   private readonly onCommitSeek: (positionMs: number, commandSeq: number) => void;
   private readonly onSeekSettled: (() => void) | undefined;
@@ -39,6 +42,7 @@ export class SeekDebouncer {
       options.initialDebounceMs ?? TOSLINK_SEEK_DEBOUNCE_MS,
     );
     this.ackPinTimeoutMs = options.ackPinTimeoutMs ?? DEFAULT_ACK_PIN_TIMEOUT_MS;
+    this.ackPinProximityMs = options.ackPinProximityMs ?? DEFAULT_ACK_PIN_PROXIMITY_MS;
     this.allocateCommandSeq = options.allocateCommandSeq;
     this.onCommitSeek = options.onCommitSeek;
     this.onSeekSettled = options.onSeekSettled;
@@ -70,6 +74,23 @@ export class SeekDebouncer {
     return this.awaitingAckCommandSeq;
   }
 
+  public hasPendingDebounce(): boolean {
+    return this.debounceTimerId !== null;
+  }
+
+  public getPinnedPositionMs(): number | null {
+    if (this.debounceTimerId !== null && this.optimisticPositionMs !== null) {
+      return this.optimisticPositionMs;
+    }
+    if (this.awaitingAckCommandSeq !== null && this.optimisticPositionMs !== null) {
+      if (this.now() <= this.awaitingAckDeadlineMs) {
+        return this.optimisticPositionMs;
+      }
+      this.clearAckPin();
+    }
+    return null;
+  }
+
   public requestSeekSeconds(seconds: number): void {
     if (!Number.isFinite(seconds)) {
       return;
@@ -95,11 +116,27 @@ export class SeekDebouncer {
     }, this.debounceMs);
   }
 
-  public acknowledgeCommandSeq(lastAckedCommandSeq: number): boolean {
+  public acknowledgeCommandSeq(
+    lastAckedCommandSeq: number,
+    telemetryPositionMs?: number,
+  ): boolean {
     if (
       this.awaitingAckCommandSeq !== null &&
       lastAckedCommandSeq >= this.awaitingAckCommandSeq
     ) {
+      if (
+        telemetryPositionMs !== undefined &&
+        Number.isFinite(telemetryPositionMs) &&
+        this.optimisticPositionMs !== null
+      ) {
+        const withinProximity =
+          Math.abs(telemetryPositionMs - this.optimisticPositionMs) <=
+          this.ackPinProximityMs;
+        const deadlineExpired = this.now() > this.awaitingAckDeadlineMs;
+        if (!withinProximity && !deadlineExpired) {
+          return false;
+        }
+      }
       this.awaitingAckCommandSeq = null;
       this.awaitingAckDeadlineMs = 0;
       if (this.debounceTimerId === null) {
@@ -108,18 +145,20 @@ export class SeekDebouncer {
       }
       return true;
     }
+    if (
+      this.awaitingAckCommandSeq !== null &&
+      this.debounceTimerId === null &&
+      this.now() > this.awaitingAckDeadlineMs
+    ) {
+      this.clearAckPin();
+    }
     return false;
   }
 
   public getEffectivePositionMs(telemetryPositionMs: number): number {
-    if (this.debounceTimerId !== null && this.optimisticPositionMs !== null) {
-      return this.optimisticPositionMs;
-    }
-    if (this.awaitingAckCommandSeq !== null && this.optimisticPositionMs !== null) {
-      if (this.now() <= this.awaitingAckDeadlineMs) {
-        return this.optimisticPositionMs;
-      }
-      this.clearAckPin();
+    const pinned = this.getPinnedPositionMs();
+    if (pinned !== null) {
+      return pinned;
     }
     return Math.max(0, Math.round(telemetryPositionMs));
   }

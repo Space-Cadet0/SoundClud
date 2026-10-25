@@ -7,6 +7,7 @@
  * parallel TOSLINK/HEOS discovery + TOFU WebSocket playback control.
  */
 
+import type { PlaybackTelemetry } from '@soundclud/protocol';
 import {
   isRecord,
   type ExtensionRuntimeRequest,
@@ -281,15 +282,55 @@ export class ExtensionBackgroundCoordinator {
       }
 
       case 'request_load_track': {
-        await updateEphemeralSessionState(this.storage.session, (prev) => ({
-          ...prev,
-          drmFallback: null,
-          activeTabId: senderTabId ?? prev.activeTabId,
-          connectionState:
-            prev.connectionState === 'session_claimed'
-              ? 'connecting'
-              : prev.connectionState,
-        }));
+        await updateEphemeralSessionState(this.storage.session, (prev) => {
+          const prevTelemetry = prev.lastTelemetry;
+          const optimisticTelemetry: PlaybackTelemetry | null =
+            prevTelemetry !== null
+              ? {
+                  protocolVersion: prevTelemetry.protocolVersion,
+                  serverSeq: prevTelemetry.serverSeq,
+                  phase: 'loading',
+                  ...(prevTelemetry.activeOutputId !== undefined
+                    ? { activeOutputId: prevTelemetry.activeOutputId }
+                    : {}),
+                  ...(prevTelemetry.activeBackend !== undefined
+                    ? { activeBackend: prevTelemetry.activeBackend }
+                    : {}),
+                  volumeMode: prevTelemetry.volumeMode,
+                  fixedGainDb: prevTelemetry.fixedGainDb,
+                  sampleRateHz: prevTelemetry.sampleRateHz,
+                  bitDepth: prevTelemetry.bitDepth,
+                  positionMs: msg.locator.startPositionMs,
+                  durationMs: msg.locator.track.durationMs,
+                  bufferedMs: msg.locator.startPositionMs,
+                  track: msg.locator.track,
+                  streamInfo: {
+                    preset: msg.locator.selected.preset,
+                    quality: msg.locator.selected.quality,
+                    protocol: msg.locator.selected.protocol,
+                    bitrateKbps: msg.locator.selected.bitrateKbps,
+                    accountTier: msg.locator.auth.accountTier,
+                    hlsRefreshCount: 0,
+                  },
+                  ...(prevTelemetry.activeControllerId !== undefined
+                    ? { activeControllerId: prevTelemetry.activeControllerId }
+                    : {}),
+                  timestampMs: Date.now(),
+                }
+              : null;
+
+          return {
+            ...prev,
+            drmFallback: null,
+            activeTabId: senderTabId ?? prev.activeTabId,
+            lastTelemetry: optimisticTelemetry,
+            nextCommandSeq: Math.max(prev.nextCommandSeq, msg.commandSeq),
+            connectionState:
+              prev.connectionState === 'session_claimed'
+                ? 'connecting'
+                : prev.connectionState,
+          };
+        });
         const local = await readDurableLocalConfig(this.storage.local);
         await this.wsController.sendCommand({
           type: 'load_track',

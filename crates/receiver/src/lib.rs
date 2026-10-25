@@ -19,6 +19,7 @@ pub mod protocol_ws;
 pub mod security;
 pub mod server;
 pub mod wav_streamer;
+pub mod wav_transcode;
 pub mod ws_handler;
 
 pub use crate::protocol::{

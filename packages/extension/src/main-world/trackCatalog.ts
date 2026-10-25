@@ -80,11 +80,46 @@ function extractSecretTokenFromUrl(rawUrl: string | undefined): string | undefin
   return undefined;
 }
 
+export function normalizeSoundCloudPermalinkPath(
+  rawUrlOrPath: string,
+): string | undefined {
+  try {
+    const parsed = new URL(rawUrlOrPath, 'https://soundcloud.com');
+    const segments = parsed.pathname
+      .split('/')
+      .filter((s) => s.length > 0);
+    if (segments.length === 0) {
+      return undefined;
+    }
+    const lastSeg = segments[segments.length - 1];
+    if (
+      segments.length >= 3 &&
+      lastSeg !== undefined &&
+      /^s-[A-Za-z0-9_-]{3,}$/.test(lastSeg)
+    ) {
+      segments.pop();
+    }
+    const cleaned = `/${segments.join('/')}`.toLowerCase();
+    return cleaned.length > 1 ? cleaned : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function normalizePermalinkKey(rawUrlOrPath: string): string | undefined {
   try {
     const parsed = new URL(rawUrlOrPath, 'https://soundcloud.com');
     const cleaned = parsed.pathname.replace(/\/+$/, '').toLowerCase();
     return cleaned.length > 0 ? cleaned : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeMediaPathKey(rawUrl: string): string | undefined {
+  try {
+    const parsed = new URL(rawUrl, 'https://soundcloud.com');
+    return `${parsed.origin.toLowerCase()}${parsed.pathname}`;
   } catch {
     return undefined;
   }
@@ -246,7 +281,11 @@ export class SoundCloudTrackCatalog {
   private readonly trackIdByPermalinkPath = new Map<string, string>();
   private readonly observedPlaylistsByTrackId = new Map<string, ObservedInTabPlaylist>();
   private readonly trackIdByMediaUrl = new Map<string, string>();
+  private readonly trackIdByMediaPathKey = new Map<string, string>();
   private mostRecentlyResolvedTrackId: string | undefined;
+  private lastFetchedPlaylistTrackId: string | undefined;
+  private streamObservationSeq = 0;
+  private lastFetchedPlaylistSeq = 0;
   private locatorCounter = 0;
   private readonly resolveObservers = new Set<TrackResolveObserver>();
   private readonly onHqTranscodingSeen: (() => void) | undefined;
@@ -334,7 +373,12 @@ export class SoundCloudTrackCatalog {
     };
     this.observedPlaylistsByTrackId.set(updatedEntry.trackId, observed);
     this.trackIdByMediaUrl.set(trimmedMedia, updatedEntry.trackId);
+    const mediaPathKey = normalizeMediaPathKey(trimmedMedia);
+    if (mediaPathKey !== undefined) {
+      this.trackIdByMediaPathKey.set(mediaPathKey, updatedEntry.trackId);
+    }
     this.mostRecentlyResolvedTrackId = updatedEntry.trackId;
+    this.streamObservationSeq += 1;
 
     const previewSelection = rankSoundCloudTranscodings(updatedEntry.transcodings, {
       observedInTabPlaylist: observed,
@@ -349,6 +393,7 @@ export class SoundCloudTrackCatalog {
     const matched = this.findTrackByResolveUrlInternal(resolveRequestUrl.trim());
     if (matched !== undefined) {
       this.mostRecentlyResolvedTrackId = matched.trackId;
+      this.streamObservationSeq += 1;
       const observed = this.observedPlaylistsByTrackId.get(matched.trackId);
       const previewSelection = rankSoundCloudTranscodings(matched.transcodings, {
         observedInTabPlaylist: observed,
@@ -360,17 +405,75 @@ export class SoundCloudTrackCatalog {
     return matched;
   }
 
+  public observeFetchedPlaylistUrl(playlistUrl: string): CatalogTrackEntry | undefined {
+    const trimmed = playlistUrl.trim();
+    if (trimmed.length === 0) {
+      return undefined;
+    }
+    const mediaPathKey = normalizeMediaPathKey(trimmed);
+    const matchedTrackId =
+      this.trackIdByMediaUrl.get(trimmed) ??
+      (mediaPathKey !== undefined
+        ? this.trackIdByMediaPathKey.get(mediaPathKey)
+        : undefined);
+    if (matchedTrackId === undefined) {
+      return undefined;
+    }
+    const matched = this.tracksById.get(matchedTrackId);
+    if (matched === undefined) {
+      return undefined;
+    }
+    this.lastFetchedPlaylistTrackId = matched.trackId;
+    this.mostRecentlyResolvedTrackId = matched.trackId;
+    this.streamObservationSeq += 1;
+    this.lastFetchedPlaylistSeq = this.streamObservationSeq;
+
+    const observed = this.observedPlaylistsByTrackId.get(matched.trackId);
+    const previewSelection = rankSoundCloudTranscodings(matched.transcodings, {
+      observedInTabPlaylist: observed,
+    });
+    for (const observer of this.resolveObservers) {
+      observer(matched, previewSelection);
+    }
+    return matched;
+  }
+
   public findTrackById(trackId: string): CatalogTrackEntry | undefined {
     return this.tracksById.get(trackId.trim());
   }
 
   public findTrackByPermalink(urlOrPath: string): CatalogTrackEntry | undefined {
-    const key = normalizePermalinkKey(urlOrPath);
-    if (key === undefined) {
+    const exactKey = normalizePermalinkKey(urlOrPath);
+    if (exactKey !== undefined) {
+      const exactId = this.trackIdByPermalinkPath.get(exactKey);
+      if (exactId !== undefined) {
+        return this.tracksById.get(exactId);
+      }
+    }
+    const baseKey = normalizeSoundCloudPermalinkPath(urlOrPath);
+    if (baseKey !== undefined) {
+      const baseId = this.trackIdByPermalinkPath.get(baseKey);
+      if (baseId !== undefined) {
+        return this.tracksById.get(baseId);
+      }
+    }
+    return undefined;
+  }
+
+  public findTrackByTitle(title: string): CatalogTrackEntry | undefined {
+    const normalized = title.trim().toLowerCase();
+    if (normalized.length === 0) {
       return undefined;
     }
-    const id = this.trackIdByPermalinkPath.get(key);
-    return id !== undefined ? this.tracksById.get(id) : undefined;
+    let best: CatalogTrackEntry | undefined;
+    for (const entry of this.tracksById.values()) {
+      if (entry.title.trim().toLowerCase() === normalized) {
+        if (best === undefined || entry.updatedAtMs >= best.updatedAtMs) {
+          best = entry;
+        }
+      }
+    }
+    return best;
   }
 
   public findTrackByMediaOrResolveUrl(url: string): CatalogTrackEntry | undefined {
@@ -382,7 +485,36 @@ export class SoundCloudTrackCatalog {
     if (directId !== undefined) {
       return this.tracksById.get(directId);
     }
+    const mediaPathKey = normalizeMediaPathKey(trimmed);
+    if (mediaPathKey !== undefined) {
+      const byPathId = this.trackIdByMediaPathKey.get(mediaPathKey);
+      if (byPathId !== undefined) {
+        return this.tracksById.get(byPathId);
+      }
+    }
     return this.findTrackByResolveUrlInternal(trimmed);
+  }
+
+  public getLastFetchedPlaylistTrack(): CatalogTrackEntry | undefined {
+    if (this.lastFetchedPlaylistTrackId === undefined) {
+      return undefined;
+    }
+    return this.tracksById.get(this.lastFetchedPlaylistTrackId);
+  }
+
+  public getExplicitlyResolvedTrack(): CatalogTrackEntry | undefined {
+    if (this.mostRecentlyResolvedTrackId === undefined) {
+      return undefined;
+    }
+    return this.tracksById.get(this.mostRecentlyResolvedTrackId);
+  }
+
+  public getStreamObservationSeq(): number {
+    return this.streamObservationSeq;
+  }
+
+  public getLastFetchedPlaylistSeq(): number {
+    return this.lastFetchedPlaylistSeq;
   }
 
   public getMostRecentlyResolvedTrack(): CatalogTrackEntry | undefined {
@@ -564,6 +696,10 @@ export class SoundCloudTrackCatalog {
     const permalinkKey = normalizePermalinkKey(merged.permalinkUrl);
     if (permalinkKey !== undefined) {
       this.trackIdByPermalinkPath.set(permalinkKey, merged.trackId);
+    }
+    const basePermalinkKey = normalizeSoundCloudPermalinkPath(merged.permalinkUrl);
+    if (basePermalinkKey !== undefined) {
+      this.trackIdByPermalinkPath.set(basePermalinkKey, merged.trackId);
     }
 
     const hasFullLengthHq = merged.transcodings.some(

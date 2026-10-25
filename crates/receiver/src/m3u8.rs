@@ -48,20 +48,26 @@ impl ParsedHlsPlaylist {
     }
 
     /// Finds `(segment_index, intra_segment_offset_secs)` for a given timestamp in seconds.
+    /// Returns `None` cleanly when `target_secs` is at or past `total_duration_secs`.
     #[must_use]
     pub fn locate_time(&self, target_secs: f64) -> Option<(usize, f64)> {
-        if self.segments.is_empty() {
+        if self.segments.is_empty() || !target_secs.is_finite() {
             return None;
         }
         let clamped = target_secs.max(0.0);
+        if self.total_duration_secs <= 0.0 {
+            return (clamped <= 0.0).then_some((0, 0.0));
+        }
+        if clamped >= self.total_duration_secs {
+            return None;
+        }
         for seg in &self.segments {
             let end = seg.start_time_secs + seg.duration_secs;
             if clamped < end {
                 return Some((seg.index, (clamped - seg.start_time_secs).max(0.0)));
             }
         }
-        let last = self.segments.last()?;
-        Some((last.index, last.duration_secs.max(0.0)))
+        None
     }
 
     /// Renders a local `127.0.0.1`-rewritten VOD `.m3u8` playlist for `LocalMpvBackend`.

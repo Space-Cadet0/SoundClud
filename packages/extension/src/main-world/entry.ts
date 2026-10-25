@@ -29,14 +29,47 @@ function getSafeLocalStorage(): Storage | null {
 }
 
 function querySoundCloudPlayerTitleHint(): DomTrackHint | undefined {
-  const titleAnchor = document.querySelector<HTMLAnchorElement>(
-    '.playbackSoundBadge__titleLink, .playbackSoundBadge a[href]',
+  const primaryTitleAnchor = document.querySelector<HTMLAnchorElement>(
+    '.playbackSoundBadge__titleLink',
   );
-  const href = titleAnchor?.getAttribute('href')?.trim();
+  const candidateAnchor =
+    primaryTitleAnchor ??
+    Array.from(
+      document.querySelectorAll<HTMLAnchorElement>('.playbackSoundBadge a[href]'),
+    ).find((anchor) => {
+      const rawHref = anchor.getAttribute('href')?.trim() ?? '';
+      if (rawHref.length === 0) {
+        return false;
+      }
+      try {
+        const parsed = new URL(rawHref, 'https://soundcloud.com');
+        return parsed.pathname.split('/').filter((s) => s.length > 0).length >= 2;
+      } catch {
+        return false;
+      }
+    });
+
+  const href = candidateAnchor?.getAttribute('href')?.trim();
+  const titleAttr = candidateAnchor?.getAttribute('title')?.trim();
+  const textTitle = candidateAnchor?.textContent?.trim();
+  const resolvedTitle =
+    titleAttr !== undefined && titleAttr.length > 0
+      ? titleAttr
+      : textTitle !== undefined && textTitle.length > 0
+        ? textTitle
+        : undefined;
+
   if (href !== undefined && href.length > 0) {
-    return { permalinkOrPath: href };
+    return {
+      permalinkOrPath: href,
+      ...(resolvedTitle !== undefined ? { title: resolvedTitle } : {}),
+      isPlayerBadge: true,
+    };
   }
-  return { permalinkOrPath: window.location.pathname };
+  return {
+    permalinkOrPath: window.location.pathname,
+    isPlayerBadge: false,
+  };
 }
 
 function clickSoundCloudTransportButton(direction: 'next' | 'previous'): void {
@@ -86,10 +119,7 @@ function bootstrapMainWorld(): void {
       if (playBtn !== null && playBtn.classList.contains('playing')) {
         playBtn.click();
       } else {
-        const audio = document.querySelector('audio');
-        if (audio !== null) {
-          virtualizerRef?.interceptPause(audio);
-        }
+        virtualizerRef?.pauseFromMediaSession();
       }
     },
     onPreviousTrack: () => {
@@ -99,10 +129,7 @@ function bootstrapMainWorld(): void {
       clickSoundCloudTransportButton('next');
     },
     onSeekTo: (seconds) => {
-      const audio = document.querySelector('audio');
-      if (audio !== null) {
-        audio.currentTime = seconds;
-      }
+      virtualizerRef?.seekFromMediaSession(seconds);
     },
   });
 
@@ -118,8 +145,14 @@ function bootstrapMainWorld(): void {
       pauseElement(el) {
         nativeBridgeProxy?.pauseElement(el);
       },
+      playElement(el) {
+        nativeBridgeProxy?.playElement?.(el);
+      },
       getNativeCurrentTimeSeconds(el) {
         return nativeBridgeProxy?.getNativeCurrentTimeSeconds(el) ?? 0;
+      },
+      setNativeCurrentTimeSeconds(el, seconds) {
+        nativeBridgeProxy?.setNativeCurrentTimeSeconds?.(el, seconds);
       },
       getNativePaused(el) {
         return nativeBridgeProxy?.getNativePaused(el) ?? true;
@@ -131,6 +164,31 @@ function bootstrapMainWorld(): void {
 
   nativeBridgeProxy = installMediaPrototypeHooks(virtualizer);
   installNetworkPassiveObservers(sessionObserver, catalog);
+
+  const onUserInteraction = (): void => {
+    virtualizer.recordUserInteraction();
+  };
+  for (const eventName of [
+    'pointerdown',
+    'mousedown',
+    'touchstart',
+    'keydown',
+    'click',
+  ] as const) {
+    window.addEventListener(eventName, onUserInteraction, {
+      capture: true,
+      passive: true,
+    });
+  }
+  window.addEventListener(
+    'pointermove',
+    (ev: PointerEvent) => {
+      if (ev.buttons !== 0) {
+        virtualizer.recordUserInteraction();
+      }
+    },
+    { capture: true, passive: true },
+  );
 
   sessionObserver.subscribe((snap) => {
     if (snap.clientId.length > 0 || snap.oauthToken !== undefined) {

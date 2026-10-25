@@ -9,11 +9,11 @@ description: >-
 
 # Orchestrate SoundClud Engineering Phase
 
-Follow this 5-step multi-agent workflow to deliver any `SoundClud` phase cleanly with zero file collisions and zero portability regressions.
+Follow this 6-step multi-agent workflow to deliver any `SoundClud` phase cleanly with zero file collisions and zero portability regressions.
 
 ## Step 1 — Pre-Flight Checkpoint & Forensic Validation
 1. Verify `git status` is clean or create a safety checkpoint tag/branch (`checkpoint-YYYY-MM-DD`) before wide-ranging edits.
-2. If any external SoundCloud `api-v2`, Maestro MSE, or macOS/Linux CoreAudio behavior is unverified, invoke `forensic-protocol-auditor` (read-only) first to gather empirical proof before writing code.
+2. If any external SoundCloud `api-v2`, Maestro MSE, Crashpad minidump, HEOS UPnP/CLI/AVR MCU, or macOS/Linux CoreAudio behavior is unverified, invoke `forensic-protocol-auditor` (read-only) first to gather empirical proof before writing code.
 
 ## Step 2 — Lock Shared Wire Contracts (`packages/protocol/`)
 1. Delegate wire-protocol additions or changes to `protocol-contracts-architect` (`packages/protocol/`) first.
@@ -25,13 +25,17 @@ Invoke only the needed domain specialists concurrently, assigning **strict non-o
 - `extension-maestro-engineer` -> `packages/extension/` (ensure `chrome-extensions` and `modern-web-guidance` skills are read first)
 - `packaging-service-ci-engineer` -> `packaging/`, `scripts/`, `CHROMEWEBSTORE.md`, `.github/workflows/`
 
-## Step 4 — Independent Adversarial Verification & Hygiene Gate
-1. Invoke `adversarial-qa-hygiene-verifier` (`tests/`) to add deterministic offline unit/chaos tests covering happy paths and real-world edge cases (HLS `403` token refresh, WebSocket drop/reconnect, multi-tab handoff, rapid scrub debouncing).
+## Step 4 — Independent Offline Adversarial Verification & Hygiene Gate
+1. Invoke `adversarial-qa-hygiene-verifier` (`tests/`) to add deterministic offline unit/chaos tests covering happy paths and real-world edge cases (HLS `403` token refresh, WebSocket drop/reconnect, multi-tab handoff, rapid scrub debouncing, full MSE surface virtualization, DLNA byte-seek headers).
 2. Run the canonical workspace gate:
    ```bash
    npm run verify
    ```
 3. Confirm macOS Intel Monterey compatibility (`MACOSX_DEPLOYMENT_TARGET=11.0 cargo check --workspace --target x86_64-apple-darwin`) when `crates/receiver` changes.
 
-## Step 5 — Scoped Conventional Commit
+## Step 5 — Opt-In Live Hardware & Browser UAT Validation (When Live Hardware Is Present)
+1. When validating playback, browser virtualization, or hardware control against live `soundcloud.com` and physical HEOS/TOSLINK hardware, invoke `live-uat-hardware-browser-validator` after `npm run verify` passes.
+2. Enforce the strict `0 dB` Amp-Volume Invariant (zero volume mutations; use silent PCM or paused verification when testing synthetic faults), verify bounded V8 heap / zero Crashpad dumps, and keep `git status` 100% free of live LAN IPs, UDNs, tokens, or screenshots.
+
+## Step 6 — Scoped Conventional Commit
 Stage verified changes and commit using scoped Conventional Commits (`feat(receiver): ...`, `feat(extension): ...`, `fix(protocol): ...`, `test(chaos): ...`). `.githooks/pre-commit` will automatically run `scripts/check-hygiene.mjs`.

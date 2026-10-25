@@ -96,7 +96,13 @@ function classifyCodecTier(
     return { tier: 1, quality: 'hq', bitrateKbps: 256, sampleRateHz: 44100 };
   }
 
-  if (presetLower === 'aac_160k' || presetLower.startsWith('aac_160')) {
+  const isHeAacSbrOrPs =
+    mimeLower.includes('mp4a.40.5') || mimeLower.includes('mp4a.40.29');
+
+  if (
+    !isHeAacSbrOrPs &&
+    (presetLower === 'aac_160k' || presetLower.startsWith('aac_160'))
+  ) {
     return { tier: 2, quality: 'sq', bitrateKbps: 160, sampleRateHz: 44100 };
   }
 
@@ -104,8 +110,15 @@ function classifyCodecTier(
     return { tier: 3, quality: 'sq', bitrateKbps: 128, sampleRateHz: 44100 };
   }
 
-  if (presetLower === 'aac_96k' || presetLower.startsWith('aac_96')) {
-    return { tier: 4, quality: 'sq', bitrateKbps: 96, sampleRateHz: 44100 };
+  if (
+    presetLower === 'aac_160k' ||
+    presetLower.startsWith('aac_160') ||
+    presetLower === 'aac_96k' ||
+    presetLower.startsWith('aac_96')
+  ) {
+    const bitrateKbps =
+      presetLower === 'aac_160k' || presetLower.startsWith('aac_160') ? 160 : 96;
+    return { tier: 4, quality: 'sq', bitrateKbps, sampleRateHz: 44100 };
   }
 
   if (

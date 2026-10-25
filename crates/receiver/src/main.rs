@@ -19,7 +19,23 @@ async fn main() {
         }
     };
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let raw_rust_log = std::env::var("RUST_LOG").unwrap_or_default();
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if !raw_rust_log.contains("symphonia")
+        && !raw_rust_log.contains("debug")
+        && !raw_rust_log.contains("trace")
+    {
+        for directive in [
+            "symphonia_format_isomp4=warn",
+            "symphonia_core=warn",
+            "symphonia_bundle_mp3=warn",
+            "symphonia_codec_aac=warn",
+        ] {
+            if let Ok(parsed) = directive.parse() {
+                filter = filter.add_directive(parsed);
+            }
+        }
+    }
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     #[cfg(target_os = "macos")]

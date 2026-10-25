@@ -9,7 +9,7 @@ use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use soundclud_receiver::backends::heos_discovery::HeosDiscoverySeed;
-use soundclud_receiver::backends::heos_soap::extract_xml_tag_text;
+use soundclud_receiver::backends::heos_soap::{extract_xml_tag_text, DLNA_WAV_FEATURES};
 use soundclud_receiver::protocol::{
     AccountTier, ClientWsCommand, DiscoverResponse, EphemeralSoundCloudAuth, OutputCapabilities,
     OutputDevice, OutputDeviceKind, OutputTransport, PairRequest, PairResponse, PlayableProtocol,
@@ -423,8 +423,27 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
         .clone()
         .expect("DIDL-Lite");
     assert!(didl.contains("<dc:title>Warm &amp; Clear &lt;HQ&gt;</dc:title>"));
+    assert!(didl.contains("<dc:creator>Studio Ensemble</dc:creator>"));
     assert!(didl.contains("<upnp:artist>Studio Ensemble</upnp:artist>"));
-    assert!(didl.contains("http-get:*:audio/wav:*"));
+    assert!(didl.contains("<upnp:album>SoundCloud</upnp:album>"));
+    assert!(didl.contains("<upnp:genre>Music</upnp:genre>"));
+    assert!(didl.contains(&format!("http-get:*:audio/wav:{DLNA_WAV_FEATURES}")));
+    assert!(didl.contains("size=\"529244\""));
+    assert!(didl.contains("bitrate=\"264600\""));
+
+    // Verify Stop was issued before SetAVTransportURI
+    {
+        let actions = heos_state.soap_actions.lock().unwrap();
+        let stop_idx = actions
+            .iter()
+            .position(|a| a.contains("#Stop"))
+            .expect("AVTransport#Stop before SetAVTransportURI");
+        let set_uri_idx = actions
+            .iter()
+            .position(|a| a.contains("#SetAVTransportURI"))
+            .expect("AVTransport#SetAVTransportURI");
+        assert!(stop_idx < set_uri_idx);
+    }
 
     // Verify capability-token enforcement on /heos/<token>/stream.wav
     let forged = client
@@ -436,13 +455,31 @@ async fn wakes_heos_from_standby_streams_24bit_44100_wav_scrubs_and_never_touche
         .unwrap();
     assert_eq!(forged.status().as_u16(), 403);
 
-    // Fetch WAV header + PCM samples and verify 44.1 kHz / 24-bit stereo RIFF WAVE + non-zero samples
+    // Verify HEAD probe returns exact DLNA & Content-Length headers with empty body
+    let head_wav = client.head(&stream_uri).send().await.unwrap();
+    assert_eq!(head_wav.status().as_u16(), 200);
+    assert_eq!(
+        head_wav.headers().get("contentfeatures.dlna.org").unwrap(),
+        DLNA_WAV_FEATURES
+    );
+    assert_eq!(
+        head_wav.headers().get("transfermode.dlna.org").unwrap(),
+        "Streaming"
+    );
+    assert_eq!(head_wav.headers().get("content-length").unwrap(), "529244");
+    assert!(head_wav.bytes().await.unwrap().is_empty());
+
+    // Fetch WAV header + PCM samples and verify 44.1 kHz / 24-bit stereo RIFF WAVE + exact length
     let full_wav = client.get(&stream_uri).send().await.unwrap();
     assert_eq!(full_wav.status().as_u16(), 200);
     assert_eq!(full_wav.headers().get("content-type").unwrap(), "audio/wav");
     assert_eq!(full_wav.headers().get("accept-ranges").unwrap(), "bytes");
+    assert_eq!(
+        full_wav.headers().get("contentfeatures.dlna.org").unwrap(),
+        DLNA_WAV_FEATURES
+    );
     let wav_bytes = full_wav.bytes().await.unwrap();
-    assert!(wav_bytes.len() > 44 + 6_000);
+    assert_eq!(wav_bytes.len(), 529_244);
     assert_eq!(&wav_bytes[0..4], b"RIFF");
     assert_eq!(&wav_bytes[8..12], b"WAVE");
     assert_eq!(u16::from_le_bytes([wav_bytes[20], wav_bytes[21]]), 1); // PCM

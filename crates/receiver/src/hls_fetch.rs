@@ -112,6 +112,83 @@ pub async fn fetch_clean_cdn_bytes(
         .map_err(|e| FetchError::Other(format!("CDN body read failed: {e}")))
 }
 
+pub async fn fetch_clean_cdn_prefix_bytes(
+    client: &reqwest::Client,
+    cdn_url: &str,
+    max_bytes: usize,
+) -> Result<Bytes, FetchError> {
+    let end_byte = max_bytes.saturating_sub(1);
+    let resp_res = client
+        .get(cdn_url)
+        .header(reqwest::header::RANGE, format!("bytes=0-{end_byte}"))
+        .send()
+        .await;
+    let mut resp = resp_res.map_err(|e| FetchError::Other(format!("CDN fetch failed: {e}")))?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(FetchError::AuthOrExpired(status));
+    }
+    if !resp.status().is_success() {
+        return Err(FetchError::Other(format!("CDN HTTP {status}")));
+    }
+    let mut out = Vec::with_capacity(max_bytes.min(65_536));
+    while out.len() < max_bytes {
+        let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| FetchError::Other(format!("CDN chunk read failed: {e}")))?
+        else {
+            break;
+        };
+        let take = (max_bytes - out.len()).min(chunk.len());
+        out.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    Ok(Bytes::from(out))
+}
+
+pub async fn open_clean_cdn_stream(
+    client: &reqwest::Client,
+    cdn_url: &str,
+    range_start_byte: Option<u64>,
+) -> Result<(reqwest::Response, bool), FetchError> {
+    let mut req = client.get(cdn_url);
+    let requested_range = range_start_byte.filter(|&b| b > 0);
+    if let Some(start_byte) = requested_range {
+        req = req.header(reqwest::header::RANGE, format!("bytes={start_byte}-"));
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| FetchError::Other(format!("CDN stream open failed: {e}")))?;
+    let status = resp.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(FetchError::AuthOrExpired(status));
+    }
+    if status == 416 && requested_range.is_some() {
+        let fallback = client
+            .get(cdn_url)
+            .send()
+            .await
+            .map_err(|e| FetchError::Other(format!("CDN stream retry failed: {e}")))?;
+        let fb_status = fallback.status().as_u16();
+        if fb_status == 401 || fb_status == 403 {
+            return Err(FetchError::AuthOrExpired(fb_status));
+        }
+        if !fallback.status().is_success() {
+            return Err(FetchError::Other(format!("CDN HTTP {fb_status}")));
+        }
+        return Ok((fallback, false));
+    }
+    if !resp.status().is_success() {
+        return Err(FetchError::Other(format!("CDN HTTP {status}")));
+    }
+    let honored_range = requested_range.is_some() && status == 206;
+    Ok((resp, honored_range))
+}
+
 pub async fn fetch_key_bytes(
     client: &reqwest::Client,
     key_uri: &str,
@@ -143,9 +220,9 @@ pub async fn load_playlist_for_descriptor(
     track_duration_ms: u64,
 ) -> Result<ParsedHlsPlaylist, FetchError> {
     if desc.protocol == PlayableProtocol::Progressive {
-        let dur_secs = (track_duration_ms as f64 / 1000.0).max(1.0);
+        let dur_secs = track_duration_ms as f64 / 1000.0;
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let target_dur = dur_secs.ceil() as u64;
+        let target_dur = dur_secs.ceil().max(1.0) as u64;
         return Ok(ParsedHlsPlaylist {
             target_duration: target_dur,
             media_sequence: 0,

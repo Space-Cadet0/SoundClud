@@ -9,12 +9,14 @@ use crate::protocol::{
     StreamLocatorPayload, UpdateConfigRequest, PROTOCOL_VERSION,
 };
 use crate::security::{generate_random_hex_token, PersistedReceiverState};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+const MAX_RETAINED_HEOS_TOKENS: usize = 6;
 
 struct ControllerHandle {
     controller_id: String,
@@ -32,7 +34,7 @@ pub struct ReceiverCoordinator {
     cached_outputs: RwLock<Vec<OutputDevice>>,
     active_session: RwLock<Option<Arc<HlsSession>>>,
     preloaded_session: RwLock<Option<Arc<HlsSession>>>,
-    heos_streams: RwLock<HashMap<String, Arc<HlsSession>>>,
+    heos_streams: RwLock<VecDeque<(String, Arc<HlsSession>)>>,
     backend_snapshot: RwLock<BackendStatusSnapshot>,
     controllers: RwLock<HashMap<u64, ControllerHandle>>,
     active_controller_conn: RwLock<Option<u64>>,
@@ -66,7 +68,7 @@ impl ReceiverCoordinator {
             cached_outputs: RwLock::new(Vec::new()),
             active_session: RwLock::new(None),
             preloaded_session: RwLock::new(None),
-            heos_streams: RwLock::new(HashMap::new()),
+            heos_streams: RwLock::new(VecDeque::new()),
             backend_snapshot: RwLock::new(BackendStatusSnapshot::default()),
             controllers: RwLock::new(HashMap::new()),
             active_controller_conn: RwLock::new(None),
@@ -181,8 +183,10 @@ impl ReceiverCoordinator {
         self.heos_streams
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(capability_token)
-            .cloned()
+            .iter()
+            .rev()
+            .find(|(tok, _)| tok == capability_token)
+            .map(|(_, session)| session.clone())
     }
 
     pub async fn refresh_outputs(&self) -> Vec<OutputDevice> {
@@ -245,16 +249,21 @@ impl ReceiverCoordinator {
             .as_ref()
             .and_then(|id| outputs.iter().find(|o| &o.id == id))
             .map(|o| o.kind);
-        let snap = match active_backend {
-            Some(OutputDeviceKind::HeosUpnp) => self.heos_backend.status_snapshot(),
-            Some(OutputDeviceKind::Coreaudio | OutputDeviceKind::Alsa) => {
-                self.local_backend.status_snapshot()
+        let coord_snap = self
+            .backend_snapshot
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let snap = if coord_snap.phase == PlaybackPhase::Error {
+            coord_snap
+        } else {
+            match active_backend {
+                Some(OutputDeviceKind::HeosUpnp) => self.heos_backend.status_snapshot(),
+                Some(OutputDeviceKind::Coreaudio | OutputDeviceKind::Alsa) => {
+                    self.local_backend.status_snapshot()
+                }
+                None => coord_snap,
             }
-            None => self
-                .backend_snapshot
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
         };
         let session = self
             .active_session
@@ -583,10 +592,38 @@ impl ReceiverCoordinator {
         }
 
         let start_ms = locator.start_position_ms;
-        let session = self
+        let track_dur_ms = locator.track.duration_ms;
+        *self
+            .backend_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = BackendStatusSnapshot {
+            phase: PlaybackPhase::Loading,
+            position_ms: start_ms,
+            duration_ms: track_dur_ms,
+            buffered_ms: start_ms,
+            error_code: None,
+            error_message: None,
+        };
+
+        let session = match self
             .hls_proxy
             .create_session(locator, Some(self.build_refresh_callback()))
-            .await?;
+            .await
+        {
+            Ok(s) => s,
+            Err(err) => {
+                self.record_coordinator_load_error(command_seq, &err);
+                return Err(err);
+            }
+        };
+
+        if target_dev.kind == OutputDeviceKind::HeosUpnp {
+            if let Err(err) = session.prewarm_pcm_at(start_ms).await {
+                self.hls_proxy.remove_session(&session.session_id);
+                self.record_coordinator_load_error(command_seq, &err);
+                return Err(err);
+            }
+        }
 
         let prev_session = self
             .active_session
@@ -600,12 +637,14 @@ impl ReceiverCoordinator {
         let port = self.local_http_port.load(Ordering::Relaxed);
         let heos_token = if target_dev.kind == OutputDeviceKind::HeosUpnp {
             let tok = generate_random_hex_token(16);
-            let mut map = self
+            let mut ring = self
                 .heos_streams
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.clear();
-            map.insert(tok.clone(), session.clone());
+            ring.push_back((tok.clone(), session.clone()));
+            while ring.len() > MAX_RETAINED_HEOS_TOKENS {
+                ring.pop_front();
+            }
             Some(tok)
         } else {
             None
@@ -628,22 +667,36 @@ impl ReceiverCoordinator {
         };
 
         if let Err(err) = res {
-            let mut snap = self
-                .backend_snapshot
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            snap.phase = PlaybackPhase::Error;
-            snap.error_code = Some("backend_load_failed".to_string());
-            snap.error_message = Some(err.clone());
-            drop(snap);
-            self.last_acked_seq.store(command_seq, Ordering::SeqCst);
-            self.broadcast_state_tick();
+            self.record_coordinator_load_error(command_seq, &err);
             return Err(err);
         }
+
+        let active_snap = if target_dev.kind == OutputDeviceKind::HeosUpnp {
+            self.heos_backend.status_snapshot()
+        } else {
+            self.local_backend.status_snapshot()
+        };
+        *self
+            .backend_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = active_snap;
 
         self.last_acked_seq.store(command_seq, Ordering::SeqCst);
         self.broadcast_state_tick();
         Ok(())
+    }
+
+    fn record_coordinator_load_error(&self, command_seq: u64, err: &str) {
+        let mut snap = self
+            .backend_snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snap.phase = PlaybackPhase::Error;
+        snap.error_code = Some("backend_load_failed".to_string());
+        snap.error_message = Some(err.to_string());
+        drop(snap);
+        self.last_acked_seq.store(command_seq, Ordering::SeqCst);
+        self.broadcast_state_tick();
     }
 
     pub async fn set_paused(&self, command_seq: u64, paused: bool) -> Result<(), String> {

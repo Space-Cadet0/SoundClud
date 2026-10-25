@@ -1,12 +1,15 @@
 use crate::protocol::{StandbyState, TrackMetadata};
+pub use crate::wav_streamer::DLNA_WAV_FEATURES;
+use crate::wav_streamer::{MAX_WAV_WINDOW_DURATION_MS, WAV_BYTE_RATE, WAV_HEADER_BYTES};
 
 const ACT_SERVICE_URN: &str = "urn:schemas-denon-com:service:ACT:1";
 const AVT_SERVICE_URN: &str = "urn:schemas-upnp-org:service:AVTransport:1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpnpPositionInfo {
     pub rel_time_ms: u64,
     pub track_duration_ms: u64,
+    pub track_uri: Option<String>,
 }
 
 #[must_use]
@@ -88,16 +91,44 @@ pub fn extract_xml_tag_text(xml: &str, local_tag: &str) -> Option<String> {
     None
 }
 
-/// Builds UPnP `DIDL-Lite` XML for Denon/Marantz front-panel OLED metadata display.
+/// Builds DLNA-compliant UPnP `DIDL-Lite` XML for Denon/Marantz front-panel OLED display
+/// and seekable (`DLNA.ORG_OP=01`) byte-range WAV transport.
 #[must_use]
-pub fn build_didl_lite_metadata(track: &TrackMetadata, stream_url: &str) -> String {
-    let title = xml_escape(&track.title);
-    let artist = xml_escape(&track.artist);
+pub fn build_didl_lite_metadata(
+    track: &TrackMetadata,
+    stream_url: &str,
+    start_ms: u64,
+    pcm_bytes: u32,
+) -> String {
+    let raw_title = track.title.trim();
+    let title = xml_escape(if raw_title.is_empty() {
+        "SoundCloud Track"
+    } else {
+        raw_title
+    });
+    let raw_artist = track.artist.trim();
+    let artist = xml_escape(if raw_artist.is_empty() {
+        "SoundCloud"
+    } else {
+        raw_artist
+    });
     let url_esc = xml_escape(stream_url);
-    let dur = format_upnp_duration(track.duration_ms);
+
+    let rem_ms = track.duration_ms.saturating_sub(start_ms);
+    let window_dur_ms = (u64::from(pcm_bytes) * 1_000) / u64::from(WAV_BYTE_RATE);
+    let effective_duration_ms = if rem_ms == 0 {
+        window_dur_ms
+    } else {
+        rem_ms.min(MAX_WAV_WINDOW_DURATION_MS)
+    };
+    let dur = format_upnp_duration(effective_duration_ms);
+    let total_file_bytes = WAV_HEADER_BYTES + u64::from(pcm_bytes);
+
     let art_tag = track
         .artwork_url
         .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .map_or_else(String::new, |art| {
             format!("<upnp:albumArtURI>{}</upnp:albumArtURI>", xml_escape(art))
         });
@@ -108,12 +139,15 @@ pub fn build_didl_lite_metadata(track: &TrackMetadata, stream_url: &str) -> Stri
          xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
          <item id=\"sc_{}\" parentID=\"0\" restricted=\"1\">\
          <dc:title>{title}</dc:title>\
-         <upnp:artist>{artist}</upnp:artist>\
          <dc:creator>{artist}</dc:creator>\
+         <upnp:artist>{artist}</upnp:artist>\
+         <upnp:album>SoundCloud</upnp:album>\
+         <upnp:genre>Music</upnp:genre>\
          {art_tag}\
          <upnp:class>object.item.audioItem.musicTrack</upnp:class>\
-         <res protocolInfo=\"http-get:*:audio/wav:*\" sampleFrequency=\"44100\" \
-         bitsPerSample=\"24\" nrAudioChannels=\"2\" duration=\"{dur}\">{url_esc}</res>\
+         <res protocolInfo=\"http-get:*:audio/wav:{DLNA_WAV_FEATURES}\" size=\"{total_file_bytes}\" \
+         bitrate=\"264600\" bitsPerSample=\"24\" sampleFrequency=\"44100\" \
+         nrAudioChannels=\"2\" duration=\"{dur}\">{url_esc}</res>\
          </item></DIDL-Lite>",
         xml_escape(&track.track_id)
     )
@@ -280,9 +314,13 @@ pub async fn avt_get_position_info(
     let track_duration_ms = extract_xml_tag_text(&xml, "TrackDuration")
         .and_then(|s| parse_upnp_duration_ms(&s))
         .unwrap_or(0);
+    let track_uri = extract_xml_tag_text(&xml, "TrackURI")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("NOT_IMPLEMENTED"));
     Ok(UpnpPositionInfo {
         rel_time_ms,
         track_duration_ms,
+        track_uri,
     })
 }
 

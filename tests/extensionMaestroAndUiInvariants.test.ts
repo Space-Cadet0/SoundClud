@@ -12,22 +12,30 @@ import {
   attachMainWorldNonceBridge,
   BRIDGE_BOOTSTRAP_ATTR,
   BRIDGE_BOOTSTRAP_EVENT,
+  createInMemoryStorageArea,
   createIsolatedWorldNonceBridge,
+  ExtensionBackgroundCoordinator,
   generateHexNonce128,
   generateInaudibleKeepaliveWavBytes,
+  installMediaPrototypeHooks,
   KEEPALIVE_DURATION_SECONDS,
   KEEPALIVE_SAMPLE_RATE_HZ,
   MaestroVirtualizerController,
   parseOAuthTokenFromAuthorizationHeader,
   parseOAuthTokenFromCookieString,
   promoteSoundCloudLocalSettingsToHq,
+  readEphemeralSessionState,
   SeekDebouncer,
   SOUNDCLOUD_LOCAL_SETTINGS_KEY,
   SoundCloudSessionObserver,
   SoundCloudTrackCatalog,
+  updateDurableLocalConfig,
+  updateEphemeralSessionState,
+  type DomTrackHint,
   type IsolatedToMainMessage,
   type MainToIsolatedMessage,
   type MinimalKeyValueStorage,
+  type NativeMediaBridge,
 } from '@soundclud/extension';
 
 const CURRENT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -87,13 +95,17 @@ function makeTelemetry(
   };
 }
 
-function makePlayableTrackPayload(trackId: string, title: string): Record<string, unknown> {
+function makePlayableTrackPayload(
+  trackId: string,
+  title: string,
+  durationMs = 210_000,
+): Record<string, unknown> {
   return {
     id: Number(trackId),
     title,
     permalink_url: `https://soundcloud.com/synthetic-artist/track-${trackId}`,
-    full_duration: 210_000,
-    duration: 210_000,
+    full_duration: durationMs,
+    duration: durationMs,
     artwork_url: `https://i1.sndcdn.com/artworks-synthetic-${trackId}-large.jpg`,
     waveform_url: `https://wis.sndcdn.com/synthetic-${trackId}_m.json`,
     track_authorization: `synthetic_test_track_auth_${trackId}`,
@@ -103,21 +115,21 @@ function makePlayableTrackPayload(trackId: string, title: string): Record<string
         {
           url: `https://api-v2.soundcloud.com/media/soundcloud:tracks:${trackId}/abr/stream/hls`,
           preset: 'abr_hq',
-          duration: 210_000,
+          duration: durationMs,
           quality: 'hq',
           format: { protocol: 'hls', mime_type: 'audio/mp4; codecs="mp4a.40.2"' },
         },
         {
           url: `https://api-v2.soundcloud.com/media/soundcloud:tracks:${trackId}/sq-mp3/stream/hls`,
           preset: 'mp3_1_0',
-          duration: 210_000,
+          duration: durationMs,
           quality: 'sq',
           format: { protocol: 'hls', mime_type: 'audio/mpeg' },
         },
         {
           url: `https://api-v2.soundcloud.com/media/soundcloud:tracks:${trackId}/hq-aac/stream/encrypted-hls`,
           preset: 'aac_256k',
-          duration: 210_000,
+          duration: durationMs,
           quality: 'hq',
           format: { protocol: 'encrypted-hls', mime_type: 'audio/mp4; codecs="mp4a.40.2"' },
         },
@@ -160,7 +172,288 @@ function makeCencOnlyTrackPayload(trackId: string, title: string): Record<string
   };
 }
 
+let activeMediaGlobalsTeardown: (() => void) | null = null;
+
+interface SyntheticBrowserMediaHarness {
+  createAudioElement(): HTMLMediaElement & {
+    nativePlayCalls: number;
+    nativePauseCalls: number;
+    nativeLoadCalls: number;
+  };
+  createMediaSource(): MediaSource;
+  teardown(): void;
+}
+
+/**
+ * Installs strict W3C `HTMLMediaElement`, `MediaSource`, `SourceBuffer`, and
+ * `URL.createObjectURL` prototypes in Node where every unvirtualized C++ MSE
+ * mutator throws `InvalidStateError` against an empty pipeline—matching real
+ * Chromium `HLSMSEPlayer` / `hls.js` failure modes.
+ */
+function installSyntheticBrowserMediaGlobals(): SyntheticBrowserMediaHarness {
+  activeMediaGlobalsTeardown?.();
+
+  const globalRecord = globalThis as unknown as Record<string, unknown>;
+  const prevHTMLMediaElement = globalRecord['HTMLMediaElement'];
+  const prevMediaSource = globalRecord['MediaSource'];
+  const prevSourceBuffer = globalRecord['SourceBuffer'];
+
+  const urlRecord = URL as unknown as Record<string, unknown>;
+  const origCreateObjectURL = URL.createObjectURL.bind(URL);
+  const origRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+  delete urlRecord['__soundcludMsePatchedV1'];
+
+  const throwInvalidState = (op: string): never => {
+    throw new DOMException(
+      `Empty native C++ MSE pipeline rejected ${op}`,
+      'InvalidStateError',
+    );
+  };
+
+  class HostileNativeSourceBuffer extends EventTarget {
+    public appendBuffer(_data: BufferSource): void {
+      throwInvalidState('SourceBuffer.appendBuffer');
+    }
+
+    public remove(_start: number, _end: number): void {
+      throwInvalidState('SourceBuffer.remove');
+    }
+
+    public abort(): void {
+      throwInvalidState('SourceBuffer.abort');
+    }
+
+    public get buffered(): TimeRanges {
+      return throwInvalidState('SourceBuffer.buffered');
+    }
+
+    public get updating(): boolean {
+      return throwInvalidState('SourceBuffer.updating');
+    }
+
+    public get timestampOffset(): number {
+      return throwInvalidState('SourceBuffer.timestampOffset get');
+    }
+
+    public set timestampOffset(_v: number) {
+      throwInvalidState('SourceBuffer.timestampOffset set');
+    }
+
+    public get appendWindowStart(): number {
+      return throwInvalidState('SourceBuffer.appendWindowStart get');
+    }
+
+    public set appendWindowStart(_v: number) {
+      throwInvalidState('SourceBuffer.appendWindowStart set');
+    }
+
+    public get appendWindowEnd(): number {
+      return throwInvalidState('SourceBuffer.appendWindowEnd get');
+    }
+
+    public set appendWindowEnd(_v: number) {
+      throwInvalidState('SourceBuffer.appendWindowEnd set');
+    }
+
+    public get mode(): AppendMode {
+      return throwInvalidState('SourceBuffer.mode get');
+    }
+
+    public set mode(_v: AppendMode) {
+      throwInvalidState('SourceBuffer.mode set');
+    }
+  }
+
+  class HostileNativeMediaSource extends EventTarget {
+    public addSourceBuffer(_type: string): SourceBuffer {
+      return new HostileNativeSourceBuffer() as unknown as SourceBuffer;
+    }
+
+    public removeSourceBuffer(_sb: SourceBuffer): void {
+      throwInvalidState('MediaSource.removeSourceBuffer');
+    }
+
+    public endOfStream(_error?: EndOfStreamError): void {
+      throwInvalidState('MediaSource.endOfStream');
+    }
+
+    public get duration(): number {
+      return Number.NaN;
+    }
+
+    public set duration(_v: number) {
+      throwInvalidState('MediaSource.duration set');
+    }
+
+    public get readyState(): ReadyState {
+      return 'open';
+    }
+  }
+
+  class SyntheticDomMediaElement extends EventTarget {
+    public nativePlayCalls = 0;
+    public nativePauseCalls = 0;
+    public nativeLoadCalls = 0;
+
+    private nativeSrc = '';
+    private nativeCurrentTime = 0;
+    private nativeDuration = Number.NaN;
+    private nativePaused = true;
+    private nativeSeeking = false;
+    private nativeEnded = false;
+    private nativeReadyState = 0;
+    private nativeVolume = 1;
+    private nativeMuted = false;
+
+    public play(): Promise<void> {
+      this.nativePlayCalls += 1;
+      this.nativePaused = false;
+      return Promise.resolve();
+    }
+
+    public pause(): void {
+      this.nativePauseCalls += 1;
+      this.nativePaused = true;
+    }
+
+    public load(): void {
+      this.nativeLoadCalls += 1;
+      this.nativeCurrentTime = 0;
+    }
+
+    public removeAttribute(qualifiedName: string): void {
+      if (qualifiedName.toLowerCase() === 'src') {
+        this.nativeSrc = '';
+      }
+    }
+
+    public setAttribute(qualifiedName: string, value: string): void {
+      if (qualifiedName.toLowerCase() === 'src') {
+        this.nativeSrc = value;
+      }
+    }
+
+    public get currentSrc(): string {
+      return this.nativeSrc;
+    }
+
+    public get src(): string {
+      return this.nativeSrc;
+    }
+
+    public set src(value: string) {
+      this.nativeSrc = value;
+    }
+
+    public get currentTime(): number {
+      return this.nativeCurrentTime;
+    }
+
+    public set currentTime(value: number) {
+      this.nativeCurrentTime = value;
+    }
+
+    public get duration(): number {
+      return this.nativeDuration;
+    }
+
+    public get paused(): boolean {
+      return this.nativePaused;
+    }
+
+    public get seeking(): boolean {
+      return this.nativeSeeking;
+    }
+
+    public get ended(): boolean {
+      return this.nativeEnded;
+    }
+
+    public get readyState(): number {
+      return this.nativeReadyState;
+    }
+
+    public get buffered(): TimeRanges {
+      return {
+        length: 0,
+        start(): number {
+          throw new DOMException('Empty native TimeRanges', 'IndexSizeError');
+        },
+        end(): number {
+          throw new DOMException('Empty native TimeRanges', 'IndexSizeError');
+        },
+      };
+    }
+
+    public get volume(): number {
+      return this.nativeVolume;
+    }
+
+    public set volume(value: number) {
+      this.nativeVolume = value;
+    }
+
+    public get muted(): boolean {
+      return this.nativeMuted;
+    }
+
+    public set muted(value: boolean) {
+      this.nativeMuted = value;
+    }
+  }
+
+  let objectUrlSeq = 0;
+  const revokedUrls = new Set<string>();
+  URL.createObjectURL = ((obj: Blob | MediaSource): string => {
+    if (obj instanceof HostileNativeMediaSource) {
+      objectUrlSeq += 1;
+      return `blob:https://soundcloud.com/synthetic-mse-${String(objectUrlSeq)}`;
+    }
+    return origCreateObjectURL(obj as Blob);
+  }) as typeof URL.createObjectURL;
+
+  URL.revokeObjectURL = ((url: string): void => {
+    revokedUrls.add(url);
+    if (!url.startsWith('blob:https://soundcloud.com/synthetic-mse-')) {
+      origRevokeObjectURL(url);
+    }
+  }) as typeof URL.revokeObjectURL;
+
+  globalRecord['SourceBuffer'] = HostileNativeSourceBuffer;
+  globalRecord['MediaSource'] = HostileNativeMediaSource;
+  globalRecord['HTMLMediaElement'] = SyntheticDomMediaElement;
+
+  const teardown = (): void => {
+    delete urlRecord['__soundcludMsePatchedV1'];
+    URL.createObjectURL = origCreateObjectURL;
+    URL.revokeObjectURL = origRevokeObjectURL;
+    if (prevSourceBuffer === undefined) delete globalRecord['SourceBuffer'];
+    else globalRecord['SourceBuffer'] = prevSourceBuffer;
+    if (prevMediaSource === undefined) delete globalRecord['MediaSource'];
+    else globalRecord['MediaSource'] = prevMediaSource;
+    if (prevHTMLMediaElement === undefined) delete globalRecord['HTMLMediaElement'];
+    else globalRecord['HTMLMediaElement'] = prevHTMLMediaElement;
+    if (activeMediaGlobalsTeardown === teardown) {
+      activeMediaGlobalsTeardown = null;
+    }
+  };
+
+  activeMediaGlobalsTeardown = teardown;
+
+  return {
+    createAudioElement: () =>
+      new SyntheticDomMediaElement() as unknown as HTMLMediaElement & {
+        nativePlayCalls: number;
+        nativePauseCalls: number;
+        nativeLoadCalls: number;
+      },
+    createMediaSource: () => new HostileNativeMediaSource() as unknown as MediaSource,
+    teardown,
+  };
+}
+
 afterEach(() => {
+  activeMediaGlobalsTeardown?.();
   vi.useRealTimers();
 });
 
@@ -413,7 +706,7 @@ describe('@soundclud/extension — MaestroVirtualizerController, SeekDebouncer &
     });
     expect(controller.getCurrentTimeSeconds()).toBe(25);
     expect(controller.getDurationSeconds(0)).toBe(210);
-    expect(controller.getBufferedTimeRanges().end(0)).toBe(55);
+    expect(controller.getBufferedTimeRanges().end(0)).toBe(210);
     expect(controller.getPaused()).toBe(false);
 
     // Switch active output to HEOS Direct (180 ms seek debounce) & perform rapid waveform scrub
@@ -427,15 +720,18 @@ describe('@soundclud/extension — MaestroVirtualizerController, SeekDebouncer &
     expect(controller.getSeekDebounceMs()).toBe(180);
 
     outboundMessages.length = 0;
+    controller.recordUserInteraction();
     controller.interceptSeekSeconds(mediaEl, 60);
     vi.advanceTimersByTime(100);
+    controller.recordUserInteraction();
     controller.interceptSeekSeconds(mediaEl, 75);
     vi.advanceTimersByTime(100);
+    controller.recordUserInteraction();
     controller.interceptSeekSeconds(mediaEl, 92.4);
 
     // Still inside 180 ms HEOS debounce window -> zero seek commands sent yet, optimistic pin active!
     expect(outboundMessages).toHaveLength(0);
-    expect(controller.getSeeking()).toBe(true);
+    expect(controller.isSeekPendingAck()).toBe(true);
     expect(controller.getCurrentTimeSeconds()).toBe(92.4);
 
     vi.advanceTimersByTime(180);
@@ -454,7 +750,8 @@ describe('@soundclud/extension — MaestroVirtualizerController, SeekDebouncer &
       telemetry: makeTelemetry({ positionMs: 26_000, durationMs: 210_000, bufferedMs: 56_000 }),
     });
     expect(controller.getCurrentTimeSeconds()).toBe(92.4);
-    expect(controller.getSeeking()).toBe(true);
+    expect(controller.isSeekPendingAck()).toBe(true);
+    expect(controller.getSeeking()).toBe(false);
 
     // Acked state_tick (lastAckedCommandSeq = 2 >= 2) settles seek pin cleanly!
     controller.handleIsolatedMessage({
@@ -462,6 +759,7 @@ describe('@soundclud/extension — MaestroVirtualizerController, SeekDebouncer &
       lastAckedCommandSeq: 2,
       telemetry: makeTelemetry({ positionMs: 92_600, durationMs: 210_000, bufferedMs: 110_000 }),
     });
+    expect(controller.isSeekPendingAck()).toBe(false);
     expect(controller.getSeeking()).toBe(false);
     expect(controller.getCurrentTimeSeconds()).toBe(92.6);
 
@@ -603,6 +901,645 @@ describe('@soundclud/extension — MaestroVirtualizerController, SeekDebouncer &
         (m) => m.type === 'request_load_track' && m.locator.track.trackId === '403',
       ),
     ).toBe(true);
+
+    controller.dispose();
+  });
+
+  it('Regression Test A — virtualizes the full W3C MSE surface (appendBuffer, remove, abort, timestampOffset, appendWindowStart/End, mode, endOfStream, duration) without InvalidStateError and reports full forward buffered coverage', async () => {
+    const dom = installSyntheticBrowserMediaGlobals();
+
+    const catalog = new SoundCloudTrackCatalog();
+    catalog.ingestPayload(makePlayableTrackPayload('501', 'Full MSE Virtualization Track', 300_000));
+
+    const observer = new SoundCloudSessionObserver();
+    observer.ingestHydration([{ hydratable: 'apiClient', data: { id: 'cid_mse_full' } }]);
+
+    let nativeBridgeRef: NativeMediaBridge | null = null;
+    const controller = new MaestroVirtualizerController({
+      catalog,
+      sessionObserver: observer,
+      sendToIsolated: () => {},
+      nativeBridge: {
+        pauseElement: (el) => nativeBridgeRef?.pauseElement(el),
+        playElement: (el) => nativeBridgeRef?.playElement?.(el),
+        getNativeCurrentTimeSeconds: (el) =>
+          nativeBridgeRef?.getNativeCurrentTimeSeconds(el) ?? 0,
+        setNativeCurrentTimeSeconds: (el, s) =>
+          nativeBridgeRef?.setNativeCurrentTimeSeconds?.(el, s),
+        getNativePaused: (el) => nativeBridgeRef?.getNativePaused(el) ?? true,
+      },
+    });
+    nativeBridgeRef = installMediaPrototypeHooks(controller);
+    controller.setHandoffEnabled(true);
+
+    const el = dom.createAudioElement();
+    const ms = dom.createMediaSource();
+    const blobUrl = URL.createObjectURL(ms);
+    el.src = blobUrl;
+
+    await el.play();
+    expect(el.nativePlayCalls).toBe(0);
+    expect(el.readyState).toBe(4);
+
+    // Feed HEOS-style telemetry where `bufferedMs` is only `pos + 2s` (`27_000 ms` on a `300_000 ms` track)
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        positionMs: 25_000,
+        durationMs: 300_000,
+        bufferedMs: 27_000,
+        phase: 'playing',
+      }),
+    });
+
+    const sb = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    const sbEvents: string[] = [];
+    for (const evName of ['updatestart', 'update', 'updateend', 'abort'] as const) {
+      sb.addEventListener(evName, () => sbEvents.push(evName));
+    }
+
+    // 1. Properties on empty virtualized SourceBuffer & MediaSource never throw InvalidStateError
+    expect(sb.updating).toBe(false);
+    expect(sb.mode).toBe('segments');
+    sb.mode = 'sequence';
+    expect(sb.mode).toBe('sequence');
+    sb.mode = 'segments';
+    expect(sb.mode).toBe('segments');
+
+    expect(sb.timestampOffset).toBe(0);
+    sb.timestampOffset = 14.25;
+    expect(sb.timestampOffset).toBe(14.25);
+
+    expect(sb.appendWindowStart).toBe(0);
+    expect(sb.appendWindowEnd).toBe(Number.POSITIVE_INFINITY);
+    sb.appendWindowStart = 2.5;
+    sb.appendWindowEnd = 295;
+    expect(sb.appendWindowStart).toBe(2.5);
+    expect(sb.appendWindowEnd).toBe(295);
+
+    ms.duration = 300;
+    expect(ms.duration).toBe(300);
+
+    // 2. appendBuffer lifecycle
+    sb.appendBuffer(new Uint8Array([0x00, 0x01, 0x02, 0x03]));
+    expect(sb.updating).toBe(true);
+    expect(sbEvents).toEqual(['updatestart']);
+    await Promise.resolve();
+    expect(sb.updating).toBe(false);
+    expect(sbEvents).toEqual(['updatestart', 'update', 'updateend']);
+
+    // 3. remove(0, 10) eviction lifecycle (must never throw InvalidStateError on empty native buffer!)
+    sbEvents.length = 0;
+    sb.remove(0, 10);
+    expect(sb.updating).toBe(true);
+    expect(sbEvents).toEqual(['updatestart']);
+    await Promise.resolve();
+    expect(sb.updating).toBe(false);
+    expect(sbEvents).toEqual(['updatestart', 'update', 'updateend']);
+
+    // 4. abort() cancels in-flight update cleanly without duplicate microtask updateend
+    sbEvents.length = 0;
+    sb.appendBuffer(new Uint8Array([0xaa, 0xbb]));
+    expect(sb.updating).toBe(true);
+    sb.abort();
+    expect(sb.updating).toBe(false);
+    expect(sbEvents).toEqual(['updatestart', 'abort', 'updateend']);
+    await Promise.resolve();
+    expect(sbEvents).toEqual(['updatestart', 'abort', 'updateend']);
+
+    // 5. MediaSource.endOfStream() + removeSourceBuffer()
+    let sourceEndedCount = 0;
+    ms.addEventListener('sourceended', () => {
+      sourceEndedCount += 1;
+    });
+    ms.endOfStream();
+    expect(ms.readyState).toBe('ended');
+    await Promise.resolve();
+    expect(sourceEndedCount).toBe(1);
+    expect(() => ms.removeSourceBuffer(sb)).not.toThrow();
+
+    // 6. Buffered TimeRanges MUST report full forward coverage [0, >= duration],
+    //    NEVER [0, pos + 2s] (27s) and NEVER bufEnd === pos (25s)!
+    for (const ranges of [sb.buffered, el.buffered]) {
+      expect(ranges.length).toBe(1);
+      expect(ranges.start(0)).toBe(0);
+      expect(ranges.end(0)).toBeGreaterThanOrEqual(300);
+      expect(ranges.end(0)).not.toBe(27);
+      expect(ranges.end(0)).toBeGreaterThan(el.currentTime);
+    }
+
+    URL.revokeObjectURL(blobUrl);
+    controller.dispose();
+  });
+
+  it('Regression Test B — interpolates el.currentTime monotonically between 1,000 ms HEOS ticks and rejects unprompted hls.js +0.1s stall nudges', async () => {
+    vi.useFakeTimers();
+    const dom = installSyntheticBrowserMediaGlobals();
+
+    let perfNowMs = 10_000;
+    const advanceClockMs = (deltaMs: number): void => {
+      perfNowMs += deltaMs;
+      vi.advanceTimersByTime(deltaMs);
+    };
+
+    const catalog = new SoundCloudTrackCatalog();
+    catalog.ingestPayload(makePlayableTrackPayload('502', 'HEOS Monotonic Playhead Track', 240_000));
+
+    const observer = new SoundCloudSessionObserver();
+    observer.ingestHydration([{ hydratable: 'apiClient', data: { id: 'cid_monotonic' } }]);
+
+    const outboundMessages: MainToIsolatedMessage[] = [];
+    let nativeBridgeRef: NativeMediaBridge | null = null;
+    const controller = new MaestroVirtualizerController({
+      catalog,
+      sessionObserver: observer,
+      sendToIsolated: (msg) => outboundMessages.push(msg),
+      nowPerfMs: () => perfNowMs,
+      nativeBridge: {
+        pauseElement: (el) => nativeBridgeRef?.pauseElement(el),
+        getNativeCurrentTimeSeconds: (el) =>
+          nativeBridgeRef?.getNativeCurrentTimeSeconds(el) ?? 0,
+        getNativePaused: (el) => nativeBridgeRef?.getNativePaused(el) ?? true,
+      },
+    });
+    nativeBridgeRef = installMediaPrototypeHooks(controller);
+
+    controller.handleIsolatedMessage({
+      type: 'sync_runtime_state',
+      handoffEnabled: true,
+      seekDebounceMs: HEOS_SEEK_DEBOUNCE_MS,
+      connectionState: 'connected',
+      lastAckedCommandSeq: 0,
+    });
+
+    const el = dom.createAudioElement();
+    await el.play();
+    expect(outboundMessages[0]?.type).toBe('request_load_track');
+
+    // Initial HEOS wake/loading creep prevents SoundCloud's 2.0s `_determineIfPlaying()` timeout
+    const tLoad0 = el.currentTime;
+    advanceClockMs(500);
+    const tLoad500 = el.currentTime;
+    expect(tLoad500).toBeGreaterThan(tLoad0);
+
+    // Feed 1,000 ms stepped HEOS telemetry ticks (including an integer-second truncation repeat at +900ms)
+    const sampledPositions: number[] = [];
+
+    for (const stepSec of [10, 11, 12] as const) {
+      controller.handleIsolatedMessage({
+        type: 'telemetry_tick',
+        lastAckedCommandSeq: 1,
+        telemetry: makeTelemetry({
+          activeBackend: 'heos_upnp',
+          positionMs: stepSec * 1_000,
+          durationMs: 240_000,
+          bufferedMs: (stepSec + 2) * 1_000,
+          phase: 'playing',
+        }),
+      });
+      sampledPositions.push(el.currentTime);
+
+      for (let q = 0; q < 3; q += 1) {
+        advanceClockMs(250);
+        sampledPositions.push(el.currentTime);
+      }
+      advanceClockMs(250);
+    }
+
+    // Verify strictly advancing sub-second playhead across every 250ms sample (prevents hls.js bufferStalledError!)
+    for (let i = 1; i < sampledPositions.length; i += 1) {
+      const prev = sampledPositions[i - 1] ?? 0;
+      const curr = sampledPositions[i] ?? 0;
+      expect(curr).toBeGreaterThan(prev);
+    }
+
+    // Feed a jittered HEOS integer-second repeat (`12_000 ms` when interpolated playhead is ~`13.0s`):
+    // playhead MUST clamp monotonically and never jump backward!
+    const beforeJitterSec = el.currentTime;
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 12_000,
+        durationMs: 240_000,
+        bufferedMs: 14_000,
+        phase: 'playing',
+      }),
+    });
+    expect(el.currentTime).toBeGreaterThanOrEqual(beforeJitterSec);
+
+    // Unprompted synthetic `el.currentTime = el.currentTime + 0.1` (`hls.js` GapController stall nudge)
+    // with NO recent `recordUserInteraction()` MUST NOT emit an outbound `request_seek`!
+    advanceClockMs(2_000);
+    outboundMessages.length = 0;
+    const preNudgeSec = el.currentTime;
+    el.currentTime = preNudgeSec + 0.1;
+    advanceClockMs(500);
+
+    expect(outboundMessages.filter((m) => m.type === 'request_seek')).toHaveLength(0);
+    expect(controller.isSeekPendingAck()).toBe(false);
+
+    controller.dispose();
+  });
+
+  it('Regression Test C — scrubs to 2,700s (45:00) on a 3,600s (1:00:00) mix with accurate async seeked currentTime, >=3,600s forward buffer, and zero snap-back to 12s', async () => {
+    vi.useFakeTimers();
+    const dom = installSyntheticBrowserMediaGlobals();
+
+    let perfNowMs = 50_000;
+    const advanceClockMs = (deltaMs: number): void => {
+      perfNowMs += deltaMs;
+      vi.advanceTimersByTime(deltaMs);
+    };
+
+    const catalog = new SoundCloudTrackCatalog();
+    catalog.ingestPayload(makePlayableTrackPayload('503', 'Hour-Long DJ Mix', 3_600_000));
+
+    const observer = new SoundCloudSessionObserver();
+    observer.ingestHydration([{ hydratable: 'apiClient', data: { id: 'cid_hour_mix' } }]);
+
+    const outboundMessages: MainToIsolatedMessage[] = [];
+    let nativeBridgeRef: NativeMediaBridge | null = null;
+    const controller = new MaestroVirtualizerController({
+      catalog,
+      sessionObserver: observer,
+      sendToIsolated: (msg) => outboundMessages.push(msg),
+      nowPerfMs: () => perfNowMs,
+      nativeBridge: {
+        pauseElement: (el) => nativeBridgeRef?.pauseElement(el),
+        getNativeCurrentTimeSeconds: (el) =>
+          nativeBridgeRef?.getNativeCurrentTimeSeconds(el) ?? 0,
+        getNativePaused: (el) => nativeBridgeRef?.getNativePaused(el) ?? true,
+      },
+    });
+    nativeBridgeRef = installMediaPrototypeHooks(controller);
+
+    controller.handleIsolatedMessage({
+      type: 'sync_runtime_state',
+      handoffEnabled: true,
+      seekDebounceMs: HEOS_SEEK_DEBOUNCE_MS,
+      connectionState: 'connected',
+      lastAckedCommandSeq: 0,
+    });
+
+    const el = dom.createAudioElement();
+    await el.play();
+
+    // Playing at 12s (`12_000 ms`) of a 3,600s (`1:00:00`) mix
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 12_000,
+        durationMs: 3_600_000,
+        bufferedMs: 14_000,
+        phase: 'playing',
+      }),
+    });
+    expect(el.currentTime).toBe(12);
+
+    const seekingSnapshots: Array<{ currentTime: number; seeking: boolean }> = [];
+    const seekedSnapshots: Array<{
+      currentTime: number;
+      seeking: boolean;
+      bufferedEnd: number;
+    }> = [];
+    const timeupdatePositionsAfterScrub: number[] = [];
+
+    el.addEventListener('seeking', () => {
+      seekingSnapshots.push({ currentTime: el.currentTime, seeking: el.seeking });
+    });
+    el.addEventListener('seeked', () => {
+      seekedSnapshots.push({
+        currentTime: el.currentTime,
+        seeking: el.seeking,
+        bufferedEnd: el.buffered.end(0),
+      });
+    });
+    el.addEventListener('timeupdate', () => {
+      timeupdatePositionsAfterScrub.push(el.currentTime);
+    });
+
+    outboundMessages.length = 0;
+    controller.recordUserInteraction();
+    el.currentTime = 2700;
+
+    // 1. Immediate synchronous read MUST be 2,700s with >= 3,600s forward buffer
+    expect(el.currentTime).toBe(2700);
+    expect(el.buffered.end(0)).toBeGreaterThanOrEqual(3600);
+    expect(controller.isSeekPendingAck()).toBe(true);
+
+    // 2. Async `'seeking'` and `'seeked'` fire promptly with exact ~2,700s position
+    advanceClockMs(1);
+    expect(seekingSnapshots).toEqual([{ currentTime: 2700, seeking: true }]);
+    expect(seekedSnapshots).toHaveLength(1);
+    const seekedSnap = seekedSnapshots[0];
+    expect(seekedSnap).toBeDefined();
+    if (seekedSnap !== undefined) {
+      expect(seekedSnap.seeking).toBe(false);
+      expect(Math.abs(seekedSnap.currentTime * 1000 - 2_700_000)).toBeLessThanOrEqual(100);
+      expect(seekedSnap.bufferedEnd).toBeGreaterThanOrEqual(3600);
+    }
+
+    // 3. Mid-debounce pre-seek tick (`12.25s`, seq 1) MUST NOT snap `el.currentTime` back!
+    advanceClockMs(50);
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 12_250,
+        durationMs: 3_600_000,
+        bufferedMs: 14_250,
+        phase: 'playing',
+      }),
+    });
+    expect(el.currentTime).toBe(2700);
+
+    // Commit 180ms HEOS debounce -> emits `request_seek(2_700_000)` with `commandSeq = 2`
+    advanceClockMs(150);
+    expect(outboundMessages).toEqual([
+      {
+        type: 'request_seek',
+        commandSeq: 2,
+        positionMs: 2_700_000,
+      },
+    ]);
+
+    // 4a. Unacked pre-seek tick (`lastAckedCommandSeq: 1 < 2`, `positionMs: 12_500`) ignored
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 12_500,
+        durationMs: 3_600_000,
+        bufferedMs: 14_500,
+        phase: 'playing',
+      }),
+    });
+    expect(el.currentTime).toBe(2700);
+
+    // 4b. Early-acked tick still carrying pre-jump `12.6s` position (`|12.6s - 2700s| > 3s` proximity) stays pinned!
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 2,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 12_600,
+        durationMs: 3_600_000,
+        bufferedMs: 14_600,
+        phase: 'playing',
+      }),
+    });
+    expect(el.currentTime).toBe(2700);
+    expect(controller.isSeekPendingAck()).toBe(true);
+
+    // 4c. Settled post-seek tick (`lastAckedCommandSeq: 2`, `positionMs: 2_700_060`) releases pin cleanly
+    //     without ANY momentary snap-back to 12s inside `onSeekSettled` `'timeupdate'` listeners!
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 2,
+      telemetry: makeTelemetry({
+        activeBackend: 'heos_upnp',
+        positionMs: 2_700_060,
+        durationMs: 3_600_000,
+        bufferedMs: 2_702_060,
+        phase: 'playing',
+      }),
+    });
+    expect(controller.isSeekPendingAck()).toBe(false);
+    expect(el.currentTime).toBeCloseTo(2700.06, 2);
+    expect(el.buffered.end(0)).toBeGreaterThanOrEqual(3600);
+    expect(timeupdatePositionsAfterScrub.length).toBeGreaterThan(0);
+    for (const observedSec of timeupdatePositionsAfterScrub) {
+      expect(observedSec).toBeGreaterThanOrEqual(2700);
+    }
+
+    controller.dispose();
+  });
+
+  it('Regression Test D — fences shared <audio> pause/src/load/play reset before /stream/hls resolves and blocks stale Track 1 paused telemetry echoes across MAIN + SW', async () => {
+    vi.useFakeTimers();
+    const dom = installSyntheticBrowserMediaGlobals();
+
+    const perfNowMs = 90_000;
+    const catalog = new SoundCloudTrackCatalog();
+    catalog.ingestPayload([
+      makePlayableTrackPayload('1001', 'Track One', 240_000),
+      makePlayableTrackPayload('1002', 'Track Two', 312_000),
+    ]);
+
+    const observer = new SoundCloudSessionObserver();
+    observer.ingestHydration([{ hydratable: 'apiClient', data: { id: 'cid_track_switch' } }]);
+
+    const outboundMessages: MainToIsolatedMessage[] = [];
+    let domHint: DomTrackHint | undefined = {
+      permalinkOrPath: '/synthetic-artist/track-1001',
+      title: 'Track One',
+      isPlayerBadge: true,
+    };
+
+    let nativeBridgeRef: NativeMediaBridge | null = null;
+    const controller = new MaestroVirtualizerController({
+      catalog,
+      sessionObserver: observer,
+      sendToIsolated: (msg) => outboundMessages.push(msg),
+      nowPerfMs: () => perfNowMs,
+      resolveDomTrackHint: () => domHint,
+      nativeBridge: {
+        pauseElement: (el) => nativeBridgeRef?.pauseElement(el),
+        getNativeCurrentTimeSeconds: (el) =>
+          nativeBridgeRef?.getNativeCurrentTimeSeconds(el) ?? 0,
+        getNativePaused: (el) => nativeBridgeRef?.getNativePaused(el) ?? true,
+      },
+    });
+    nativeBridgeRef = installMediaPrototypeHooks(controller);
+    controller.setHandoffEnabled(true);
+
+    const el = dom.createAudioElement();
+    el.src = 'blob:https://soundcloud.com/track-1';
+    catalog.recordResolvedStreamUrl(
+      'https://api-v2.soundcloud.com/media/soundcloud:tracks:1001/hq-aac/stream/encrypted-hls',
+      'https://cf-hls-media.sndcdn.com/hq-1001.m3u8',
+    );
+    await el.play();
+    expect(outboundMessages[0]?.type).toBe('request_load_track');
+
+    // Track 1 reaches 45s and user pauses Track 1 (or SoundCloud pauses during transition)
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 1,
+      telemetry: makeTelemetry({
+        positionMs: 45_000,
+        durationMs: 240_000,
+        bufferedMs: 65_000,
+        phase: 'playing',
+        track: {
+          trackId: '1001',
+          permalinkUrl: 'https://soundcloud.com/synthetic-artist/track-1001',
+          title: 'Track One',
+          artist: 'Synthetic Artist',
+          durationMs: 240_000,
+        },
+      }),
+    });
+    el.pause();
+    expect(outboundMessages[1]).toEqual({
+      type: 'request_set_paused',
+      commandSeq: 2,
+      paused: true,
+    });
+    controller.handleIsolatedMessage({
+      type: 'telemetry_tick',
+      lastAckedCommandSeq: 2,
+      telemetry: makeTelemetry({
+        positionMs: 45_000,
+        durationMs: 240_000,
+        bufferedMs: 65_000,
+        phase: 'paused',
+        track: {
+          trackId: '1001',
+          permalinkUrl: 'https://soundcloud.com/synthetic-artist/track-1001',
+          title: 'Track One',
+          artist: 'Synthetic Artist',
+          durationMs: 240_000,
+        },
+      }),
+    });
+    expect(el.paused).toBe(true);
+    expect(el.currentTime).toBe(45);
+
+    // 1. User clicks Track 2: shared `<audio>` resets `pause()`, `src = 'blob:.../track-2'`,
+    //    `currentTime = 0`, `load()`, `play()` BEFORE Track 2's `/stream/hls` JSON resolves
+    //    and while DOM player badge STILL shows Track 1!
+    outboundMessages.length = 0;
+    el.pause();
+    el.src = 'blob:https://soundcloud.com/track-2';
+    el.currentTime = 0;
+    el.load();
+    await el.play();
+    vi.advanceTimersByTime(250);
+
+    // Track 1 MUST NOT be falsely resumed (`set_paused(false)`) and NO stale `seek(0)` may hit Track 1!
+    expect(
+      outboundMessages.filter(
+        (m) => m.type === 'request_set_paused' || m.type === 'request_seek',
+      ),
+    ).toHaveLength(0);
+    expect(outboundMessages.filter((m) => m.type === 'request_load_track')).toHaveLength(0);
+    expect(el.paused).toBe(false);
+    expect(el.currentTime).toBeLessThan(0.5);
+
+    // As soon as Track 2's `/stream/hls` JSON resolves in `catalog`, `request_load_track` fires for Track 2!
+    domHint = {
+      permalinkOrPath: '/synthetic-artist/track-1002',
+      title: 'Track Two',
+      isPlayerBadge: true,
+    };
+    catalog.ingestPayload(
+      { url: 'https://cf-hls-media.sndcdn.com/hq-1002.m3u8' },
+      'https://api-v2.soundcloud.com/media/soundcloud:tracks:1002/hq-aac/stream/encrypted-hls',
+    );
+
+    const loadTrack2Messages = outboundMessages.filter(
+      (m): m is Extract<MainToIsolatedMessage, { type: 'request_load_track' }> =>
+        m.type === 'request_load_track',
+    );
+    expect(loadTrack2Messages).toHaveLength(1);
+    const loadTrack2 = loadTrack2Messages[0];
+    if (loadTrack2 === undefined) {
+      throw new Error('Expected request_load_track for Track 2');
+    }
+    const loadSeq = loadTrack2.commandSeq;
+    expect(loadTrack2.locator.track.trackId).toBe('1002');
+    expect(loadTrack2.locator.startPositionMs).toBe(0);
+    expect(el.duration).toBe(312);
+
+    // 2. Immediately inject stale `sync_runtime_state` carrying Track 1's `paused` telemetry (`lastAckedCommandSeq < loadSeq`):
+    //    `el.paused` MUST stay `false`, `el.currentTime` near `0`, and `el.duration` MUST stay `312`!
+    controller.handleIsolatedMessage({
+      type: 'sync_runtime_state',
+      handoffEnabled: true,
+      seekDebounceMs: HEOS_SEEK_DEBOUNCE_MS,
+      connectionState: 'connected',
+      lastAckedCommandSeq: loadSeq - 1,
+      telemetry: makeTelemetry({
+        phase: 'paused',
+        positionMs: 45_000,
+        durationMs: 240_000,
+        bufferedMs: 65_000,
+        track: {
+          trackId: '1001',
+          permalinkUrl: 'https://soundcloud.com/synthetic-artist/track-1001',
+          title: 'Track One',
+          artist: 'Synthetic Artist',
+          durationMs: 240_000,
+        },
+      }),
+    });
+    // Also inject an unacked tick without `track` metadata (`lastAckedCommandSeq < loadSeq`)
+    controller.handleIsolatedMessage({
+      type: 'sync_runtime_state',
+      handoffEnabled: true,
+      seekDebounceMs: HEOS_SEEK_DEBOUNCE_MS,
+      connectionState: 'connected',
+      lastAckedCommandSeq: loadSeq - 1,
+      telemetry: makeTelemetry({
+        phase: 'paused',
+        positionMs: 45_000,
+        durationMs: 240_000,
+        bufferedMs: 65_000,
+      }),
+    });
+
+    expect(el.paused).toBe(false);
+    expect(el.currentTime).toBeLessThan(0.5);
+    expect(el.duration).toBe(312);
+
+    // 3. Verify Background SW coordinator also optimistically replaces Track 1's paused session
+    //    telemetry with Track 2 (`phase: 'loading'`, `durationMs: 312_000`) upon `request_load_track`!
+    const localArea = createInMemoryStorageArea();
+    const sessionArea = createInMemoryStorageArea();
+    await updateDurableLocalConfig(localArea, (prev) => ({
+      ...prev,
+      handoffEnabled: true,
+    }));
+    await updateEphemeralSessionState(sessionArea, (prev) => ({
+      ...prev,
+      connectionState: 'connected',
+      lastAckedCommandSeq: loadSeq - 1,
+      lastTelemetry: makeTelemetry({
+        phase: 'paused',
+        positionMs: 45_000,
+        durationMs: 240_000,
+        track: {
+          trackId: '1001',
+          permalinkUrl: 'https://soundcloud.com/synthetic-artist/track-1001',
+          title: 'Track One',
+          artist: 'Synthetic Artist',
+          durationMs: 240_000,
+        },
+      }),
+    }));
+
+    const bgCoordinator = new ExtensionBackgroundCoordinator({
+      storage: { local: localArea, session: sessionArea },
+    });
+    const swResp = await bgCoordinator.handleRequest(
+      { type: 'forward_main_message', message: loadTrack2 },
+      77,
+    );
+    expect(swResp.ok).toBe(true);
+    const updatedSession = await readEphemeralSessionState(sessionArea);
+    expect(updatedSession.nextCommandSeq).toBe(loadSeq);
+    expect(updatedSession.lastTelemetry?.phase).toBe('loading');
+    expect(updatedSession.lastTelemetry?.track?.trackId).toBe('1002');
+    expect(updatedSession.lastTelemetry?.positionMs).toBe(0);
+    expect(updatedSession.lastTelemetry?.durationMs).toBe(312_000);
 
     controller.dispose();
   });

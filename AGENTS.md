@@ -36,16 +36,17 @@ These rules apply unconditionally across the entire `SoundClud` repository. Ever
 
 ## 2. Multi-Agent Operating Model & File Ownership
 
-Complex work in `SoundClud` is executed through a **4-tier multi-agent topology** to prevent context pollution, confirmation bias, and merge collisions:
+Complex work in `SoundClud` is executed through a **5-tier multi-agent topology** to prevent context pollution, confirmation bias, and merge collisions:
 
 1. **Lead Orchestrator**: Owns architecture alignment (`docs/ARCHITECTURE_SPEC.md`), cross-package integration, subagent lifecycle management, and final verification sign-off.
-2. **Read-Only Forensic Auditor (`forensic-protocol-auditor`)**: Investigates protocol edge cases, CoreAudio/HEOS state, or regressions empirically before code is written, keeping `git status` 100% clean.
+2. **Read-Only Forensic Auditor (`forensic-protocol-auditor`)**: Investigates protocol edge cases, Crashpad minidumps, CoreAudio/HEOS state, or regressions empirically before code is written, keeping `git status` 100% clean.
 3. **Disjoint Domain Specialists** (parallelizable with zero file overlap):
    - **`protocol-contracts-architect`** -> `packages/protocol/`
-   - **`receiver-daemon-architect`** -> `crates/receiver/` (`LocalMpvBackend` + `HeosUpnpBackend` + Local HLS/WAV Proxy)
+   - **`receiver-daemon-architect`** -> `crates/receiver/` (`LocalMpvBackend` + `HeosUpnpBackend` + HEOS Host-MCU Control + Local HLS/WAV Proxy)
    - **`extension-maestro-engineer`** -> `packages/extension/` (must consult `chrome-extensions` and `modern-web-guidance` skills first)
    - **`packaging-service-ci-engineer`** -> `packaging/`, `scripts/`, `CHROMEWEBSTORE.md`, `.github/workflows/`
-4. **Independent Adversarial Gatekeeper (`adversarial-qa-hygiene-verifier`)** -> `tests/`: Independently verifies runtime behavior, chaos resilience (HLS `403` mid-mix refresh, HEOS standby wake/scrub, WS drops, multi-tab handoff), latency targets, and Zero-PII invariants via `npm run verify`.
+4. **Independent Adversarial Gatekeeper (`adversarial-qa-hygiene-verifier`)** -> `tests/`: Independently verifies runtime behavior, chaos resilience (HLS `403` mid-mix refresh, HEOS standby wake/scrub, WS drops, multi-tab handoff, MSE surface virtualization), latency targets, and Zero-PII invariants via `npm run verify`.
+5. **Opt-In Live Hardware & Browser UAT Validator (`live-uat-hardware-browser-validator`)**: Executes opt-in live Chromium (`soundcloud.com`) + physical HEOS/CoreAudio hardware verification (`0 dB` amp-knob-only invariant, V8 heap/Crashpad stability, multi-hour mix scrubs, track-switch soak) strictly outside default offline CI (`Law 4`), leaving zero PII or temp artifacts in the repository.
 
 ---
 

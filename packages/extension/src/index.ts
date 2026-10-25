@@ -13,6 +13,7 @@ export * from './main-world/sessionObserver.js';
 export * from './main-world/trackCatalog.js';
 export * from './main-world/seekDebouncer.js';
 export * from './main-world/mediaKeyKeepalive.js';
+export * from './main-world/mseVirtualizer.js';
 export * from './main-world/playerVirtualizer.js';
 export * from './main-world/mediaPrototypeHooks.js';
 

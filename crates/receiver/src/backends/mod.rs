@@ -1,4 +1,5 @@
 pub mod heos_discovery;
+pub mod heos_mcu;
 pub mod heos_soap;
 pub mod heos_upnp;
 pub mod local_mpv;

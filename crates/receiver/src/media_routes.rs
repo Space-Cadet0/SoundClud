@@ -1,7 +1,8 @@
 use crate::coordinator::ReceiverCoordinator;
 use crate::protocol::ApiErrorResponse;
 use crate::wav_streamer::{
-    compute_total_pcm_bytes, parse_http_byte_range, spawn_wav_byte_stream, WAV_HEADER_BYTES,
+    compute_total_pcm_bytes, parse_http_byte_range, spawn_wav_byte_stream, DLNA_WAV_FEATURES,
+    WAV_HEADER_BYTES,
 };
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -139,10 +140,7 @@ pub async fn get_heos_wav_stream(
     };
 
     let start_ms = query.start_ms.unwrap_or(0);
-    let playlist = session.playlist_snapshot();
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let fallback_dur = (playlist.total_duration_secs * 1000.0).round() as u64;
-    let track_dur_ms = session.track.duration_ms.max(fallback_dur);
+    let track_dur_ms = session.effective_duration_ms();
     let pcm_bytes = compute_total_pcm_bytes(track_dur_ms, start_ms);
     let total_file_bytes = WAV_HEADER_BYTES + u64::from(pcm_bytes);
 
@@ -153,7 +151,13 @@ pub async fn get_heos_wav_stream(
                 Err(_) => {
                     return (
                         StatusCode::RANGE_NOT_SATISFIABLE,
-                        [(header::CONTENT_RANGE, format!("bytes */{total_file_bytes}"))],
+                        [
+                            (
+                                header::CONTENT_RANGE.as_str(),
+                                format!("bytes */{total_file_bytes}"),
+                            ),
+                            ("contentFeatures.dlna.org", DLNA_WAV_FEATURES.to_string()),
+                        ],
                     )
                         .into_response();
                 }
@@ -179,7 +183,8 @@ pub async fn get_heos_wav_stream(
         .header(header::CONTENT_TYPE, "audio/wav")
         .header(header::ACCEPT_RANGES, "bytes")
         .header(header::CONTENT_LENGTH, content_len.to_string())
-        .header("transferMode.dlna.org", "Streaming");
+        .header("transferMode.dlna.org", "Streaming")
+        .header("contentFeatures.dlna.org", DLNA_WAV_FEATURES);
 
     if let Some(cr) = content_range {
         resp_builder = resp_builder.header(header::CONTENT_RANGE, cr);

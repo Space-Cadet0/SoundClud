@@ -521,12 +521,31 @@ export class ReceiverWsController {
         if (this.intentionalClose || !this.isWelcomed) {
           break;
         }
-        await updateEphemeralSessionState(this.storage.session, (prev) => ({
-          ...prev,
-          connectionState: 'connected',
-          lastTelemetry: event.telemetry,
-          lastAckedCommandSeq: event.lastAckedCommandSeq,
-        }));
+        let ignoredStalePreviousTrackTick = false;
+        await updateEphemeralSessionState(this.storage.session, (prev) => {
+          const isStalePreviousTrack =
+            prev.lastTelemetry?.phase === 'loading' &&
+            prev.lastTelemetry.track?.trackId !== undefined &&
+            event.telemetry.track?.trackId !== undefined &&
+            event.telemetry.track.trackId !== prev.lastTelemetry.track.trackId &&
+            event.lastAckedCommandSeq < prev.nextCommandSeq;
+          if (isStalePreviousTrack) {
+            ignoredStalePreviousTrackTick = true;
+            return {
+              ...prev,
+              connectionState: 'connected',
+            };
+          }
+          return {
+            ...prev,
+            connectionState: 'connected',
+            lastTelemetry: event.telemetry,
+            lastAckedCommandSeq: event.lastAckedCommandSeq,
+          };
+        });
+        if (ignoredStalePreviousTrackTick) {
+          break;
+        }
         await this.onForwardToMain({
           type: 'telemetry_tick',
           telemetry: event.telemetry,

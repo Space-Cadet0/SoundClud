@@ -1,6 +1,10 @@
 use crate::backends::heos_discovery::{
     discover_heos_endpoints, HeosDiscoveredEndpoint, HeosDiscoverySeed,
 };
+use crate::backends::heos_mcu::{
+    activate_host_mcu_zone, extract_device_ip, keepalive_host_mcu, ping_heos_cli_keepalive,
+    resolve_mcu_port, McuPowerStatus,
+};
 use crate::backends::heos_soap::{
     avt_get_position_info, avt_get_transport_info, avt_pause, avt_play, avt_seek_rel_time,
     avt_set_transport_uri, avt_stop, build_didl_lite_metadata, get_device_power_state,
@@ -11,10 +15,11 @@ use crate::backends::{
 };
 use crate::hls_proxy::HlsSession;
 use crate::protocol::{OutputDevice, OutputDeviceKind, PlaybackPhase, StandbyState};
+use crate::wav_streamer::{compute_total_pcm_bytes, WAV_BYTE_RATE};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -23,6 +28,8 @@ pub struct HeosBackendConfig {
     pub enable_lan_multicast: bool,
     pub discovery_seeds: Vec<HeosDiscoverySeed>,
     pub poll_interval: Duration,
+    pub keepalive_interval: Duration,
+    pub mcu_port_override: Option<u16>,
 }
 
 impl Default for HeosBackendConfig {
@@ -31,6 +38,8 @@ impl Default for HeosBackendConfig {
             enable_lan_multicast: true,
             discovery_seeds: Vec::new(),
             poll_interval: Duration::from_millis(250),
+            keepalive_interval: Duration::from_secs(180),
+            mcu_port_override: None,
         }
     }
 }
@@ -41,12 +50,25 @@ struct ActiveHeosSession {
     local_http_port: u16,
     capability_token: String,
     anchor_start_ms: u64,
+    expected_stream_url: String,
+    paused_via_stop: bool,
+    paused_position_ms: u64,
     poller: JoinHandle<()>,
+}
+
+struct PollerParams {
+    endpoint: HeosDiscoveredEndpoint,
+    expected_stream_url: String,
+    track_id: String,
+    locator_id: String,
+    track_dur_ms: u64,
+    anchor_start_ms: u64,
 }
 
 struct SharedHeosState {
     snapshot: BackendStatusSnapshot,
     endpoints: HashMap<String, HeosDiscoveredEndpoint>,
+    transition_guard_until: Option<Instant>,
 }
 
 pub struct HeosUpnpBackend {
@@ -54,6 +76,7 @@ pub struct HeosUpnpBackend {
     client: reqwest::Client,
     event_tx: mpsc::UnboundedSender<BackendEvent>,
     shared: Arc<RwLock<SharedHeosState>>,
+    transport_lock: Mutex<()>,
     active: Mutex<Option<ActiveHeosSession>>,
 }
 
@@ -71,9 +94,25 @@ impl HeosUpnpBackend {
             shared: Arc::new(RwLock::new(SharedHeosState {
                 snapshot: BackendStatusSnapshot::default(),
                 endpoints: HashMap::new(),
+                transition_guard_until: None,
             })),
+            transport_lock: Mutex::new(()),
             active: Mutex::new(None),
         }
+    }
+
+    fn record_load_error(&self, message: &str) {
+        let snap = {
+            let mut s = self
+                .shared
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            s.snapshot.phase = PlaybackPhase::Error;
+            s.snapshot.error_code = Some("backend_load_failed".to_string());
+            s.snapshot.error_message = Some(message.to_string());
+            s.snapshot.clone()
+        };
+        let _ = self.event_tx.send(BackendEvent::StateChanged(snap));
     }
 
     async fn resolve_endpoint(&self, output_id: &str) -> Result<HeosDiscoveredEndpoint, String> {
@@ -101,43 +140,56 @@ impl HeosUpnpBackend {
     }
 
     async fn ensure_device_awake(&self, endpoint: &HeosDiscoveredEndpoint) -> Result<(), String> {
-        let Some(act_url) = &endpoint.act_control_url else {
-            return Ok(());
-        };
-        let current = get_device_power_state(&self.client, act_url)
-            .await
-            .unwrap_or(StandbyState::Unknown);
-        if current != StandbyState::Off {
-            return Ok(());
-        }
+        if let Some(act_url) = &endpoint.act_control_url {
+            let current = get_device_power_state(&self.client, act_url)
+                .await
+                .unwrap_or(StandbyState::Unknown);
+            if current == StandbyState::Off {
+                tracing::info!(
+                    output_id = %endpoint.output_id,
+                    "waking HEOS device from network standby"
+                );
+                let waking_snap = {
+                    let mut s = self
+                        .shared
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    s.snapshot.phase = PlaybackPhase::WakingDevice;
+                    s.snapshot.clone()
+                };
+                let _ = self.event_tx.send(BackendEvent::StateChanged(waking_snap));
 
-        let waking_snap = {
-            let mut s = self
-                .shared
-                .write()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            s.snapshot.phase = PlaybackPhase::WakingDevice;
-            s.snapshot.clone()
-        };
-        let _ = self.event_tx.send(BackendEvent::StateChanged(waking_snap));
-
-        set_device_power_state_on(&self.client, act_url).await?;
-        for _ in 0..80 {
-            if let Ok(StandbyState::On) = get_device_power_state(&self.client, act_url).await {
-                if let Some(ep) = self
-                    .shared
-                    .write()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .endpoints
-                    .get_mut(&endpoint.output_id)
-                {
-                    ep.standby_state = StandbyState::On;
+                set_device_power_state_on(&self.client, act_url).await?;
+                let mut woke = false;
+                for _ in 0..80 {
+                    if let Ok(StandbyState::On) =
+                        get_device_power_state(&self.client, act_url).await
+                    {
+                        if let Some(ep) = self
+                            .shared
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .endpoints
+                            .get_mut(&endpoint.output_id)
+                        {
+                            ep.standby_state = StandbyState::On;
+                        }
+                        woke = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-                return Ok(());
+                if !woke {
+                    return Err("HEOS device did not wake from standby within timeout".to_string());
+                }
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        Err("HEOS device did not wake from standby within timeout".to_string())
+
+        let device_ip = extract_device_ip(&endpoint.avt_control_url, endpoint.ip);
+        if let Some(mcu_port) = resolve_mcu_port(device_ip, self.config.mcu_port_override) {
+            activate_host_mcu_zone(device_ip, mcu_port).await;
+        }
+        Ok(())
     }
 
     async fn start_transport_at(
@@ -147,7 +199,25 @@ impl HeosUpnpBackend {
         local_http_port: u16,
         capability_token: &str,
         start_ms: u64,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
+        session.prewarm_pcm_at(start_ms).await?;
+
+        self.shared
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+
+        let _ = avt_stop(&self.client, &endpoint.avt_control_url).await;
+        let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(1_200);
+        while tokio::time::Instant::now() < settle_deadline {
+            match avt_get_transport_info(&self.client, &endpoint.avt_control_url).await {
+                Ok(state) if state.eq_ignore_ascii_case("TRANSITIONING") => {
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
+                _ => break,
+            }
+        }
+
         let local_ip = route_local_ip_for_target(endpoint.ip, local_http_port);
         let host_fmt = match local_ip {
             IpAddr::V4(v4) => v4.to_string(),
@@ -156,77 +226,219 @@ impl HeosUpnpBackend {
         let stream_url = format!(
             "http://{host_fmt}:{local_http_port}/heos/{capability_token}/stream.wav?start_ms={start_ms}"
         );
-        let didl = build_didl_lite_metadata(&session.track, &stream_url);
+        let track_dur_ms = session.effective_duration_ms();
+        let pcm_bytes = compute_total_pcm_bytes(track_dur_ms, start_ms);
+        let didl = build_didl_lite_metadata(&session.track, &stream_url, start_ms, pcm_bytes);
         avt_set_transport_uri(&self.client, &endpoint.avt_control_url, &stream_url, &didl).await?;
-        avt_play(&self.client, &endpoint.avt_control_url).await?;
-        Ok(())
+
+        let mut last_play_err = String::new();
+        let mut play_ok = false;
+        for attempt in 0..8 {
+            match avt_play(&self.client, &endpoint.avt_control_url).await {
+                Ok(()) => {
+                    play_ok = true;
+                    break;
+                }
+                Err(err) => {
+                    last_play_err = err;
+                    if attempt + 1 < 8 {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    }
+                }
+            }
+        }
+        if !play_ok {
+            return Err(last_play_err);
+        }
+
+        tracing::info!(
+            output_id = %endpoint.output_id,
+            start_ms,
+            pcm_bytes,
+            "started HEOS UPnP WAV transport"
+        );
+        Ok(stream_url)
     }
 
-    fn spawn_poller(
-        &self,
-        avt_url: String,
-        track_id: String,
-        locator_id: String,
-        track_dur_ms: u64,
-        anchor_start_ms: u64,
-    ) -> JoinHandle<()> {
+    fn spawn_poller(&self, params: PollerParams) -> JoinHandle<()> {
         let client = self.client.clone();
         let shared = self.shared.clone();
         let event_tx = self.event_tx.clone();
         let interval = self.config.poll_interval;
+        let keepalive_interval = self.config.keepalive_interval;
+        let mcu_port_override = self.config.mcu_port_override;
 
         tokio::spawn(async move {
+            let device_ip = extract_device_ip(&params.endpoint.avt_control_url, params.endpoint.ip);
+            let mcu_port = resolve_mcu_port(device_ip, mcu_port_override);
+            let enable_keepalive = !device_ip.is_loopback() || mcu_port_override.is_some();
+            let mut last_keepalive_at = tokio::time::Instant::now();
             let mut saw_playing = false;
+            let mut consecutive_stopped_polls: u8 = 0;
+            let mut last_track_uri: Option<String> = None;
+            let mut logged_premature_stop = false;
+
             loop {
                 tokio::time::sleep(interval).await;
-                if let Ok(pos) = avt_get_position_info(&client, &avt_url).await {
-                    let abs_pos = anchor_start_ms.saturating_add(pos.rel_time_ms);
-                    let snap = {
-                        let mut s = shared
-                            .write()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        s.snapshot.position_ms = abs_pos.min(track_dur_ms.max(abs_pos));
-                        if track_dur_ms > 0 {
-                            s.snapshot.duration_ms = track_dur_ms;
-                        } else if pos.track_duration_ms > 0 {
-                            s.snapshot.duration_ms = pos.track_duration_ms;
-                        }
-                        s.snapshot.buffered_ms = s
-                            .snapshot
-                            .position_ms
-                            .saturating_add(2_000)
-                            .min(s.snapshot.duration_ms.max(abs_pos));
-                        s.snapshot.clone()
-                    };
-                    let _ = event_tx.send(BackendEvent::StateChanged(snap));
-                }
 
-                if let Ok(state_str) = avt_get_transport_info(&client, &avt_url).await {
-                    match state_str.as_str() {
-                        "PLAYING" => {
-                            saw_playing = true;
+                let in_guard = shared
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .transition_guard_until
+                    .is_some_and(|until| Instant::now() < until);
+
+                if let Ok(pos) =
+                    avt_get_position_info(&client, &params.endpoint.avt_control_url).await
+                {
+                    last_track_uri.clone_from(&pos.track_uri);
+                    let uri_ok = pos
+                        .track_uri
+                        .as_deref()
+                        .is_none_or(|u| u == params.expected_stream_url);
+                    if uri_ok {
+                        let abs_pos = params.anchor_start_ms.saturating_add(pos.rel_time_ms);
+                        let maybe_snap = {
                             let mut s = shared
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            if s.snapshot.phase != PlaybackPhase::Paused {
-                                s.snapshot.phase = PlaybackPhase::Playing;
+                            let allow_pos_update = s.snapshot.phase != PlaybackPhase::Paused
+                                && (!in_guard
+                                    || (i128::from(abs_pos) - i128::from(s.snapshot.position_ms))
+                                        .abs()
+                                        <= 2_500);
+                            if allow_pos_update {
+                                s.snapshot.position_ms =
+                                    abs_pos.min(params.track_dur_ms.max(abs_pos));
+                                if params.track_dur_ms > 0 {
+                                    s.snapshot.duration_ms = params.track_dur_ms;
+                                } else if pos.track_duration_ms > 0 {
+                                    s.snapshot.duration_ms = pos.track_duration_ms;
+                                }
+                                s.snapshot.buffered_ms = s
+                                    .snapshot
+                                    .position_ms
+                                    .saturating_add(2_000)
+                                    .max(s.snapshot.buffered_ms)
+                                    .min(s.snapshot.duration_ms.max(abs_pos));
+                                Some(s.snapshot.clone())
+                            } else {
+                                None
+                            }
+                        };
+                        if let Some(snap) = maybe_snap {
+                            let _ = event_tx.send(BackendEvent::StateChanged(snap));
+                        }
+                    }
+                }
+
+                if let Ok(state_str) =
+                    avt_get_transport_info(&client, &params.endpoint.avt_control_url).await
+                {
+                    let uri_ok = last_track_uri
+                        .as_deref()
+                        .is_none_or(|u| u == params.expected_stream_url);
+                    match state_str.as_str() {
+                        "PLAYING" => {
+                            consecutive_stopped_polls = 0;
+                            logged_premature_stop = false;
+                            if uri_ok {
+                                saw_playing = true;
+                            }
+                            if !in_guard {
+                                let mut s = shared
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                if s.snapshot.phase != PlaybackPhase::Paused {
+                                    s.snapshot.phase = PlaybackPhase::Playing;
+                                }
                             }
                         }
                         "PAUSED_PLAYBACK" => {
-                            shared
-                                .write()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .snapshot
-                                .phase = PlaybackPhase::Paused;
+                            consecutive_stopped_polls = 0;
+                            if !in_guard {
+                                shared
+                                    .write()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .snapshot
+                                    .phase = PlaybackPhase::Paused;
+                            }
                         }
-                        "STOPPED" if saw_playing => {
-                            let _ = event_tx.send(BackendEvent::TrackEnded {
-                                track_id,
-                                locator_id,
-                            });
-                            break;
+                        "STOPPED" => {
+                            let (phase, cur_pos_ms) = {
+                                let s = shared
+                                    .read()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                (s.snapshot.phase, s.snapshot.position_ms)
+                            };
+                            if !in_guard && phase != PlaybackPhase::Paused && uri_ok && saw_playing
+                            {
+                                consecutive_stopped_polls =
+                                    consecutive_stopped_polls.saturating_add(1);
+                                if consecutive_stopped_polls >= 2 {
+                                    let near_end = params.track_dur_ms == 0
+                                        || cur_pos_ms.saturating_add(5_000) >= params.track_dur_ms;
+                                    if near_end {
+                                        let _ = event_tx.send(BackendEvent::TrackEnded {
+                                            track_id: params.track_id,
+                                            locator_id: params.locator_id,
+                                        });
+                                        break;
+                                    } else if !logged_premature_stop {
+                                        logged_premature_stop = true;
+                                        tracing::warn!(
+                                            output_id = %params.endpoint.output_id,
+                                            position_ms = cur_pos_ms,
+                                            duration_ms = params.track_dur_ms,
+                                            "suppressed premature TrackEnded on mid-track STOPPED"
+                                        );
+                                    }
+                                }
+                            } else {
+                                consecutive_stopped_polls = 0;
+                            }
                         }
-                        _ => {}
+                        _ => {
+                            consecutive_stopped_polls = 0;
+                        }
+                    }
+                }
+
+                if enable_keepalive && last_keepalive_at.elapsed() >= keepalive_interval {
+                    let is_playing = shared
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot
+                        .phase
+                        == PlaybackPhase::Playing;
+                    if is_playing {
+                        last_keepalive_at = tokio::time::Instant::now();
+                        if let Some(act_url) = &params.endpoint.act_control_url {
+                            let _ = set_device_power_state_on(&client, act_url).await;
+                        }
+                        ping_heos_cli_keepalive(
+                            device_ip,
+                            params.endpoint.cli_port,
+                            params.endpoint.heos_pid,
+                        )
+                        .await;
+                        if let Some(mp) = mcu_port {
+                            if keepalive_host_mcu(device_ip, mp).await == McuPowerStatus::Standby {
+                                tracing::info!(
+                                    output_id = %params.endpoint.output_id,
+                                    "HEOS host amplifier entered standby; stopping active stream"
+                                );
+                                let _ = avt_stop(&client, &params.endpoint.avt_control_url).await;
+                                let idle_snap = {
+                                    let mut s = shared
+                                        .write()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    s.snapshot = BackendStatusSnapshot::default();
+                                    s.snapshot.clone()
+                                };
+                                let _ = event_tx.send(BackendEvent::StateChanged(idle_snap));
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -287,15 +499,29 @@ impl AudioBackend for HeosUpnpBackend {
 
     fn load(&self, req: BackendLoadRequest) -> BackendFuture<'_, ()> {
         Box::pin(async move {
-            let token = req
-                .heos_capability_token
-                .ok_or_else(|| "missing HEOS capability token".to_string())?;
-            let endpoint = self.resolve_endpoint(&req.output_id).await?;
+            let _tx_guard = self.transport_lock.lock().await;
+
+            let Some(token) = req.heos_capability_token else {
+                let msg = "missing HEOS capability token".to_string();
+                self.record_load_error(&msg);
+                return Err(msg);
+            };
+            let endpoint = match self.resolve_endpoint(&req.output_id).await {
+                Ok(ep) => ep,
+                Err(e) => {
+                    self.record_load_error(&e);
+                    return Err(e);
+                }
+            };
 
             if let Some(prev) = self.active.lock().await.take() {
                 prev.poller.abort();
+                if prev.endpoint.output_id != endpoint.output_id {
+                    let _ = avt_stop(&self.client, &prev.endpoint.avt_control_url).await;
+                }
             }
 
+            let effective_dur = req.session.effective_duration_ms();
             {
                 let mut s = self
                     .shared
@@ -304,37 +530,53 @@ impl AudioBackend for HeosUpnpBackend {
                 s.snapshot = BackendStatusSnapshot {
                     phase: PlaybackPhase::Loading,
                     position_ms: req.start_position_ms,
-                    duration_ms: req.session.track.duration_ms,
+                    duration_ms: effective_dur,
                     buffered_ms: req.start_position_ms,
                     error_code: None,
                     error_message: None,
                 };
             }
 
-            self.ensure_device_awake(&endpoint).await?;
-            self.start_transport_at(
-                &endpoint,
-                &req.session,
-                req.local_http_port,
-                &token,
-                req.start_position_ms,
-            )
-            .await?;
+            if let Err(e) = self.ensure_device_awake(&endpoint).await {
+                self.record_load_error(&e);
+                return Err(e);
+            }
+            let stream_url = match self
+                .start_transport_at(
+                    &endpoint,
+                    &req.session,
+                    req.local_http_port,
+                    &token,
+                    req.start_position_ms,
+                )
+                .await
+            {
+                Ok(url) => url,
+                Err(e) => {
+                    self.record_load_error(&e);
+                    return Err(e);
+                }
+            };
 
-            let poller = self.spawn_poller(
-                endpoint.avt_control_url.clone(),
-                req.session.track.track_id.clone(),
-                req.session.locator_id(),
-                req.session.track.duration_ms,
-                req.start_position_ms,
-            );
+            let poller = self.spawn_poller(PollerParams {
+                endpoint: endpoint.clone(),
+                expected_stream_url: stream_url.clone(),
+                track_id: req.session.track.track_id.clone(),
+                locator_id: req.session.locator_id(),
+                track_dur_ms: req.session.effective_duration_ms(),
+                anchor_start_ms: req.start_position_ms,
+            });
 
+            let final_dur = req.session.effective_duration_ms();
             *self.active.lock().await = Some(ActiveHeosSession {
                 endpoint,
                 session: req.session,
                 local_http_port: req.local_http_port,
                 capability_token: token,
                 anchor_start_ms: req.start_position_ms,
+                expected_stream_url: stream_url,
+                paused_via_stop: false,
+                paused_position_ms: req.start_position_ms,
                 poller,
             });
 
@@ -344,6 +586,9 @@ impl AudioBackend for HeosUpnpBackend {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.snapshot.phase = PlaybackPhase::Playing;
+                s.snapshot.duration_ms = final_dur;
+                s.snapshot.buffered_ms =
+                    req.start_position_ms.saturating_add(10_000).min(final_dur);
                 s.snapshot.clone()
             };
             let _ = self.event_tx.send(BackendEvent::StateChanged(snap));
@@ -353,18 +598,84 @@ impl AudioBackend for HeosUpnpBackend {
 
     fn set_paused(&self, paused: bool) -> BackendFuture<'_, ()> {
         Box::pin(async move {
-            let avt_url = self
-                .active
-                .lock()
-                .await
-                .as_ref()
-                .map(|a| a.endpoint.avt_control_url.clone())
+            let _tx_guard = self.transport_lock.lock().await;
+            let mut guard = self.active.lock().await;
+            let active = guard
+                .as_mut()
                 .ok_or_else(|| "no active HEOS session".to_string())?;
+
+            self.shared
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+
             if paused {
-                avt_pause(&self.client, &avt_url).await?;
+                if avt_pause(&self.client, &active.endpoint.avt_control_url)
+                    .await
+                    .is_ok()
+                {
+                    active.paused_via_stop = false;
+                } else {
+                    let cur_pos = self
+                        .shared
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .snapshot
+                        .position_ms;
+                    avt_stop(&self.client, &active.endpoint.avt_control_url).await?;
+                    active.paused_via_stop = true;
+                    active.paused_position_ms = cur_pos;
+                    tracing::info!(
+                        output_id = %active.endpoint.output_id,
+                        position_ms = cur_pos,
+                        "HEOS renderer rejected Pause; fell back to Stop with saved resume position"
+                    );
+                }
             } else {
-                avt_play(&self.client, &avt_url).await?;
+                let reanchor_pos = if active.paused_via_stop {
+                    Some(active.paused_position_ms)
+                } else if avt_play(&self.client, &active.endpoint.avt_control_url)
+                    .await
+                    .is_err()
+                {
+                    Some(
+                        self.shared
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .snapshot
+                            .position_ms,
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(resume_ms) = reanchor_pos {
+                    let new_url = self
+                        .start_transport_at(
+                            &active.endpoint,
+                            &active.session,
+                            active.local_http_port,
+                            &active.capability_token,
+                            resume_ms,
+                        )
+                        .await?;
+                    let new_poller = self.spawn_poller(PollerParams {
+                        endpoint: active.endpoint.clone(),
+                        expected_stream_url: new_url.clone(),
+                        track_id: active.session.track.track_id.clone(),
+                        locator_id: active.session.locator_id(),
+                        track_dur_ms: active.session.effective_duration_ms(),
+                        anchor_start_ms: resume_ms,
+                    });
+                    active.poller.abort();
+                    active.poller = new_poller;
+                    active.anchor_start_ms = resume_ms;
+                    active.expected_stream_url = new_url;
+                    active.paused_via_stop = false;
+                }
             }
+            drop(guard);
+
             let snap = {
                 let mut s = self
                     .shared
@@ -384,41 +695,72 @@ impl AudioBackend for HeosUpnpBackend {
 
     fn seek(&self, position_ms: u64) -> BackendFuture<'_, ()> {
         Box::pin(async move {
+            let _tx_guard = self.transport_lock.lock().await;
             let mut guard = self.active.lock().await;
             let active = guard
                 .as_mut()
                 .ok_or_else(|| "no active HEOS session".to_string())?;
 
-            let can_rel_seek = position_ms >= active.anchor_start_ms;
-            let rel_result = if can_rel_seek {
-                avt_seek_rel_time(
-                    &self.client,
-                    &active.endpoint.avt_control_url,
-                    position_ms - active.anchor_start_ms,
-                )
-                .await
-            } else {
-                Err("before_anchor".to_string())
+            let optim_snap = {
+                let mut s = self
+                    .shared
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let dur = s.snapshot.duration_ms.max(position_ms);
+                s.snapshot.position_ms = position_ms;
+                s.snapshot.buffered_ms = position_ms.saturating_add(30_000).min(dur);
+                s.transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+                s.snapshot.clone()
             };
+            let _ = self.event_tx.send(BackendEvent::StateChanged(optim_snap));
 
-            if rel_result.is_err() {
-                active.poller.abort();
-                self.start_transport_at(
-                    &active.endpoint,
-                    &active.session,
-                    active.local_http_port,
-                    &active.capability_token,
-                    position_ms,
-                )
-                .await?;
-                active.anchor_start_ms = position_ms;
-                active.poller = self.spawn_poller(
-                    active.endpoint.avt_control_url.clone(),
-                    active.session.track.track_id.clone(),
-                    active.session.locator_id(),
-                    active.session.track.duration_ms,
-                    position_ms,
-                );
+            let _ = active.session.prewarm_pcm_at(position_ms).await;
+
+            if active.paused_via_stop {
+                active.paused_position_ms = position_ms;
+            } else {
+                let track_dur_ms = active.session.effective_duration_ms();
+                let window_pcm = compute_total_pcm_bytes(track_dur_ms, active.anchor_start_ms);
+                let window_dur_ms = (u64::from(window_pcm) * 1_000) / u64::from(WAV_BYTE_RATE);
+                let can_rel_seek = position_ms >= active.anchor_start_ms
+                    && (position_ms - active.anchor_start_ms) < window_dur_ms;
+
+                let rel_ok = if can_rel_seek {
+                    avt_seek_rel_time(
+                        &self.client,
+                        &active.endpoint.avt_control_url,
+                        position_ms - active.anchor_start_ms,
+                    )
+                    .await
+                    .is_ok()
+                } else {
+                    false
+                };
+
+                if !rel_ok {
+                    let new_url = self
+                        .start_transport_at(
+                            &active.endpoint,
+                            &active.session,
+                            active.local_http_port,
+                            &active.capability_token,
+                            position_ms,
+                        )
+                        .await?;
+                    let new_poller = self.spawn_poller(PollerParams {
+                        endpoint: active.endpoint.clone(),
+                        expected_stream_url: new_url.clone(),
+                        track_id: active.session.track.track_id.clone(),
+                        locator_id: active.session.locator_id(),
+                        track_dur_ms,
+                        anchor_start_ms: position_ms,
+                    });
+                    active.poller.abort();
+                    active.poller = new_poller;
+                    active.anchor_start_ms = position_ms;
+                    active.expected_stream_url = new_url;
+                    active.paused_via_stop = false;
+                }
             }
             drop(guard);
 
@@ -427,7 +769,9 @@ impl AudioBackend for HeosUpnpBackend {
                     .shared
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let dur = s.snapshot.duration_ms.max(position_ms);
                 s.snapshot.position_ms = position_ms;
+                s.snapshot.buffered_ms = position_ms.saturating_add(30_000).min(dur);
                 s.snapshot.clone()
             };
             let _ = self.event_tx.send(BackendEvent::StateChanged(snap));
@@ -441,6 +785,7 @@ impl AudioBackend for HeosUpnpBackend {
 
     fn stop(&self, _keep_idle_carrier: bool, _dither_subaudible: bool) -> BackendFuture<'_, ()> {
         Box::pin(async move {
+            let _tx_guard = self.transport_lock.lock().await;
             if let Some(active) = self.active.lock().await.take() {
                 active.poller.abort();
                 let _ = avt_stop(&self.client, &active.endpoint.avt_control_url).await;
@@ -451,6 +796,7 @@ impl AudioBackend for HeosUpnpBackend {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 s.snapshot = BackendStatusSnapshot::default();
+                s.transition_guard_until = None;
                 s.snapshot.clone()
             };
             let _ = self.event_tx.send(BackendEvent::StateChanged(snap));

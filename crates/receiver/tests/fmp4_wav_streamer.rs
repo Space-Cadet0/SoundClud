@@ -280,3 +280,113 @@ async fn decodes_fragmented_mp4_init_plus_m4s_into_bit_perfect_0db_24bit_wav() {
 
     task.abort();
 }
+
+#[tokio::test]
+async fn streams_progressive_protocol_incrementally_and_decodes_macos_he_aac_fallback() {
+    // Build a 0.1s 44.1 kHz 16-bit WAV served via PlayableProtocol::Progressive
+    let frames = 4_410usize;
+    let data_len = u32::try_from(frames * 4).unwrap();
+    let mut wav16 = Vec::with_capacity(44 + frames * 4);
+    wav16.extend_from_slice(b"RIFF");
+    wav16.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav16.extend_from_slice(b"WAVEfmt ");
+    wav16.extend_from_slice(&16u32.to_le_bytes());
+    wav16.extend_from_slice(&1u16.to_le_bytes());
+    wav16.extend_from_slice(&2u16.to_le_bytes());
+    wav16.extend_from_slice(&44_100u32.to_le_bytes());
+    wav16.extend_from_slice(&(44_100u32 * 4).to_le_bytes());
+    wav16.extend_from_slice(&4u16.to_le_bytes());
+    wav16.extend_from_slice(&16u16.to_le_bytes());
+    wav16.extend_from_slice(b"data");
+    wav16.extend_from_slice(&data_len.to_le_bytes());
+    for _ in 0..frames {
+        wav16.extend_from_slice(&16_384i16.to_le_bytes());
+        wav16.extend_from_slice(&(-16_384i16).to_le_bytes());
+    }
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let prog_bytes = wav16.clone();
+    let app = Router::new().route("/prog.wav", get(move || async move { prog_bytes.clone() }));
+    let srv = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let locator = StreamLocatorPayload {
+        locator_id: "loc_prog".to_string(),
+        track: TrackMetadata {
+            track_id: "304".to_string(),
+            permalink_url: "https://soundcloud.com/prog/test".to_string(),
+            title: "Progressive Test".to_string(),
+            artist: "Tester".to_string(),
+            artwork_url: None,
+            duration_ms: 150, // 0.15s > 0.10s actual frames -> verifies progressive + zero-pad!
+            waveform_url: None,
+        },
+        selected: SelectedTranscodingDescriptor {
+            resolve_url: format!("{base}/unused"),
+            preset: "mp3_1_0".to_string(),
+            protocol: PlayableProtocol::Progressive,
+            mime_type: "audio/wav".to_string(),
+            quality: StreamQualityTier::Sq,
+            bitrate_kbps: 128,
+            sample_rate_hz: SourceSampleRateHz::Hz44100,
+            initial_playlist_url: Some(format!("{base}/prog.wav")),
+        },
+        fallback_transcodings: Vec::new(),
+        auth: EphemeralSoundCloudAuth {
+            client_id: "cid".to_string(),
+            oauth_token: None,
+            track_authorization: None,
+            secret_token: None,
+            account_tier: AccountTier::Free,
+        },
+        start_position_ms: 0,
+    };
+
+    let proxy = HlsProxy::new();
+    let session = proxy.create_session(locator, None).await.unwrap();
+    session.prewarm_pcm_at(0).await.unwrap();
+    let mut rx = spawn_wav_byte_stream(session, 0, None);
+    let mut out = Vec::new();
+    while let Some(Ok(c)) = rx.recv().await {
+        out.extend_from_slice(&c);
+    }
+    assert_eq!(out.len(), 44 + 6_615 * 6);
+    assert!(out[44..44 + 4_410 * 6].iter().any(|&b| b != 0));
+    assert!(out[44 + 4_410 * 6..].iter().all(|&b| b == 0));
+
+    #[cfg(target_os = "macos")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let in_wav = dir.path().join("in.wav");
+        let heaac = dir.path().join("heaac.aac");
+        std::fs::write(&in_wav, &wav16).unwrap();
+        let ok = tokio::process::Command::new("/usr/bin/afconvert")
+            .args(["-f", "adts", "-d", "aach"])
+            .arg(&in_wav)
+            .arg(&heaac)
+            .status()
+            .await
+            .is_ok_and(|s| s.success());
+        if ok {
+            let adts_bytes = std::fs::read(&heaac).unwrap();
+            let decoded = soundclud_receiver::wav_transcode::decode_segment_to_pcm24_bytes(
+                adts_bytes,
+                "audio/aac",
+                false,
+            )
+            .await;
+            assert!(
+                !decoded.is_empty(),
+                "macOS afconvert fallback must decode HE-AAC"
+            );
+            assert_eq!(decoded.len() % 6, 0);
+            assert!(decoded.iter().any(|&b| b != 0));
+        }
+    }
+
+    srv.abort();
+}

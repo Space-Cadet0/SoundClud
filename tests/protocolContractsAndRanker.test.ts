@@ -157,6 +157,58 @@ describe('@soundclud/protocol — Go+ Transcoding Ranker (rankSoundCloudTranscod
     expect(result.fallbacks[3]?.sampleRateHz).toBe(48000);
   });
 
+  it('demotes HE-AAC SBR/PS aac_160k (mp4a.40.5 / mp4a.40.29) behind mp3_1_0 while keeping Go+ aac_256k #1 and AAC-LC aac_160k ahead of mp3_1_0', () => {
+    // 1. Free/SQ track where `aac_160k` is HE-AACv1 SBR (`mp4a.40.5`) or HE-AACv2 PS (`mp4a.40.29`):
+    //    universally-decodable `mp3_1_0` (`audio/mpeg`) MUST win over HE-AAC!
+    for (const heAacCodec of ['mp4a.40.5', 'mp4a.40.29'] as const) {
+      const sqWithHeAac: readonly SoundCloudTranscoding[] = [
+        makeTranscoding('opus_0_0', 'hls', 'audio/ogg; codecs="opus"', { quality: 'sq' }),
+        makeTranscoding('aac_160k', 'hls', `audio/mp4; codecs="${heAacCodec}"`, {
+          quality: 'sq',
+        }),
+        makeTranscoding('mp3_1_0', 'hls', 'audio/mpeg', { quality: 'sq' }),
+      ];
+
+      const sqResult = rankSoundCloudTranscodings(sqWithHeAac);
+      expect(sqResult.kind).toBe('playable');
+      if (sqResult.kind !== 'playable') {
+        throw new Error('Expected playable selection');
+      }
+      expect(sqResult.selected.preset).toBe('mp3_1_0');
+      expect(sqResult.fallbacks.map((f) => f.preset)).toEqual(['aac_160k', 'opus_0_0']);
+    }
+
+    // 2. Go+ track with `aac_256k` (`mp4a.40.2`), HE-AAC `aac_160k` (`mp4a.40.5`), and `mp3_1_0`:
+    //    `aac_256k` stays #1 and `mp3_1_0` ranks ahead of HE-AAC `aac_160k` in fallbacks!
+    const goPlusWithHeAac160: readonly SoundCloudTranscoding[] = [
+      makeTranscoding('aac_160k', 'hls', 'audio/mp4; codecs="mp4a.40.5"', { quality: 'sq' }),
+      makeTranscoding('mp3_1_0', 'hls', 'audio/mpeg', { quality: 'sq' }),
+      makeTranscoding('aac_256k', 'encrypted-hls', 'audio/mp4; codecs="mp4a.40.2"', {
+        quality: 'hq',
+      }),
+    ];
+    const goPlusResult = rankSoundCloudTranscodings(goPlusWithHeAac160);
+    expect(goPlusResult.kind).toBe('playable');
+    if (goPlusResult.kind !== 'playable') {
+      throw new Error('Expected playable Go+ selection');
+    }
+    expect(goPlusResult.selected.preset).toBe('aac_256k');
+    expect(goPlusResult.fallbacks.map((f) => f.preset)).toEqual(['mp3_1_0', 'aac_160k']);
+
+    // 3. Standard AAC-LC `aac_160k` (`mp4a.40.2`) MUST still rank ahead of `mp3_1_0`!
+    const sqWithAacLc: readonly SoundCloudTranscoding[] = [
+      makeTranscoding('mp3_1_0', 'hls', 'audio/mpeg', { quality: 'sq' }),
+      makeTranscoding('aac_160k', 'hls', 'audio/mp4; codecs="mp4a.40.2"', { quality: 'sq' }),
+    ];
+    const aacLcResult = rankSoundCloudTranscodings(sqWithAacLc);
+    expect(aacLcResult.kind).toBe('playable');
+    if (aacLcResult.kind !== 'playable') {
+      throw new Error('Expected playable AAC-LC selection');
+    }
+    expect(aacLcResult.selected.preset).toBe('aac_160k');
+    expect(aacLcResult.fallbacks.map((f) => f.preset)).toEqual(['mp3_1_0']);
+  });
+
   it('skips broken abr_sq and abr_hq 404 stubs unconditionally', () => {
     const transcodings: readonly SoundCloudTranscoding[] = [
       makeTranscoding('abr_hq', 'hls', 'audio/mp4; codecs="mp4a.40.2"', { quality: 'hq' }),
