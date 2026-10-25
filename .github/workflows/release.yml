@@ -1,0 +1,332 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: "Optional version label for manual dry-run builds (e.g., 0.1.0)"
+        required: false
+        type: string
+
+# Default least-privilege token scope across all verification and build jobs.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-and-package:
+    name: Verify Gates, Extension ZIP & Packaging Bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version metadata
+        id: meta
+        env:
+          INPUT_VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+            RELEASE_VERSION="${RELEASE_TAG#v}"
+          elif [[ -n "${INPUT_VERSION_OVERRIDE}" ]]; then
+            RELEASE_VERSION="${INPUT_VERSION_OVERRIDE#v}"
+            RELEASE_TAG="v${RELEASE_VERSION}"
+          else
+            RELEASE_VERSION="$(node -e "const fs=require('node:fs');console.log(JSON.parse(fs.readFileSync('package.json','utf8')).version);")"
+            RELEASE_TAG="v${RELEASE_VERSION}"
+          fi
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "release_version=${RELEASE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Resolved release: ${RELEASE_TAG} (${RELEASE_VERSION})"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Audit npm dependencies (high/critical)
+        run: npm audit --audit-level=high
+
+      - name: Run Zero-PII & portability hygiene gate
+        run: npm run check:hygiene
+
+      - name: Verify installer and wrapper shell syntax
+        run: |
+          bash -n \
+            packaging/install/install.sh \
+            packaging/install/uninstall.sh \
+            packaging/launchd/run-receiver.sh
+
+      - name: Run strict TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run deterministic offline unit tests
+        run: npm test
+
+      - name: Run Rust format, clippy, and unit tests
+        run: npm run check:rust
+
+      - name: Build and package Chromium MV3 extension
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/release
+          npm --workspace @soundclud/extension run build
+          node ./scripts/package-extension.mjs \
+            --source-dir packages/extension/dist \
+            --output "dist/release/soundclud-extension-${RELEASE_TAG}.zip"
+          rm -f "dist/release/soundclud-extension-${RELEASE_TAG}.zip.sha256"
+
+      - name: Bundle Zero-Homebrew installer & service templates
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="$(mktemp -d)"
+          trap 'rm -rf "${STAGE_DIR}"' EXIT
+          BUNDLE_NAME="soundclud-packaging-${RELEASE_TAG}"
+          mkdir -p "${STAGE_DIR}/${BUNDLE_NAME}"
+          cp -R packaging "${STAGE_DIR}/${BUNDLE_NAME}/packaging"
+          if [[ -f README.md ]]; then
+            cp README.md "${STAGE_DIR}/${BUNDLE_NAME}/README.md"
+          fi
+          if [[ -f LICENSE ]]; then
+            cp LICENSE "${STAGE_DIR}/${BUNDLE_NAME}/LICENSE"
+          fi
+          GZIP=-n tar \
+            --sort=name \
+            --mtime='UTC 2025-01-01' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -czf "dist/release/${BUNDLE_NAME}.tar.gz" \
+            -C "${STAGE_DIR}" \
+            "${BUNDLE_NAME}"
+
+      - name: Upload extension and packaging artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-common-assets
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build-receiver:
+    name: Build Receiver (${{ matrix.target }})
+    needs: verify-and-package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-14
+            macosx_deployment_target: "11.0"
+          - target: aarch64-apple-darwin
+            os: macos-14
+            macosx_deployment_target: "11.0"
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            macosx_deployment_target: ""
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust stable toolchain (${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and target build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Compile soundclud-receiver release binary
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+          DEPLOY_TARGET: ${{ matrix.macosx_deployment_target }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${DEPLOY_TARGET}" ]]; then
+            export MACOSX_DEPLOYMENT_TARGET="${DEPLOY_TARGET}"
+          fi
+          cargo build \
+            --release \
+            --locked \
+            --package soundclud-receiver \
+            --bin soundclud-receiver \
+            --target "${TARGET_TRIPLE}"
+
+      - name: Verify Mach-O architecture & Monterey deployment target (macOS)
+        if: matrix.macosx_deployment_target != ''
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          BIN_PATH="target/${TARGET_TRIPLE}/release/soundclud-receiver"
+          ARCHS="$(lipo -archs "${BIN_PATH}")"
+          echo "Built Mach-O architectures: ${ARCHS}"
+          case "${TARGET_TRIPLE}" in
+            x86_64-apple-darwin) [[ "${ARCHS}" == "x86_64" ]] ;;
+            aarch64-apple-darwin) [[ "${ARCHS}" == "arm64" ]] ;;
+          esac
+          otool -l "${BIN_PATH}" | grep -A 4 -E 'LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX'
+
+      - name: Smoke-test offline Zero-Homebrew installer & package tarball
+        env:
+          TARGET_TRIPLE: ${{ matrix.target }}
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          BIN_PATH="target/${TARGET_TRIPLE}/release/soundclud-receiver"
+          SMOKE_DIR="$(mktemp -d)"
+          STAGE_DIR="$(mktemp -d)"
+          trap 'rm -rf "${SMOKE_DIR}" "${STAGE_DIR}"' EXIT
+
+          ./packaging/install/install.sh \
+            --bin-source "${BIN_PATH}" \
+            --heos-only \
+            --skip-service \
+            --prefix "${SMOKE_DIR}/prefix" \
+            --state-dir "${SMOKE_DIR}/state"
+          test -x "${SMOKE_DIR}/prefix/bin/soundclud-receiver"
+          ./packaging/install/uninstall.sh \
+            --skip-service \
+            --purge-state \
+            --prefix "${SMOKE_DIR}/prefix" \
+            --state-dir "${SMOKE_DIR}/state"
+
+          ARCHIVE_STEM="soundclud-receiver-${RELEASE_TAG}-${TARGET_TRIPLE}"
+          mkdir -p "${STAGE_DIR}/${ARCHIVE_STEM}" "dist/release"
+          cp "${BIN_PATH}" "${STAGE_DIR}/${ARCHIVE_STEM}/soundclud-receiver"
+          chmod 0755 "${STAGE_DIR}/${ARCHIVE_STEM}/soundclud-receiver"
+          cp -R packaging "${STAGE_DIR}/${ARCHIVE_STEM}/packaging"
+          if [[ -f README.md ]]; then
+            cp README.md "${STAGE_DIR}/${ARCHIVE_STEM}/README.md"
+          fi
+          if [[ -f LICENSE ]]; then
+            cp LICENSE "${STAGE_DIR}/${ARCHIVE_STEM}/LICENSE"
+          fi
+
+          if tar --version 2>/dev/null | grep -qi 'gnu'; then
+            GZIP=-n tar \
+              --sort=name \
+              --mtime='UTC 2025-01-01' \
+              --owner=0 \
+              --group=0 \
+              --numeric-owner \
+              -czf "dist/release/${ARCHIVE_STEM}.tar.gz" \
+              -C "${STAGE_DIR}" \
+              "${ARCHIVE_STEM}"
+          else
+            COPYFILE_DISABLE=1 GZIP=-n tar \
+              -czf "dist/release/${ARCHIVE_STEM}.tar.gz" \
+              -C "${STAGE_DIR}" \
+              "${ARCHIVE_STEM}"
+          fi
+
+      - name: Upload receiver release tarball (${{ matrix.target }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-receiver-${{ matrix.target }}
+          path: dist/release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-release:
+    name: Generate SHA256SUMS.txt & Publish Release
+    needs:
+      - verify-and-package
+      - build-receiver
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Elevated write scope restricted strictly to this final release-publishing job.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all staged release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate and verify unified SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cd release-assets
+          rm -f SHA256SUMS.txt
+          LC_ALL=C ls -1 \
+            soundclud-receiver-*-x86_64-apple-darwin.tar.gz \
+            soundclud-receiver-*-aarch64-apple-darwin.tar.gz \
+            soundclud-receiver-*-x86_64-unknown-linux-gnu.tar.gz \
+            soundclud-packaging-*.tar.gz \
+            soundclud-extension-*.zip > /tmp/release-manifest.lst
+          LC_ALL=C sort -u /tmp/release-manifest.lst | xargs sha256sum > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          sha256sum --check SHA256SUMS.txt
+
+      - name: Upload complete verified release bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: soundclud-release-bundle-${{ needs.verify-and-package.outputs.release_tag }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release assets on version tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ASSETS=(release-assets/*)
+          if [[ "${#ASSETS[@]}" -eq 0 ]]; then
+            echo "No release assets found to publish" >&2
+            exit 1
+          fi
+          if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${ASSETS[@]}"
+          else
+            gh release create "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --generate-notes \
+              --title "SoundClud ${RELEASE_TAG}" \
+              "${ASSETS[@]}"
+          fi

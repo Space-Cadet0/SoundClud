@@ -58,6 +58,9 @@ jobs:
       - name: Run Zero-PII & portability hygiene gate
         run: npm run check:hygiene
 
+      - name: Build and validate Chromium MV3 extension bundle
+        run: npm run package:extension
+
       - name: Run strict TypeScript typecheck
         run: npm run typecheck
 

@@ -54,9 +54,40 @@ SoundClud/
 │   ├── protocol/                    # Shared TypeScript / wire protocol v1 contracts
 │   └── extension/                   # Chromium Manifest V3 extension (Chrome/Brave/Arc/Edge)
 ├── packaging/                       # Zero-Homebrew installers & launchd/systemd units
-├── scripts/                         # Zero-PII hygiene scanner & checkpoint utilities
-└── tests/                           # 100% offline deterministic Vitest & static invariant gates
+├── scripts/                         # Zero-PII hygiene scanner, extension packager & checkpoints
+├── tests/                           # 100% offline deterministic Vitest, E2E & chaos suites
+└── CHROMEWEBSTORE.md                # Chrome Web Store Manifest V3 listing & privacy dossier
 ```
+
+---
+
+## Quick Start
+
+### 1. Build & Install the Receiver Daemon (`soundclud-receiver`)
+
+#### Option A — Headless Mac Mini TOSLINK (`macOS 12 Monterey+` Intel `x86_64` or Apple Silicon) / Linux
+```bash
+# Build native release binary (or cross-compile Monterey x86_64 with MACOSX_DEPLOYMENT_TARGET=11.0)
+cargo build --release --bin soundclud-receiver
+
+# Zero-Homebrew install with standalone SHA-256-verified mpv + launchd/systemd auto-start
+./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver
+```
+
+#### Option B — Direct HEOS Network Mode (`127.0.0.1` on Your Client Laptop — Zero Second Mac & Zero `mpv` Needed)
+```bash
+cargo build --release --bin soundclud-receiver
+./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver --heos-only
+```
+
+### 2. Build & Load the Chromium Manifest V3 Extension (`Chrome` / `Brave` / `Arc` / `Edge`)
+```bash
+npm install
+npm run package:extension
+```
+1. Open `chrome://extensions` in your Chromium browser and enable **Developer mode**.
+2. Click **Load unpacked** and select `packages/extension/dist`.
+3. Open `https://soundcloud.com` (logged into your Free or Go+ account as normal), click the **SoundClud** toolbar icon (or the player-bar cast pill), and pick either your **Optical Out (`TOSLINK 44.1 kHz 0 dB`)** or your **Denon / Marantz HEOS Amplifier (`HEOS 44.1 kHz 0 dB`)**.
 
 ---
 
@@ -66,8 +97,11 @@ SoundClud/
 # Install workspace tooling & activate .githooks/pre-commit
 npm install
 
-# Run full Zero-PII hygiene, strict TypeScript, offline Vitest & Rust Clippy/test suite
+# Run full Zero-PII hygiene, MV3 build, strict TypeScript, offline E2E Vitest & Rust Clippy/test suite
 npm run verify
+
+# Verify Late 2014 Intel Mac Mini (macOS 12 Monterey / deployment target 11.0) compatibility
+MACOSX_DEPLOYMENT_TARGET=11.0 cargo check --workspace --target x86_64-apple-darwin
 ```
 
 ---

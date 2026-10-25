@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 1,
+  "component": "mpv",
+  "description": "Standalone macOS 11+ (Monterey x86_64 and Apple Silicon arm64) mpv binary archives verified via SHA-256 with zero Homebrew or Python runtime dependency.",
+  "minimumMacosDeploymentTarget": "11.0",
+  "heosOnlyRequiresMpv": false,
+  "heosOnlyNote": "HeosUpnpBackend unwraps fMP4/AES-128, decodes AAC-LC/MP3, and streams 44,100 Hz / 24-bit 0 dB uncompressed WAV in pure safe Rust with zero mpv dependency.",
+  "verificationPolicy": {
+    "algorithm": "sha256",
+    "requireChecksumVerification": true,
+    "allowHomebrew": false,
+    "allowPythonRuntime": false,
+    "checksumTools": [
+      "shasum -a 256",
+      "sha256sum"
+    ],
+    "offlineFlags": [
+      "--mpv-archive",
+      "--mpv-bin",
+      "--heos-only"
+    ]
+  },
+  "urlTemplate": "https://laboratory.stolendata.net/~djinn/mpv_osx/{archive}",
+  "releaseMirrorUrlTemplate": "https://github.com/Space-Cadet0/SoundClud/releases/download/v{receiver_version}/{archive}",
+  "targets": {
+    "x86_64-apple-darwin": {
+      "os": "darwin",
+      "arch": "x86_64",
+      "version": "0.39.0",
+      "minimumMacosVersion": "11.0",
+      "hardwareNotes": "Supports Intel 64-bit Macs including Late 2014 Mac Mini (Macmini7,1) capped at macOS 12 Monterey.",
+      "archive": "mpv-0.39.0.tar.gz",
+      "url": "https://laboratory.stolendata.net/~djinn/mpv_osx/mpv-0.39.0.tar.gz",
+      "sha256": "35ec81ad86a97b24956a8d0f4fa1ba2690b44ae7741c920e923620bcd7bd402a",
+      "binaryPathInArchive": "mpv.app/Contents/MacOS/mpv"
+    },
+    "aarch64-apple-darwin": {
+      "os": "darwin",
+      "arch": "arm64",
+      "version": "0.39.0",
+      "minimumMacosVersion": "11.0",
+      "hardwareNotes": "Supports Apple Silicon Macs (M1 and newer) running macOS 11.0 Big Sur or later.",
+      "archive": "mpv-arm64-0.39.0.tar.gz",
+      "url": "https://laboratory.stolendata.net/~djinn/mpv_osx/mpv-arm64-0.39.0.tar.gz",
+      "sha256": "9c81c5cf2e756cf9c2fef97a00627140ea7c6b46079469ce3b1a13b4cd4f5b2b",
+      "binaryPathInArchive": "mpv.app/Contents/MacOS/mpv"
+    }
+  }
+}

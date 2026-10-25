@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  SoundClud Headless Receiver — macOS LaunchAgent / LaunchDaemon Template
+  Compatible with macOS 12 Monterey (x86_64, Late 2014 Intel Mac Mini Macmini7,1)
+  through modern Apple Silicon (arm64) macOS with zero Homebrew dependency.
+
+  Rendered by `packaging/install/install.sh` with placeholders:
+    {{BIN_DIR}}   - Directory containing `soundclud-receiver`, `run-receiver.sh`, and optional `mpv`
+    {{STATE_DIR}} - Private state directory (mode 0700)
+    {{LOG_DIR}}   - Log output directory
+    {{MPV_BIN}}   - Resolved `mpv` executable path (empty when running `--heos-only`)
+    {{HEOS_ONLY}} - "1" for pure-Rust HEOS Direct mode, "0" when local `mpv` output is enabled
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.soundclud.receiver</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{BIN_DIR}}/run-receiver.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{STATE_DIR}}</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>2</integer>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{BIN_DIR}}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>SOUNDCLUD_STATE_DIR</key>
+    <string>{{STATE_DIR}}</string>
+    <key>SOUNDCLUD_LOG_DIR</key>
+    <string>{{LOG_DIR}}</string>
+    <key>SOUNDCLUD_PORT</key>
+    <string>9876</string>
+    <key>SOUNDCLUD_MPV_BIN</key>
+    <string>{{MPV_BIN}}</string>
+    <key>SOUNDCLUD_HEOS_ONLY</key>
+    <string>{{HEOS_ONLY}}</string>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/soundclud-receiver.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/soundclud-receiver.err.log</string>
+
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key>
+    <integer>4096</integer>
+  </dict>
+</dict>
+</plist>

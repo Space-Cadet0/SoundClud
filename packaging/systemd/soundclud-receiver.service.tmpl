@@ -1,0 +1,43 @@
+# SoundClud Headless Receiver — Linux systemd --user Service Template
+#
+# Rendered by `packaging/install/install.sh` with placeholders:
+#   {{BIN_DIR}}   - Directory containing `soundclud-receiver` (and optional `mpv`)
+#   {{STATE_DIR}} - Private state directory (mode 0700)
+#   {{LOG_DIR}}   - Log output directory
+#   {{MPV_BIN}}   - Resolved `mpv` executable path (empty when running `--heos-only`)
+#   {{HEOS_ONLY}} - "1" for pure-Rust HEOS Direct mode, "0" when local `mpv` output is enabled
+#
+# For true headless persistence across reboots without an interactive desktop login:
+#   loginctl enable-linger "$USER"
+#
+# Service management:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now soundclud-receiver.service
+#   systemctl --user status soundclud-receiver.service
+#   journalctl --user -u soundclud-receiver.service -f
+
+[Unit]
+Description=SoundClud Headless Hi-Fi Receiver (0 dB Bit-Perfect ALSA/PipeWire & HEOS Direct)
+Documentation=https://github.com/Space-Cadet0/SoundClud
+Wants=network-online.target
+After=network-online.target sound.target pipewire.service pulseaudio.service
+
+[Service]
+Type=simple
+WorkingDirectory={{STATE_DIR}}
+Environment="PATH={{BIN_DIR}}:/usr/local/bin:/usr/bin:/bin"
+Environment="SOUNDCLUD_STATE_DIR={{STATE_DIR}}"
+Environment="SOUNDCLUD_LOG_DIR={{LOG_DIR}}"
+Environment="SOUNDCLUD_PORT=9876"
+Environment="SOUNDCLUD_MPV_BIN={{MPV_BIN}}"
+Environment="SOUNDCLUD_HEOS_ONLY={{HEOS_ONLY}}"
+Environment="RUST_LOG=info"
+ExecStart={{BIN_DIR}}/soundclud-receiver
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+NoNewPrivileges=true
+LimitNOFILE=4096
+
+[Install]
+WantedBy=default.target
