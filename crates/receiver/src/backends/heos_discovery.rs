@@ -184,13 +184,19 @@ async fn ssdp_discover_locations() -> Vec<String> {
 
     let mut locations = HashSet::new();
     let mut buf = [0u8; 2048];
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(450);
+    let hard_deadline = tokio::time::Instant::now() + Duration::from_millis(850);
     loop {
         let now = tokio::time::Instant::now();
-        if now >= deadline {
+        if now >= hard_deadline {
             break;
         }
-        let Ok(Ok((len, _))) = tokio::time::timeout(deadline - now, sock.recv_from(&mut buf)).await
+        let remaining = hard_deadline - now;
+        let wait_window = if locations.is_empty() {
+            remaining
+        } else {
+            remaining.min(Duration::from_millis(150))
+        };
+        let Ok(Ok((len, _))) = tokio::time::timeout(wait_window, sock.recv_from(&mut buf)).await
         else {
             break;
         };

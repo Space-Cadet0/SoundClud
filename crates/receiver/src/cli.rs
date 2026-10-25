@@ -15,18 +15,24 @@ pub struct ParsedCliOptions {
     pub state_dir: PathBuf,
     pub mpv_bin: PathBuf,
     pub enable_lan_discovery: bool,
+    pub heos_only: bool,
     pub receiver_name: Option<String>,
 }
 
 impl ParsedCliOptions {
     #[must_use]
     pub fn into_daemon_config(self) -> ReceiverDaemonConfig {
-        let mut local_mpv = crate::backends::local_mpv::LocalMpvConfig {
+        let local_mpv = crate::backends::local_mpv::LocalMpvConfig {
             state_dir: self.state_dir.clone(),
             mpv_binary: self.mpv_bin,
+            spawn_mpv_process: !self.heos_only,
+            injected_outputs: if self.heos_only {
+                Some(Vec::new())
+            } else {
+                None
+            },
             ..Default::default()
         };
-        let _ = &mut local_mpv;
         let heos = crate::backends::heos_upnp::HeosBackendConfig {
             enable_lan_multicast: self.enable_lan_discovery,
             ..Default::default()
@@ -53,6 +59,7 @@ pub fn render_help_text() -> String {
          \x20 --bind <HOST:PORT>      Bind address (default: 0.0.0.0:9876)\n\
          \x20 --state-dir <DIR>       Directory for persistent pairing/config state\n\
          \x20 --mpv-bin <PATH>        Path to standalone mpv binary (LocalMpvBackend)\n\
+         \x20 --heos-only             Disable LocalMpvBackend and expose HEOS Direct only\n\
          \x20 --name <LABEL>          Display name advertised to SoundClud clients\n\
          \x20 --no-lan-discovery      Disable LAN mDNS & SSDP multicast traffic\n\
          \x20 -V, --version           Print version information and exit\n\
@@ -63,10 +70,26 @@ pub fn render_help_text() -> String {
 
 pub fn parse_cli_args(args: &[String]) -> Result<CliOutcome, String> {
     let defaults = ReceiverDaemonConfig::default();
-    let mut bind_addr = defaults.bind_addr;
-    let mut state_dir = defaults.state_dir;
-    let mut mpv_bin = defaults.local_mpv.mpv_binary;
+    let mut bind_addr = std::env::var("SOUNDCLUD_PORT")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u16>().ok())
+        .map_or(defaults.bind_addr, |port| {
+            SocketAddr::new(defaults.bind_addr.ip(), port)
+        });
+    let mut state_dir = std::env::var("SOUNDCLUD_STATE_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map_or(defaults.state_dir, PathBuf::from);
+    let mut mpv_bin = std::env::var("SOUNDCLUD_MPV_BIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map_or(defaults.local_mpv.mpv_binary, PathBuf::from);
     let mut enable_lan_discovery = true;
+    let mut heos_only = std::env::var("SOUNDCLUD_HEOS_ONLY")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
     let mut receiver_name = None;
 
     let mut idx = 0;
@@ -82,6 +105,10 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliOutcome, String> {
             }
             "--no-lan-discovery" => {
                 enable_lan_discovery = false;
+                idx += 1;
+            }
+            "--heos-only" => {
+                heos_only = true;
                 idx += 1;
             }
             "--bind" => {
@@ -142,6 +169,7 @@ pub fn parse_cli_args(args: &[String]) -> Result<CliOutcome, String> {
         state_dir,
         mpv_bin,
         enable_lan_discovery,
+        heos_only,
         receiver_name,
     })))
 }

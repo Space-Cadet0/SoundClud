@@ -22,6 +22,11 @@ async fn main() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    #[cfg(target_os = "macos")]
+    if !opts.heos_only {
+        wait_for_macos_coreaudiod(std::time::Duration::from_secs(15)).await;
+    }
+
     let cfg = opts.into_daemon_config();
     let server = match ReceiverServer::start(cfg).await {
         Ok(s) => s,
@@ -42,4 +47,22 @@ async fn main() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down soundclud-receiver");
     server.shutdown().await;
+}
+
+#[cfg(target_os = "macos")]
+async fn wait_for_macos_coreaudiod(max_wait: std::time::Duration) {
+    let deadline = tokio::time::Instant::now() + max_wait;
+    while tokio::time::Instant::now() < deadline {
+        let running = tokio::process::Command::new("pgrep")
+            .args(["-x", "coreaudiod"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|st| st.success());
+        if running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }

@@ -594,6 +594,9 @@ install_receiver_binary() {
   if [ "${OS_KIND}" = "darwin" ] && command -v xattr >/dev/null 2>&1; then
     xattr -d com.apple.quarantine "${target_bin}" 2>/dev/null || true
   fi
+  if [ "${OS_KIND}" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - --identifier io.soundclud.receiver "${target_bin}" >/dev/null 2>&1 || true
+  fi
 
   local wrapper_src="${PACKAGING_DIR}/launchd/run-receiver.sh"
   if [ -f "${wrapper_src}" ]; then
@@ -764,8 +767,8 @@ activate_service() {
       launchctl bootout "gui/${uid_num}/io.soundclud.receiver" 2>/dev/null || launchctl unload "${ACTIVE_UNIT_PATH}" 2>/dev/null || true
       if ! launchctl bootstrap "gui/${uid_num}" "${ACTIVE_UNIT_PATH}" 2>/dev/null; then
         launchctl load -w "${ACTIVE_UNIT_PATH}"
+        launchctl kickstart -k "gui/${uid_num}/io.soundclud.receiver" 2>/dev/null || true
       fi
-      launchctl kickstart -k "gui/${uid_num}/io.soundclud.receiver" 2>/dev/null || true
       log_info "Loaded user LaunchAgent: ${ACTIVE_UNIT_PATH}"
     fi
   else
