@@ -1,0 +1,12 @@
+[package]
+name = "soundclud-receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless LAN audio receiver daemon for SoundClud"
+
+[dependencies]
+
+[lints]
+workspace = true

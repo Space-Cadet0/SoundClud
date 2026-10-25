@@ -1,0 +1,11 @@
+{
+  "soundclud-session-context": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./scripts/session-start.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

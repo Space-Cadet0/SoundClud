@@ -1,0 +1,57 @@
+# OS & Editor Metadata
+.DS_Store
+AppleDouble
+.LSOverride
+._*
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Node / TypeScript / Extension Build Outputs
+node_modules/
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+.vite/
+*.crx
+*.pem
+*.xpi
+*.zip
+
+# Rust / Cargo Build Outputs
+target/
+**/*.rs.bk
+
+# Bundled / Provisioned Local Binaries & Runtime State
+.runtime/
+bin/mpv*
+*.sock
+*.pid
+*.log
+
+# Environment, Secrets & Credentials (Defense in Depth)
+.env
+.env.*
+!.env.example
+tokens.json
+*tokens*.json
+*secret*.json
+*oauth*.json
+auth.json
+cookies.txt
+*.cookies
+
+# Local Diagnostic / Network Capture Dumps (Zero-PII Defense in Depth)
+*hydration*.json
+*transcoding*.json
+*_raw_*.json
+*_dump*.json
+*.har
+*.m3u8
+scratch/

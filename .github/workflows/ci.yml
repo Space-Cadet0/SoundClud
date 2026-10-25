@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rust_targets: ""
+          - os: macos-14
+            rust_targets: "x86_64-apple-darwin"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: ${{ matrix.rust_targets }}
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Audit npm dependencies (high/critical)
+        run: npm audit --audit-level=high
+
+      - name: Run Zero-PII & portability hygiene gate
+        run: npm run check:hygiene
+
+      - name: Run strict TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run offline unit tests
+        run: npm test
+
+      - name: Run Rust format, clippy, and unit tests
+        run: npm run check:rust
+
+      - name: Verify macOS Monterey Intel target (x86_64-apple-darwin, MACOSX_DEPLOYMENT_TARGET=11.0)
+        if: matrix.os == 'macos-14'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: MACOSX_DEPLOYMENT_TARGET=11.0 cargo check --workspace --target x86_64-apple-darwin

@@ -1,0 +1,29 @@
+#!/usr/bin/env sh
+# SoundClud Zero-PII & Portability pre-commit gate.
+set -eu
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+if ! command -v node >/dev/null 2>&1; then
+  # Locate portable user-level Node toolchains (nvm / fnm / volta / local) for GUI Git clients.
+  if [ -d "${HOME:-}/.nvm/versions/node" ]; then
+    LATEST_NVM_BIN="$(ls -1d "${HOME}/.nvm/versions/node/"*/bin 2>/dev/null | sort | tail -n 1 || true)"
+    if [ -n "$LATEST_NVM_BIN" ]; then
+      PATH="$LATEST_NVM_BIN:$PATH"
+    fi
+  fi
+  for CANDIDATE_BIN in "${HOME:-}/.volta/bin" "${HOME:-}/.local/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
+    if [ -d "$CANDIDATE_BIN" ]; then
+      PATH="$CANDIDATE_BIN:$PATH"
+    fi
+  done
+  export PATH
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "[pre-commit] ERROR: 'node' (>=22.0.0) is required to run ./scripts/check-hygiene.mjs" >&2
+  exit 1
+fi
+
+node ./scripts/check-hygiene.mjs
