@@ -21,7 +21,8 @@
 1. **Headless Optical TOSLINK / CoreAudio / ALSA** (`LocalMpvBackend`, e.g., a Mac Mini wired via Mini-TOSLINK S/PDIF), or
 2. **Denon / Marantz HEOS Built-In Amplifiers & Speakers Directly Over LAN** (`HeosUpnpBackend`, e.g., Marantz PM7000N — auto-waking from Network Standby, displaying live Track/Artist titles on the front OLED, and streaming asynchronous `44.1 kHz / 24-bit` `0 dB` PCM with **zero** remote volume mutations).
 
-Read the full first-principles specification in **[`docs/ARCHITECTURE_SPEC.md`](./docs/ARCHITECTURE_SPEC.md)**.
+- **End-User Guide**: **[`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md)** — Step-by-step installation, configuration, everyday usage, service management, and troubleshooting.
+- **Architecture & Wire Protocol Spec**: **[`docs/ARCHITECTURE_SPEC.md`](./docs/ARCHITECTURE_SPEC.md)** — Full first-principles engineering specification (`v1.2`).
 
 ---
 
@@ -47,7 +48,8 @@ SoundClud/
 ├── AGENTS.md                        # Always-on workspace engineering & portability laws
 ├── .agents/                         # Specialist subagents, workflow skills & session hooks
 ├── docs/
-│   └── ARCHITECTURE_SPEC.md         # Full technical specification & wire protocol (v1.2)
+│   ├── ARCHITECTURE_SPEC.md         # Full technical specification & wire protocol (v1.2)
+│   └── USER_GUIDE.md                # End-user installation, configuration & usage guide
 ├── crates/
 │   └── receiver/                    # Rust receiver gateway (`LocalMpvBackend` + `HeosUpnpBackend`)
 ├── packages/
