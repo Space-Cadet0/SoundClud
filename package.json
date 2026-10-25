@@ -17,13 +17,16 @@
   "scripts": {
     "prepare": "git config core.hooksPath .githooks || true",
     "check:hygiene": "node ./scripts/check-hygiene.mjs",
+    "build:extension": "npm --workspace @soundclud/extension run build",
+    "package:extension": "npm run build:extension && node ./scripts/package-extension.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && npm --workspaces run typecheck",
     "test": "vitest run",
-    "check:rust": "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace",
-    "verify": "npm run check:hygiene && npm run typecheck && npm test && npm run check:rust"
+    "check:rust": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --all -- --check && PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --workspace --all-targets -- -D warnings && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace",
+    "verify": "npm run check:hygiene && npm run build:extension && npm run typecheck && npm test && npm run check:rust"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12"
   }

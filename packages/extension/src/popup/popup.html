@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>SoundClud Hi-Fi Output</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <svg class="brand-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <rect x="2" y="2" width="20" height="20" rx="6" fill="currentColor" opacity="0.14"/>
+        <path d="M6.5 14.5V11.5M9.5 16V9M12.5 17.5V6.5M15.5 15.5V9.5M18.5 14V11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+      <div>
+        <h1>SoundClud</h1>
+        <p class="subtitle">Bit-Perfect 44.1 kHz • 0 dB Handoff</p>
+      </div>
+    </div>
+
+    <button
+      type="button"
+      id="handoff-toggle"
+      class="switch-btn"
+      role="switch"
+      aria-checked="false"
+      aria-label="Enable remote Hi-Fi audio handoff"
+    >
+      <span class="switch-track" aria-hidden="true">
+        <span class="switch-thumb"></span>
+      </span>
+      <span id="handoff-toggle-text" class="switch-label">Off</span>
+    </button>
+  </header>
+
+  <main class="content">
+    <section class="signal-card" id="signal-card" data-tone="idle" aria-labelledby="signal-heading">
+      <div class="signal-top">
+        <span class="signal-dot" aria-hidden="true"></span>
+        <h2 id="signal-heading" class="signal-headline">Browser Local Audio</h2>
+      </div>
+      <p id="signal-detail" class="signal-detail">
+        Enable handoff or select a TOSLINK / HEOS output below
+      </p>
+      <p id="now-playing" class="now-playing" hidden></p>
+    </section>
+
+    <section class="outputs-section" aria-labelledby="outputs-heading">
+      <div class="section-header">
+        <h2 id="outputs-heading">Hi-Fi Audio Outputs</h2>
+        <div class="header-actions">
+          <button type="button" id="refresh-outputs-btn" class="ghost-btn">
+            Refresh
+          </button>
+          <button type="button" id="open-endpoint-dialog-btn" class="ghost-btn accent">
+            + Add LAN Receiver
+          </button>
+        </div>
+      </div>
+
+      <p id="error-banner" class="error-banner" role="alert" hidden></p>
+
+      <ul id="outputs-list" class="outputs-list scroller"></ul>
+    </section>
+  </main>
+
+  <dialog id="endpoint-dialog" closedby="any" aria-labelledby="endpoint-dialog-title">
+    <form id="endpoint-form" method="dialog" class="dialog-form">
+      <h2 id="endpoint-dialog-title">Add LAN Receiver</h2>
+      <p class="dialog-desc">
+        Enter the hostname or address of a headless Mac Mini or Linux machine running
+        <code>soundclud-receiver</code>.
+      </p>
+      <label for="endpoint-input" class="field-label">Receiver Host &amp; Port</label>
+      <input
+        id="endpoint-input"
+        name="endpoint"
+        type="text"
+        inputmode="url"
+        placeholder="soundclud.local:9876"
+        class="text-input"
+      >
+      <p id="dialog-error" class="dialog-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button type="submit" value="cancel" formnovalidate class="secondary-btn">
+          Cancel
+        </button>
+        <button type="submit" value="confirm" class="primary-btn">
+          Save &amp; Probe
+        </button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>
