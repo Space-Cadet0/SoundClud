@@ -1,6 +1,13 @@
 /**
- * Phase-0 workspace placeholder for shared SoundClud REST & WebSocket protocol contracts.
+ * `@soundclud/protocol` — Canonical `v1` REST & WebSocket wire contracts,
+ * SoundCloud Go+ transcoding ranker, and zero-`any` runtime validators.
  */
 
-export const PROTOCOL_VERSION = 'v1' as const;
-export const DEFAULT_DISCOVERY_PORT = 9876 as const;
+export * from './constants.js';
+export * from './outputs.js';
+export * from './soundcloud.js';
+export * from './transcodingRanker.js';
+export * from './telemetry.js';
+export * from './rest.js';
+export * from './ws.js';
+export * from './validators.js';
