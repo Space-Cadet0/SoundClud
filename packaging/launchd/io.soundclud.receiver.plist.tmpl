@@ -6,11 +6,12 @@
   through modern Apple Silicon (arm64) macOS with zero Homebrew dependency.
 
   Rendered by `packaging/install/install.sh` with placeholders:
-    {{BIN_DIR}}   - Directory containing `soundclud-receiver`, `run-receiver.sh`, and optional `mpv`
-    {{STATE_DIR}} - Private state directory (mode 0700)
-    {{LOG_DIR}}   - Log output directory
-    {{MPV_BIN}}   - Resolved `mpv` executable path (empty when running in heos-only mode)
-    {{HEOS_ONLY}} - "1" for pure-Rust HEOS Direct mode, "0" when local `mpv` output is enabled
+    {{BIN_DIR}}    - Directory containing `soundclud-receiver`, `run-receiver.sh`, and optional `mpv`
+    {{STATE_DIR}}  - Private state directory (mode 0700)
+    {{LOG_DIR}}    - Log output directory
+    {{MPV_BIN}}    - Resolved `mpv` executable path (empty when running in heos-only mode)
+    {{HEOS_ONLY}}  - "1" for pure-Rust HEOS Direct mode, "0" when local `mpv` output is enabled
+    {{KEEP_AWAKE}} - "1" to hold an idle/AC sleep assertion via caffeinate, "0" otherwise
 -->
 <plist version="1.0">
 <dict>
@@ -51,6 +52,8 @@
     <string>{{MPV_BIN}}</string>
     <key>SOUNDCLUD_HEOS_ONLY</key>
     <string>{{HEOS_ONLY}}</string>
+    <key>SOUNDCLUD_KEEP_AWAKE</key>
+    <string>{{KEEP_AWAKE}}</string>
     <key>RUST_LOG</key>
     <string>info</string>
   </dict>

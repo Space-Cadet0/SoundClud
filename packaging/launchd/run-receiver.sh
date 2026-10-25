@@ -69,4 +69,8 @@ if [ ! -x "${RECEIVER_BIN}" ]; then
   exit 127
 fi
 
+if [ "$(uname -s)" = "Darwin" ] && [ "${SOUNDCLUD_KEEP_AWAKE:-0}" = "1" ] && command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -s -w "$$" >/dev/null 2>&1 &
+fi
+
 exec "${RECEIVER_BIN}" "$@"

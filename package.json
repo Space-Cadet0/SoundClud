@@ -19,6 +19,7 @@
     "check:hygiene": "node ./scripts/check-hygiene.mjs",
     "build:extension": "npm --workspace @soundclud/extension run build",
     "package:extension": "npm run build:extension && node ./scripts/package-extension.mjs",
+    "package:macos-dmg": "bash ./scripts/build-macos-dmg.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit && npm --workspaces run typecheck",
     "test": "vitest run",
     "check:rust": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --all -- --check && PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --workspace --all-targets -- -D warnings && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace",

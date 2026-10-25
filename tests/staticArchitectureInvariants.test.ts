@@ -53,6 +53,7 @@ const BINARY_EXTENSIONS = new Set<string>([
   '.bz2',
   '.7z',
   '.crx',
+  '.dmg',
   '.pem',
   '.xpi',
   '.pdf',
@@ -214,7 +215,10 @@ function scanContentForHygieneAndPortability(
   const violations: ScanViolation[] = [];
   const lines = content.split(/\r?\n/);
   const isRuntimeSourcePackage =
-    relativePath.startsWith('crates/') || relativePath.startsWith('packages/');
+    relativePath.startsWith('crates/') ||
+    relativePath.startsWith('packages/') ||
+    relativePath.startsWith('packaging/macos-app/') ||
+    relativePath === 'scripts/build-macos-dmg.sh';
 
   const computeSaltedDigest = (normalizedToken: string): string => {
     const cached = digestCache.get(normalizedToken);
@@ -518,6 +522,58 @@ describe('Zero-PII & Universal Portability Repository Gate', () => {
     }
 
     expect(allViolations).toEqual([]);
+  });
+
+  it('verifies .dmg binary classification and enforces macOS 12 Monterey AppKit portability across packaging/macos-app and build-macos-dmg.sh', () => {
+    expect(BINARY_EXTENSIONS.has('.dmg')).toBe(true);
+
+    const byRelPath = new Map(
+      workspaceSnapshot.textFiles.map((file) => [file.relativePath, file] as const),
+    );
+
+    const expectedMacAppTextFiles = [
+      'packaging/macos-app/Info.plist.tmpl',
+      'packaging/macos-app/generate-icns.mjs',
+      'packaging/macos-app/Sources/Models.swift',
+      'packaging/macos-app/Sources/ReceiverServiceManager.swift',
+      'packaging/macos-app/Sources/RelocationHelper.swift',
+      'packaging/macos-app/Sources/SetupWindowController.swift',
+      'packaging/macos-app/Sources/SoundCludApp.swift',
+      'scripts/build-macos-dmg.sh',
+    ];
+
+    const digestCache = new Map<string, string>();
+    for (const relPath of expectedMacAppTextFiles) {
+      const entry = byRelPath.get(relPath);
+      expect(entry, `Expected workspace text file ${relPath} to exist`).toBeDefined();
+      if (entry !== undefined) {
+        expect(
+          scanContentForHygieneAndPortability(entry.relativePath, entry.content, digestCache),
+        ).toEqual([]);
+      }
+    }
+
+    const swiftFiles = workspaceSnapshot.textFiles.filter(
+      (file) => file.relativePath.startsWith('packaging/macos-app/') && file.relativePath.endsWith('.swift'),
+    );
+    expect(swiftFiles.length).toBeGreaterThanOrEqual(5);
+
+    for (const swiftFile of swiftFiles) {
+      // Late 2014 Intel Mac Mini (Macmini7,1) caps out at macOS 12 Monterey:
+      // forbid SwiftUI MenuBarExtra / SMAppService (macOS 13+ Ventura-only APIs).
+      expect(
+        /\bimport\s+SwiftUI\b/.test(swiftFile.content),
+        `${swiftFile.relativePath} must use AppKit/Foundation without SwiftUI`,
+      ).toBe(false);
+      expect(
+        /\bMenuBarExtra\b/.test(swiftFile.content),
+        `${swiftFile.relativePath} must not use macOS 13+ MenuBarExtra`,
+      ).toBe(false);
+      expect(
+        /\bSMAppService\b/.test(swiftFile.content),
+        `${swiftFile.relativePath} must not use macOS 13+ SMAppService`,
+      ).toBe(false);
+    }
   });
 });
 

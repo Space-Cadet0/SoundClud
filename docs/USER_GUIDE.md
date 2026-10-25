@@ -1,104 +1,61 @@
 # SoundClud — End-User Installation, Configuration & Usage Guide
 
-**SoundClud** lets you browse, queue, scrub waveforms, and use your keyboard's hardware media keys directly inside the official `https://soundcloud.com` website—while sending **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio to either:
+**SoundClud** lets you browse, queue, scrub waveforms, and press your keyboard's hardware media keys inside the official `https://soundcloud.com` website—while sending **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio to either:
 
-1. **Setup A — Direct HEOS Network Amplifier / Speaker** (e.g., **Marantz PM7000N** or any Denon/Marantz HEOS Built-in device over Wi-Fi/Ethernet, with **zero second computer required**).
-2. **Setup B — Headless Optical TOSLINK / CoreAudio / ALSA Server** (e.g., a **2014 Intel Mac Mini** on macOS 12 Monterey+ or a Linux box plugged into your amplifier's **OPTICAL / S/PDIF** input).
+1. **Setup A — Direct HEOS Network Amplifier / Speaker** (e.g., **Marantz PM7000N** or any Denon/Marantz HEOS Built-In device over Wi-Fi/Ethernet, with **zero second computer required**).
+2. **Setup B — Headless Optical TOSLINK Server** (e.g., a **2014 Intel Mac Mini** on macOS 12 Monterey+ or a Linux machine wired into your amplifier's **OPTICAL / S/PDIF** input).
 
-Volume in both modes is controlled **exclusively by your physical Hi-Fi amplifier knob or remote** (`0 dB` fixed digital output—SoundClud never attenuates digital bits or alters your amplifier's volume).
-
----
-
-## Part 1 — Install the Receiver (`soundclud-receiver`)
-
-Every installation uses the zero-Homebrew installer (`packaging/install/install.sh`), requires **no `sudo`**, and automatically configures a background login service (`launchd` on macOS, `systemd --user` on Linux).
-
-### Option A: Single-Mac Setup for Denon / Marantz HEOS Direct (e.g., M1 MacBook Air -> Marantz PM7000N)
-
-Run `soundclud-receiver` directly on your main Mac (`127.0.0.1:9876`) in pure-Rust `--heos-only` mode (no `mpv` binary or second computer needed):
-
-```bash
-git clone git@github.com:Space-Cadet0/SoundClud.git
-cd SoundClud
-
-# 1. Build the native release binary
-cargo build --release --bin soundclud-receiver
-
-# 2. Install & start the background LaunchAgent in HEOS-only mode
-./packaging/install/install.sh \
-  --bin-source ./target/release/soundclud-receiver \
-  --heos-only
-```
-
-Verify the receiver is running and sees your HEOS amplifier on the LAN:
-
-```bash
-curl -s http://127.0.0.1:9876/api/v1/discover
-```
+Volume in both modes is controlled **exclusively by your physical Hi-Fi amplifier knob or remote** (`0 dB` fixed digital output—SoundClud never attenuates digital bits or changes your amplifier's volume).
 
 ---
 
-### Option B: Two-Machine Setup for Headless Optical TOSLINK (e.g., 2014 Intel Mac Mini -> Amplifier Optical Input)
+## Part 1 — Zero-Terminal macOS Installation (`.dmg` GUI App)
 
-1. **Physical Connection**: Connect a **3.5mm Mini-TOSLINK to Standard TOSLINK** optical fiber cable from the Mac Mini's headphone/optical combo jack to your amplifier's **OPTICAL 1** (or S/PDIF) input.
-2. **Build on Your M1 Mac (Cross-Compile for Intel macOS 12 Monterey+) — or Build Directly on the Mac Mini**:
-   ```bash
-   # On your M1 Mac, cross-compile for the 2014 Intel Mac Mini (macOS 11/12+):
-   MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release --target x86_64-apple-darwin --bin soundclud-receiver
-   ```
-3. **Copy & Install on the Mac Mini** (automatically downloads & SHA-256-verifies a standalone `mpv` binary with **zero Homebrew required**):
-   ```bash
-   ./packaging/install/install.sh \
-     --bin-source ./soundclud-receiver
-   ```
-   > **Note**: When running on the headless Mac Mini on your LAN, `soundclud-receiver` exposes **both** the Mac Mini's **Optical TOSLINK** output *and* any **Denon/Marantz HEOS** amplifiers on the network—so you can switch between Optical and HEOS at any time from your laptop, and music keeps playing even if you close your laptop lid.
+A **single Universal 2 disk image (`SoundClud-v0.1.0-macOS-Universal.dmg`)** runs natively on **both** Apple Silicon Macs (`M1` / `M2` / `M3` / `M4`) **and** Intel Macs (`x86_64`, macOS 11 Big Sur / macOS 12 Monterey+, including the Late 2014 Intel Mac Mini) with **zero Terminal commands, zero `sudo`, and zero Homebrew**.
 
-#### Headless Mac Mini Energy Saver Checklist (One-Time macOS Setting)
-On a headless Mac Mini, open **System Preferences -> Energy Saver** (or run via SSH) so macOS never sleeps while waiting for music:
-```bash
-sudo pmset -a sleep 0 disksleep 0 womp 1 autorestart 1
-```
+### Step 1: Open the Disk Image & Install `SoundClud.app`
+1. Download **`SoundClud-v0.1.0-macOS-Universal.dmg`** from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) (or open `dist/SoundClud-v0.1.0-macOS-Universal.dmg`).
+2. Double-click the `.dmg` file and drag **`SoundClud.app`** onto the **`Applications`** folder shortcut.
+   *(If you double-click `SoundClud.app` directly inside the disk image, it will offer a 1-click **Copy to Applications & Open** button automatically.)*
+3. Open **`SoundClud`** from **Applications** (or Spotlight / Launchpad).
+   - *First-run Gatekeeper tip (for unsigned local builds)*: If macOS displays an unverified developer prompt, right-click (Control-click) **`SoundClud.app`** in **Applications** and choose **Open**.
 
----
+### Step 2: Choose Your Audio Mode & Click "Install & Start Receiver"
+Inside the **SoundClud — Hi-Fi Setup & Control** window:
 
-## Part 2 — Install the Chromium Browser Extension
-
-SoundClud supports **Google Chrome**, **Brave**, **Arc**, and **Microsoft Edge** (Manifest V3, version `116+`).
-
-1. Build the extension bundle (if not already built):
-   ```bash
-   npm install
-   npm run package:extension
-   ```
-   This outputs the unpacked extension into `packages/extension/dist/` (and a distributable archive at `dist/soundclud-extension-v0.1.0.zip`).
-2. Open your Chromium browser and navigate to:
-   ```text
-   chrome://extensions
-   ```
-3. Switch **Developer mode** **ON** (top-right corner).
-4. Click **Load unpacked** (top-left) and select the **`packages/extension/dist`** folder inside the `SoundClud` repository.
-5. *(Recommended)* Click the puzzle-piece **Extensions** icon in your browser toolbar and click the **Pin** icon next to **SoundClud — Bit-Perfect TOSLINK & HEOS Handoff** so it stays visible.
+1. Under **Step 1 — Receiver Audio Mode & One-Click Install**, pick your setup:
+   - **Direct HEOS Network Mode (MacBook / Desktop -> Denon or Marantz HEOS)**:
+     Select this on your everyday laptop/desktop to stream `44.1 kHz / 24-bit` `0 dB` WAV directly over Wi-Fi/Ethernet to your Denon or Marantz HEOS amplifier. Finishes in ~1 second offline.
+   - **Optical TOSLINK + HEOS Server Mode (Headless Mac Mini -> Optical S/PDIF)**:
+     Select this on a dedicated Mac Mini plugged into your amplifier via a **3.5mm Mini-TOSLINK to Standard TOSLINK** optical cable. Automatically downloads and SHA-256-verifies a standalone `mpv` audio engine (no Homebrew needed) and enables **Keep Mac Awake for Headless LAN Playback** so the Mac Mini never sleeps on AC power (no `sudo pmset` needed).
+2. Click **`Install & Start Receiver`**.
+   - The status badge turns green (**`Running on 127.0.0.1:9876 • Auto-Starts at Login`**), and your amplifier or optical output appears automatically under **Detected Hi-Fi Outputs** (and in the waveform icon in your top-right macOS Menu Bar).
+   - You can close the Setup window at any time—`SoundClud` stays quietly in your macOS Menu Bar, and the lightweight background receiver starts automatically whenever you log in.
 
 ---
 
-## Part 3 — Configuration & First Connection
+## Part 2 — Add the Browser Extension (Zero Terminal)
 
-### 1. SoundCloud Account & Automatic Go+ `256 kbps` High Quality
-- **Zero Separate Login**: Just sign into `https://soundcloud.com` in your browser as you normally do (Works with SoundCloud Go+, SoundCloud Free, or even signed out).
-- **Automatic Go+ `256 kbps` AAC (`hq`)**: SoundCloud's web player normally defaults to Standard Quality (`sq`). SoundClud automatically promotes your SoundCloud streaming preference to High Quality and selects **`aac_256k` (`256 kbps` AAC @ `44.1 kHz`)** whenever your account has SoundCloud Go+—including on private/secret-link tracks.
+SoundClud supports **Google Chrome**, **Brave**, **Arc**, and **Microsoft Edge** (`v116+`).
 
-### 2. Selecting Your Output Device
-Open `https://soundcloud.com` (refresh any already-open SoundCloud tab once after installing the extension). You can control outputs from **two places**:
-- **Toolbar Popup**: Click the **SoundClud** icon in your browser toolbar.
-- **In-Page Cast Pill**: Docked directly inside SoundCloud's bottom player bar (`Hi-Fi Cast • Off` / `<Device> • HEOS 44.1kHz 0dB`). Click the **left side** of the pill to toggle Handoff On/Off, or click the **`▾` chevron** on the right side of the pill to switch outputs right from the page.
+Right inside **`SoundClud.app`** under **Step 2 — Browser Extension Setup**:
 
-Inside the popup under **Hi-Fi Audio Outputs**:
-1. Local (`127.0.0.1:9876`) and mDNS (`soundclud.local:9876`) receivers are discovered automatically—no pairing codes or logins required (Trust-On-First-Use cryptographic token pairing happens automatically in the background).
-2. If you have a headless Mac Mini or Linux receiver on another hostname/IP that mDNS didn't advertise across subnets, click **`+ Add LAN Receiver`**, enter `<hostname>.local:9876` (or `<ip>:9876`), and click **Save & Probe**.
-3. Click your desired output card:
-   - **`<Amplifier Name>` (`HEOS Direct • 44.1k/24b WAV`)** — Streams uncompressed `44.1 kHz / 24-bit` `0 dB` PCM over your network to your Denon/Marantz amplifier.
-   - **`Built-in Digital Output` (`TOSLINK S/PDIF • 44.1k/24b`)** — Plays bit-perfect `44.1 kHz` `0 dB` optical S/PDIF out of your headless Mac Mini.
-4. Ensure the top-right Handoff switch is toggled **On**.
+1. Click **`Copy "chrome://extensions" & Open Browser`**.
+2. Click your browser's address bar, press **`Cmd+V`** (`chrome://extensions`) + **Return**, and switch **Developer mode** **ON** (top-right corner).
+3. Back in **`SoundClud.app`**, click **`Show Extension Folder in Finder`**—Finder highlights **`SoundClud Chrome Extension`** (saved permanently in `~/Applications/SoundClud Chrome Extension` so you can safely eject the `.dmg`).
+4. **Drag and drop** the highlighted **`SoundClud Chrome Extension`** folder directly onto the `chrome://extensions` browser tab (or click **Load unpacked** and select it).
+5. *(Recommended)* Click the puzzle-piece **Extensions** icon in your browser toolbar and **Pin** **SoundClud**.
+
+---
+
+## Part 3 — Connecting SoundCloud & Selecting Outputs
+
+1. **Sign into SoundCloud Normally (Zero Separate Login)**:
+   - Click **`Open SoundCloud.com`** in `SoundClud.app` (or visit `https://soundcloud.com`; refresh once with `Cmd+R` if a tab was already open).
+   - Works seamlessly with SoundCloud Go+, SoundCloud Free, or signed-out browsing. When signed into **SoundCloud Go+**, SoundClud automatically promotes SoundCloud's default `sq` stream to **`aac_256k` (`256 kbps` High Quality AAC @ `44.1 kHz`)**—including private/secret-link tracks.
+2. **Choose Your Output Target**:
+   - **In-Page Cast Pill** (inside SoundCloud's bottom player bar): Click the **`▾` chevron** on the right side of the pill to pick your **HEOS Amplifier** or **Optical Out**, or click the left side of the pill to toggle Handoff **On / Off**.
+   - **Toolbar Popup**: Click the **SoundClud** icon in your browser toolbar to pick an output, view live bitrate/format (`Go+ HQ 256k • 44.1 kHz / 24-bit • 0 dB`), or click **`+ Add LAN Receiver`** if connecting to a headless Mac Mini on another subnet/hostname.
 
 ---
 
@@ -108,56 +65,50 @@ Once **Handoff** is **On**, use `https://soundcloud.com` **100% normally**:
 
 | Action | How It Works |
 | :--- | :--- |
-| **Play / Pause / Queue / Next / Prev** | Click any orange Play button on tracks, playlists, likes, stations, or mixes on `soundcloud.com`. Your laptop speakers stay completely silent (`0%` local audio decode CPU) while audio plays on your Hi-Fi system. |
-| **HEOS Auto-Wake & Front OLED Display** | If your Denon/Marantz amplifier is in Network Standby, pressing **Play** shows **`Waking Amplifier...`** for ~3–5 seconds while automatically powering on the amp, switching its input to **HEOS Music**, and showing the live **Track Title, Artist & Elapsed Time** on the amplifier's front OLED screen. |
-| **Waveform Scrubbing** | Click or drag anywhere along SoundCloud's orange waveform. SoundClud debounces rapid drags (`60 ms` on Optical TOSLINK, `180 ms` on HEOS Network) and seeks seamlessly—even 2 hours into a DJ mix. |
-| **MacBook Hardware Media Keys** | Press **`F7` (Previous)**, **`F8` (Play/Pause)**, and **`F9` (Next)** on your MacBook keyboard (or use macOS Control Center Now Playing) even when Chrome is in the background. |
-| **Volume Control (`0 dB` Bit-Perfect)** | Turn your **physical amplifier volume knob** or use your **amplifier remote**. SoundClud intentionally ignores SoundCloud's web volume slider so every sample reaches your DAC at bit-perfect `0 dB` unity gain. |
-| **Widevine DRM Tracks (`Mixed Queues`)** | A small number of major-label tracks use hardware Widevine DRM (`ctr-encrypted-hls`). Instead of failing or playing a 30-second preview, SoundClud displays **`Widevine DRM • Playing Locally`** for that track, plays the full song locally, and **automatically resumes Hi-Fi TOSLINK/HEOS handoff on the very next track**. |
-| **Multiple SoundCloud Tabs** | Whichever tab presses **Play** automatically claims the receiver; any older tab gracefully yields (`Claimed Elsewhere`) without conflict. |
-| **Switch Back to Laptop Speakers** | Toggle the switch in the SoundClud popup (or click the bottom player-bar pill) to **Off** at any time to return instantly to normal local browser playback. |
+| **Play / Pause / Queue / Next / Prev** | Click any orange Play button on tracks, playlists, likes, stations, or mixes. Your laptop speakers stay completely silent (`0%` local audio decode) while audio plays on your Hi-Fi system. |
+| **HEOS Auto-Wake & Front OLED Display** | If your Denon/Marantz amplifier is in Network Standby, pressing **Play** shows **`Waking Amplifier...`** (~3–5 s), powers on the amp, switches its input to **HEOS Music**, and displays the live **Track Title & Artist** on the front OLED screen. |
+| **Waveform Scrubbing** | Click or drag anywhere along SoundCloud's orange waveform—even hours into a long DJ mix. |
+| **MacBook Hardware Media Keys** | Press **`F7` (Previous)**, **`F8` (Play/Pause)**, and **`F9` (Next)** on your keyboard even when your browser is in the background. |
+| **Volume Control (`0 dB` Bit-Perfect)** | Turn your **physical amplifier volume knob** or use your **amplifier remote**. SoundClud locks digital output at `0 dB` unity gain and never alters your amplifier's volume. |
+| **Widevine DRM Tracks (`Mixed Queues`)** | If a single major-label track uses hardware Widevine DRM, the pill shows **`Widevine DRM • Local`**, plays that full song locally, and **automatically resumes Hi-Fi TOSLINK/HEOS handoff on the very next track**. |
+| **Switch Back to Laptop Speakers** | Click the SoundClud player-bar pill (or flip the popup switch to **Off**) to return immediately to normal laptop playback. |
 
 ---
 
-## Part 5 — Managing, Updating & Uninstalling
+## Part 5 — Viewing Logs, Changing Modes & Uninstalling (Zero Terminal)
 
-### Check Receiver Service Status or Logs (macOS)
+Open **`SoundClud.app`** (from **Applications** or by clicking the waveform icon in your macOS Menu Bar -> **`Open SoundClud Setup…`**):
+
+- **Switch Modes or Toggle Keep-Awake**: Select the desired radio option / checkbox and click **`Apply Settings & Restart Receiver`**.
+- **View Receiver Logs**: Click **`View Logs`** to open the live receiver log directly in macOS **Console.app**.
+- **Clean Uninstall**: Click **`Uninstall Service…`** (optionally check *Also delete logs and pairing state*), then drag **`SoundClud.app`** and **`~/Applications/SoundClud Chrome Extension`** to the Trash and click **Remove** on **SoundClud** in `chrome://extensions`.
+
+---
+
+## Part 6 — Troubleshooting
+
+- **Already-open `soundcloud.com` tab isn't handing off right after adding the extension**:
+  Refresh the `soundcloud.com` tab once (`Cmd+R` / `Ctrl+R`).
+- **HEOS amplifier doesn't appear under Detected Hi-Fi Outputs**:
+  1. Ensure **Network Control / Network Standby** is set to **On** in your amplifier's menu (on Marantz PM7000N: **Setup -> Network -> Network Control -> On**; note that **Pure Mode 2 / Network Off** shuts off the HEOS network card—use **Optical TOSLINK** when Network is Off).
+  2. Verify your Mac and amplifier are on the same home network (not an isolated Guest Wi-Fi SSID), then click **`Refresh`** in `SoundClud.app`.
+- **Optical TOSLINK not listed on Mac Mini**:
+  Ensure the Mini-TOSLINK optical plug is firmly seated—macOS CoreAudio only exposes `Built-in Digital Output` while an optical connector is physically inserted.
+
+---
+
+## Appendix — Optional Headless CLI Install (Linux / SSH)
+
+For Linux (`x86_64` / `aarch64`, `systemd --user`) or headless SSH automation without a GUI:
+
 ```bash
-# Check live status & discovered outputs
-curl -s http://127.0.0.1:9876/api/v1/status
+# Build native release receiver + macOS Universal DMG (on macOS)
+cargo build --release --bin soundclud-receiver
+npm run package:macos-dmg   # macOS only: outputs dist/SoundClud-v0.1.0-macOS-Universal.dmg
 
-# View receiver logs
-tail -f "$HOME/Library/Application Support/SoundClud/logs/soundclud-receiver.out.log" \
-        "$HOME/Library/Application Support/SoundClud/logs/soundclud-receiver.err.log"
+# CLI install (add --heos-only for pure-Rust HEOS mode, or --keep-awake on headless macOS)
+./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver
 
-# Restart the background LaunchAgent
-launchctl kickstart -k "gui/$(id -u)/io.soundclud.receiver"
-```
-
-### Check Receiver Service Status or Logs (Linux)
-```bash
-systemctl --user status soundclud-receiver.service
-journalctl --user -u soundclud-receiver.service -f
-```
-
-### Clean Uninstall
-```bash
-# Stop background service and remove installed binaries (keeps pairing config)
-./packaging/install/uninstall.sh
-
-# Full removal including state & logs
+# CLI uninstall
 ./packaging/install/uninstall.sh --purge-state
 ```
-To remove the browser extension, open `chrome://extensions` and click **Remove** on the **SoundClud** card.
-
----
-
-## Part 6 — Quick Troubleshooting
-
-- **Already-open `soundcloud.com` tab isn't handing off right after installing the extension**:
-  Refresh the `soundcloud.com` tab once (`Cmd+R` / `Ctrl+R`) so the Manifest V3 `document_start` scripts attach cleanly.
-- **HEOS amplifier doesn't appear when clicking `Refresh`**:
-  1. Ensure your amplifier's **Network Control / Network Standby** setting is enabled in the amplifier's menu (on Marantz PM7000N: **Setup -> Network -> Network Control -> On**; note that **Pure Mode 2 / Network Off** powers down the HEOS Ethernet/Wi-Fi board—use **Optical TOSLINK** when running Pure Mode with Network Off).
-  2. Confirm your Mac and HEOS amplifier are on the same LAN/Wi-Fi network (not an isolated Guest Wi-Fi SSID).
-- **No sound on Optical TOSLINK (`Setup B`)**:
-  Verify your amplifier is set to the matching **OPTICAL** input and check `curl -s http://127.0.0.1:9876/api/v1/audio/devices` on the Mac Mini to confirm **`Built-in Digital Output`** (`optical_toslink`) is selected (macOS only exposes Digital Out when the Mini-TOSLINK optical plug is physically seated in the jack).

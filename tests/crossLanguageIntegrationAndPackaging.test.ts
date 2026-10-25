@@ -1051,4 +1051,405 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
       await fsp.rm(tmpRoot, { recursive: true, force: true });
     }
   });
+
+  it('validates XML 1.0 plist comments, Info.plist Monterey/ATS/Bonjour keys, and install.sh --keep-awake receipt, plist, and run-receiver.sh caffeinate behavior', async () => {
+    const findIllegalXmlComments = (xmlText: string): string[] => {
+      const badComments: string[] = [];
+      for (const match of xmlText.matchAll(/<!--([\s\S]*?)-->/g)) {
+        const body = match[1] ?? '';
+        if (body.includes('--') || body.endsWith('-')) {
+          badComments.push(body);
+        }
+      }
+      return badComments;
+    };
+
+    expect(findIllegalXmlComments('<!-- illegal -- sequence -->')).toHaveLength(1);
+    expect(findIllegalXmlComments('<!-- illegal trailing hyphen --->')).toHaveLength(1);
+
+    const launchdPlistTmplPath = path.join(
+      REPO_ROOT,
+      'packaging',
+      'launchd',
+      'io.soundclud.receiver.plist.tmpl',
+    );
+    const macAppInfoPlistTmplPath = path.join(
+      REPO_ROOT,
+      'packaging',
+      'macos-app',
+      'Info.plist.tmpl',
+    );
+
+    const launchdPlistTmpl = await fsp.readFile(launchdPlistTmplPath, 'utf8');
+    const macAppInfoPlistTmpl = await fsp.readFile(macAppInfoPlistTmplPath, 'utf8');
+
+    expect(findIllegalXmlComments(launchdPlistTmpl)).toEqual([]);
+    expect(findIllegalXmlComments(macAppInfoPlistTmpl)).toEqual([]);
+
+    expect(macAppInfoPlistTmpl).toMatch(
+      /<key>LSMinimumSystemVersion<\/key>\s*<string>11\.0<\/string>/,
+    );
+    expect(macAppInfoPlistTmpl).toMatch(
+      /<key>NSLocalNetworkUsageDescription<\/key>\s*<string>[^<]+<\/string>/,
+    );
+    expect(macAppInfoPlistTmpl).toMatch(
+      /<key>NSBonjourServices<\/key>\s*<array>[\s\S]*?<string>_heos-audio\._tcp<\/string>[\s\S]*?<string>_soundclud\._tcp<\/string>[\s\S]*?<\/array>/,
+    );
+    expect(macAppInfoPlistTmpl).toMatch(
+      /<key>NSAppTransportSecurity<\/key>[\s\S]*?<key>NSAllowsLocalNetworking<\/key>\s*<true\s*\/>/,
+    );
+
+    if (process.arch !== 'x64' && process.arch !== 'arm64') {
+      return;
+    }
+
+    const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-keepawake-'));
+    try {
+      const binPath = resolveReceiverBinaryPath();
+      const installScript = path.join(REPO_ROOT, 'packaging', 'install', 'install.sh');
+
+      // 1. Default install (without --keep-awake): KEEP_AWAKE defaults to 0
+      const defaultPrefix = path.join(tmpRoot, 'default-prefix');
+      const defaultState = path.join(tmpRoot, 'default-state');
+      execFileSync(
+        'bash',
+        [
+          installScript,
+          '--bin-source',
+          binPath,
+          '--heos-only',
+          '--skip-service',
+          '--target-os',
+          'darwin',
+          '--prefix',
+          defaultPrefix,
+          '--state-dir',
+          defaultState,
+        ],
+        { cwd: REPO_ROOT, stdio: 'pipe' },
+      );
+
+      const defaultReceipt = await fsp.readFile(
+        path.join(defaultPrefix, 'share', 'soundclud', 'install-receipt.env'),
+        'utf8',
+      );
+      expect(defaultReceipt).toMatch(/^HEOS_ONLY=1$/m);
+      expect(defaultReceipt).toMatch(/^KEEP_AWAKE=0$/m);
+
+      const defaultPlistPath = path.join(
+        defaultPrefix,
+        'share',
+        'soundclud',
+        'io.soundclud.receiver.plist',
+      );
+      const defaultPlistText = await fsp.readFile(defaultPlistPath, 'utf8');
+      expect(defaultPlistText).toMatch(
+        /<key>SOUNDCLUD_KEEP_AWAKE<\/key>\s*<string>0<\/string>/,
+      );
+      if (process.platform === 'darwin') {
+        execFileSync('plutil', ['-lint', '-s', defaultPlistPath], { stdio: 'pipe' });
+      }
+
+      // 2. --keep-awake install: renders SOUNDCLUD_KEEP_AWAKE=1 and records KEEP_AWAKE=1
+      const awakePrefix = path.join(tmpRoot, 'awake-prefix');
+      const awakeState = path.join(tmpRoot, 'awake-state');
+      execFileSync(
+        'bash',
+        [
+          installScript,
+          '--bin-source',
+          binPath,
+          '--keep-awake',
+          '--heos-only',
+          '--skip-service',
+          '--target-os',
+          'darwin',
+          '--prefix',
+          awakePrefix,
+          '--state-dir',
+          awakeState,
+        ],
+        { cwd: REPO_ROOT, stdio: 'pipe' },
+      );
+
+      const awakeReceipt = await fsp.readFile(
+        path.join(awakePrefix, 'share', 'soundclud', 'install-receipt.env'),
+        'utf8',
+      );
+      expect(awakeReceipt).toMatch(/^HEOS_ONLY=1$/m);
+      expect(awakeReceipt).toMatch(/^KEEP_AWAKE=1$/m);
+
+      const awakePlistPath = path.join(
+        awakePrefix,
+        'share',
+        'soundclud',
+        'io.soundclud.receiver.plist',
+      );
+      const awakePlistText = await fsp.readFile(awakePlistPath, 'utf8');
+      expect(awakePlistText).toMatch(
+        /<key>SOUNDCLUD_KEEP_AWAKE<\/key>\s*<string>1<\/string>/,
+      );
+      expect(awakePlistText).toMatch(
+        /<key>SOUNDCLUD_HEOS_ONLY<\/key>\s*<string>1<\/string>/,
+      );
+      if (process.platform === 'darwin') {
+        execFileSync('plutil', ['-lint', '-s', awakePlistPath], { stdio: 'pipe' });
+
+        // 3. Verify run-receiver.sh spawns `caffeinate -i -s -w <exec_pid>` only when SOUNDCLUD_KEEP_AWAKE=1
+        const mockBinDir = path.join(tmpRoot, 'mock-bin');
+        await fsp.mkdir(mockBinDir, { recursive: true });
+        const wrapperCopy = path.join(mockBinDir, 'run-receiver.sh');
+        await fsp.copyFile(
+          path.join(REPO_ROOT, 'packaging', 'launchd', 'run-receiver.sh'),
+          wrapperCopy,
+        );
+        await fsp.chmod(wrapperCopy, 0o755);
+
+        const caffLogPath = path.join(tmpRoot, 'caffeinate-args.txt');
+        const receiverPidPath = path.join(tmpRoot, 'receiver-pid.txt');
+
+        await fsp.writeFile(
+          path.join(mockBinDir, 'caffeinate'),
+          `#!/bin/bash\nprintf '%s' "$*" > "${caffLogPath}"\n`,
+          { encoding: 'utf8', mode: 0o755 },
+        );
+        await fsp.chmod(path.join(mockBinDir, 'caffeinate'), 0o755);
+        await fsp.writeFile(
+          path.join(mockBinDir, 'soundclud-receiver'),
+          [
+            '#!/bin/bash',
+            `printf '%s' "$$" > "${receiverPidPath}"`,
+            'if [ "${SC_WAIT_FOR_CAFF:-0}" = "1" ]; then',
+            '  for _ in $(seq 1 100); do',
+            `    [ -s "${caffLogPath}" ] && break`,
+            '    sleep 0.02',
+            '  done',
+            'else',
+            '  sleep 0.05',
+            'fi',
+            '',
+          ].join('\n'),
+          { encoding: 'utf8', mode: 0o755 },
+        );
+        await fsp.chmod(path.join(mockBinDir, 'soundclud-receiver'), 0o755);
+
+        execFileSync('bash', [wrapperCopy], {
+          env: {
+            ...process.env,
+            SOUNDCLUD_HEOS_ONLY: '1',
+            SOUNDCLUD_KEEP_AWAKE: '0',
+            SC_WAIT_FOR_CAFF: '0',
+          },
+          stdio: 'pipe',
+        });
+        expect(fs.existsSync(caffLogPath)).toBe(false);
+
+        execFileSync('bash', [wrapperCopy], {
+          env: {
+            ...process.env,
+            SOUNDCLUD_HEOS_ONLY: '1',
+            SOUNDCLUD_KEEP_AWAKE: '1',
+            SC_WAIT_FOR_CAFF: '1',
+          },
+          stdio: 'pipe',
+        });
+        const recordedPid = (await fsp.readFile(receiverPidPath, 'utf8')).trim();
+        const recordedCaffArgs = (await fsp.readFile(caffLogPath, 'utf8')).trim();
+        expect(recordedPid).toMatch(/^\d+$/);
+        expect(recordedCaffArgs).toBe(`-i -s -w ${recordedPid}`);
+      }
+    } finally {
+      await fsp.rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    'builds and verifies Universal 2 SoundClud.app offline via scripts/build-macos-dmg.sh --app-only',
+    async () => {
+      if (process.platform !== 'darwin') {
+        return;
+      }
+
+      const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-macos-app-'));
+      try {
+        const stubSourcePath = path.join(tmpRoot, 'receiver-stub.c');
+        const arm64StubPath = path.join(tmpRoot, 'soundclud-receiver-arm64');
+        const x86StubPath = path.join(tmpRoot, 'soundclud-receiver-x86_64');
+        const appOutputDir = path.join(tmpRoot, 'app-out');
+
+        await fsp.writeFile(stubSourcePath, 'int main(void) { return 0; }\n', 'utf8');
+
+        const clangT0 = performance.now();
+        execFileSync(
+          'clang',
+          ['-xc', '-target', 'arm64-apple-macos11.0', stubSourcePath, '-o', arm64StubPath],
+          { stdio: 'pipe' },
+        );
+        execFileSync(
+          'clang',
+          ['-xc', '-target', 'x86_64-apple-macos11.0', stubSourcePath, '-o', x86StubPath],
+          { stdio: 'pipe' },
+        );
+        const clangElapsedMs = performance.now() - clangT0;
+        expect(clangElapsedMs).toBeLessThan(2_000);
+
+        const buildScriptPath = path.join(REPO_ROOT, 'scripts', 'build-macos-dmg.sh');
+        const extDistDir = path.join(REPO_ROOT, 'packages', 'extension', 'dist');
+
+        const buildT0 = performance.now();
+        execFileSync(
+          'bash',
+          [
+            buildScriptPath,
+            '--app-only',
+            '--version',
+            '0.1.0',
+            '--arm64-bin',
+            arm64StubPath,
+            '--x86_64-bin',
+            x86StubPath,
+            '--extension-dir',
+            extDistDir,
+            '--output-dir',
+            appOutputDir,
+          ],
+          { cwd: REPO_ROOT, stdio: 'pipe' },
+        );
+        const buildElapsedMs = performance.now() - buildT0;
+        expect(buildElapsedMs).toBeLessThan(20_000);
+
+        const appBundlePath = path.join(appOutputDir, 'SoundClud.app');
+        const guiExecutablePath = path.join(appBundlePath, 'Contents', 'MacOS', 'SoundClud');
+        const receiverExecutablePath = path.join(
+          appBundlePath,
+          'Contents',
+          'MacOS',
+          'soundclud-receiver',
+        );
+        const icnsPath = path.join(appBundlePath, 'Contents', 'Resources', 'AppIcon.icns');
+        const bundledManifestPath = path.join(
+          appBundlePath,
+          'Contents',
+          'Resources',
+          'chrome-extension',
+          'manifest.json',
+        );
+        const bundledInstallScriptPath = path.join(
+          appBundlePath,
+          'Contents',
+          'Resources',
+          'packaging',
+          'install',
+          'install.sh',
+        );
+        const infoPlistPath = path.join(appBundlePath, 'Contents', 'Info.plist');
+
+        expect(fs.existsSync(appBundlePath)).toBe(true);
+
+        const guiArchs = execFileSync('lipo', ['-archs', guiExecutablePath], {
+          encoding: 'utf8',
+        })
+          .trim()
+          .split(/\s+/);
+        expect(guiArchs).toContain('x86_64');
+        expect(guiArchs).toContain('arm64');
+
+        const receiverArchs = execFileSync('lipo', ['-archs', receiverExecutablePath], {
+          encoding: 'utf8',
+        })
+          .trim()
+          .split(/\s+/);
+        expect(receiverArchs).toContain('x86_64');
+        expect(receiverArchs).toContain('arm64');
+
+        const icnsBuffer = await fsp.readFile(icnsPath);
+        expect(icnsBuffer.byteLength).toBeGreaterThan(1024);
+        expect(icnsBuffer.subarray(0, 4).toString('ascii')).toBe('icns');
+
+        expect(fs.existsSync(bundledManifestPath)).toBe(true);
+        fs.accessSync(bundledInstallScriptPath, fs.constants.X_OK);
+
+        execFileSync('plutil', ['-lint', '-s', infoPlistPath], { stdio: 'pipe' });
+        execFileSync('codesign', ['--verify', '--deep', '--strict', appBundlePath], {
+          stdio: 'pipe',
+        });
+      } finally {
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it(
+    'decodes live Rust /api/v1/discover wire JSON via macOS AppKit Models.swift without typeMismatch',
+    async () => {
+      if (process.platform !== 'darwin') {
+        return;
+      }
+
+      const daemon = await startEphemeralReceiverDaemon();
+      const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-swift-discover-'));
+      try {
+        // Native macOS URLSession omits Origin header on 127.0.0.1:9876/api/v1/discover
+        const discoverRes = await sendRawLoopbackHttpRequest({
+          port: daemon.port,
+          method: 'GET',
+          requestPath: API_V1_DISCOVER_PATH,
+          headers: {
+            Host: `127.0.0.1:${String(daemon.port)}`,
+            Accept: 'application/json',
+          },
+        });
+        expect(discoverRes.statusCode).toBe(200);
+
+        const discoverJsonPath = path.join(tmpRoot, 'discover.json');
+        const swiftHarnessPath = path.join(tmpRoot, 'main.swift');
+        const compiledHarnessPath = path.join(tmpRoot, 'verify-models-bin');
+        await fsp.writeFile(discoverJsonPath, discoverRes.bodyText, 'utf8');
+
+        const swiftHarnessSource = [
+          'import Foundation',
+          'let jsonPath = CommandLine.arguments[1]',
+          'let rawData = try Data(contentsOf: URL(fileURLWithPath: jsonPath))',
+          'let decoded = try JSONDecoder().decode(DiscoverResponse.self, from: rawData)',
+          'print("\\(decoded.receiverName)|\\(decoded.outputs.count)")',
+          '',
+        ].join('\n');
+        await fsp.writeFile(swiftHarnessPath, swiftHarnessSource, 'utf8');
+
+        const swiftArch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
+        const modelsSwiftPath = path.join(
+          REPO_ROOT,
+          'packaging',
+          'macos-app',
+          'Sources',
+          'Models.swift',
+        );
+        execFileSync(
+          'swiftc',
+          [
+            '-target',
+            `${swiftArch}-apple-macosx11.0`,
+            modelsSwiftPath,
+            swiftHarnessPath,
+            '-o',
+            compiledHarnessPath,
+          ],
+          { stdio: 'pipe' },
+        );
+
+        const decodedSummary = execFileSync(compiledHarnessPath, [discoverJsonPath], {
+          encoding: 'utf8',
+          stdio: 'pipe',
+        }).trim();
+        const [decodedName, decodedCountStr] = decodedSummary.split('|');
+        expect(decodedName).toBe('Lab Optical Receiver');
+        expect(Number(decodedCountStr)).toBeGreaterThanOrEqual(1);
+      } finally {
+        await daemon.stop();
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
 });

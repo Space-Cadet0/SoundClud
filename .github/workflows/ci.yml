@@ -75,3 +75,35 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "11.0"
         run: MACOSX_DEPLOYMENT_TARGET=11.0 cargo check --workspace --target x86_64-apple-darwin
+
+      - name: Verify Universal 2 macOS AppKit GUI (arm64 + x86_64, macosx11.0) & Info.plist
+        if: matrix.os == 'macos-14'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: |
+          set -euo pipefail
+          bash -n \
+            packaging/install/install.sh \
+            packaging/install/uninstall.sh \
+            packaging/launchd/run-receiver.sh \
+            scripts/build-macos-dmg.sh
+          TMP_APP_VERIFY="$(mktemp -d)"
+          trap 'rm -rf "${TMP_APP_VERIFY}"' EXIT
+          sed 's/{{VERSION}}/0.1.0/g' packaging/macos-app/Info.plist.tmpl > "${TMP_APP_VERIFY}/Info.plist"
+          plutil -lint -s "${TMP_APP_VERIFY}/Info.plist"
+          plutil -lint -s packaging/macos-app/Info.plist.tmpl
+          plutil -lint -s packaging/launchd/io.soundclud.receiver.plist.tmpl
+          swiftc -parse-as-library -O -target arm64-apple-macosx11.0 \
+            packaging/macos-app/Sources/*.swift \
+            -o "${TMP_APP_VERIFY}/SoundClud-arm64"
+          swiftc -parse-as-library -O -target x86_64-apple-macosx11.0 \
+            packaging/macos-app/Sources/*.swift \
+            -o "${TMP_APP_VERIFY}/SoundClud-x86_64"
+          lipo -create \
+            "${TMP_APP_VERIFY}/SoundClud-arm64" \
+            "${TMP_APP_VERIFY}/SoundClud-x86_64" \
+            -output "${TMP_APP_VERIFY}/SoundClud"
+          ARCHS="$(lipo -archs "${TMP_APP_VERIFY}/SoundClud")"
+          echo "Verified Universal SoundClud AppKit architectures: ${ARCHS}"
+          [[ " ${ARCHS} " == *" arm64 "* ]]
+          [[ " ${ARCHS} " == *" x86_64 "* ]]

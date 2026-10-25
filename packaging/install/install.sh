@@ -30,6 +30,7 @@ Options:
   --mpv-archive <path>    Install standalone `mpv` from a local .tar.gz archive
   --mpv-sha256 <hex>      Expected SHA-256 hex digest when using `--mpv-archive`
   --heos-only             Configure pure-Rust Denon/Marantz HEOS Direct mode without `mpv`
+  --keep-awake            Prevent macOS idle sleep on AC power via caffeinate (zero sudo)
   --skip-service          Render unit templates under <prefix>/share/soundclud without
                           invoking launchctl or systemctl (ideal for CI/offline checks)
   --service-dir <dir>     Override destination directory for active service unit file
@@ -212,6 +213,7 @@ render_template() {
   local v_log="${LOG_DIR}"
   local v_mpv="${RESOLVED_MPV_BIN}"
   local v_heos="${HEOS_ONLY}"
+  local v_keep_awake="${KEEP_AWAKE}"
 
   if [ "${escape_mode}" = "xml" ]; then
     v_bin="$(xml_escape "${v_bin}")"
@@ -219,6 +221,7 @@ render_template() {
     v_log="$(xml_escape "${v_log}")"
     v_mpv="$(xml_escape "${v_mpv}")"
     v_heos="$(xml_escape "${v_heos}")"
+    v_keep_awake="$(xml_escape "${v_keep_awake}")"
   fi
 
   T_BIN_DIR="${v_bin}" \
@@ -226,6 +229,7 @@ render_template() {
   T_LOG_DIR="${v_log}" \
   T_MPV_BIN="${v_mpv}" \
   T_HEOS_ONLY="${v_heos}" \
+  T_KEEP_AWAKE="${v_keep_awake}" \
   awk '
     function replace_all(text, token, val,    out, pos, tlen) {
       out = ""
@@ -243,6 +247,7 @@ render_template() {
       line = replace_all(line, "{{LOG_DIR}}", ENVIRON["T_LOG_DIR"])
       line = replace_all(line, "{{MPV_BIN}}", ENVIRON["T_MPV_BIN"])
       line = replace_all(line, "{{HEOS_ONLY}}", ENVIRON["T_HEOS_ONLY"])
+      line = replace_all(line, "{{KEEP_AWAKE}}", ENVIRON["T_KEEP_AWAKE"])
       print line
     }
   ' "${template_path}" > "${output_path}"
@@ -256,6 +261,7 @@ MPV_BIN_ARG=""
 MPV_ARCHIVE_ARG=""
 MPV_SHA256_ARG=""
 HEOS_ONLY="0"
+KEEP_AWAKE="0"
 SKIP_SERVICE="0"
 SERVICE_DIR_OVERRIDE=""
 SYSTEM_DAEMON="0"
@@ -331,6 +337,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --heos-only)
       HEOS_ONLY="1"
+      shift
+      ;;
+    --keep-awake)
+      KEEP_AWAKE="1"
       shift
       ;;
     --skip-service)
@@ -495,6 +505,7 @@ if [ "${DRY_RUN}" = "1" ]; then
   else
     log_info "[DRY-RUN] mpv source: PATH or standalone SHA-256 verified archive"
   fi
+  log_info "[DRY-RUN] Keep awake (caffeinate): ${KEEP_AWAKE}"
   log_info "[DRY-RUN] Rendered unit (staged): ${STAGED_UNIT_PATH}"
   if [ "${SKIP_SERVICE}" = "1" ]; then
     log_info "[DRY-RUN] Service activation: skipped (--skip-service)"
@@ -806,6 +817,7 @@ OS_KIND=${OS_KIND}
 TARGET_TRIPLE=${TARGET_TRIPLE}
 MPV_MANAGED=${MPV_MANAGED}
 HEOS_ONLY=${HEOS_ONLY}
+KEEP_AWAKE=${KEEP_AWAKE}
 SERVICE_MODE=${service_mode}
 RENDERED_UNIT_NAME=${RENDERED_UNIT_NAME}
 EOF

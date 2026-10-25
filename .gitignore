@@ -23,6 +23,8 @@ coverage/
 *.pem
 *.xpi
 *.zip
+*.dmg
+*.app/
 
 # Rust / Cargo Build Outputs
 target/

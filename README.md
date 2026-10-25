@@ -55,8 +55,8 @@ SoundClud/
 ├── packages/
 │   ├── protocol/                    # Shared TypeScript / wire protocol v1 contracts
 │   └── extension/                   # Chromium Manifest V3 extension (Chrome/Brave/Arc/Edge)
-├── packaging/                       # Zero-Homebrew installers & launchd/systemd units
-├── scripts/                         # Zero-PII hygiene scanner, extension packager & checkpoints
+├── packaging/                       # Native macOS GUI (`SoundClud.app`) & Zero-Homebrew installers
+├── scripts/                         # Universal DMG builder, extension packager & Zero-PII scanner
 ├── tests/                           # 100% offline deterministic Vitest, E2E & chaos suites
 └── CHROMEWEBSTORE.md                # Chrome Web Store Manifest V3 listing & privacy dossier
 ```
@@ -65,31 +65,33 @@ SoundClud/
 
 ## Quick Start
 
-### 1. Build & Install the Receiver Daemon (`soundclud-receiver`)
+### Zero-Terminal macOS GUI Install (`SoundClud-v0.1.0-macOS-Universal.dmg`)
+Works natively on **both** Apple Silicon (`M1`–`M4`) and Intel (`x86_64`, **macOS 12 Monterey+**, including the 2014 Intel Mac Mini) with **zero Terminal, zero `sudo`, and zero Homebrew**:
 
-#### Option A — Headless Mac Mini TOSLINK (`macOS 12 Monterey+` Intel `x86_64` or Apple Silicon) / Linux
+1. Open **`SoundClud-v0.1.0-macOS-Universal.dmg`** (from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) or built locally via `npm run package:macos-dmg`) and drag **`SoundClud.app`** into **`Applications`**.
+2. Launch **`SoundClud.app`**, select **Direct HEOS Network Mode** (laptop/desktop -> Denon/Marantz HEOS) or **Optical TOSLINK + HEOS Server Mode** (headless Mac Mini -> Optical S/PDIF), and click **`Install & Start Receiver`**.
+3. Under **Step 2 — Browser Extension Setup** inside `SoundClud.app`, click **`Copy "chrome://extensions" & Open Browser`** and **`Show Extension Folder in Finder`**, enable **Developer mode** in `chrome://extensions`, and drag **`SoundClud Chrome Extension`** onto the tab.
+4. Open `https://soundcloud.com` and select your **HEOS Amplifier** or **Optical Out** from the player-bar cast pill.
+
+See **[`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md)** for the full illustrated walkthrough, Menu Bar controls, troubleshooting, and optional Linux/SSH CLI setup.
+
+### Optional CLI Build & Install (Linux / Headless SSH)
+
+#### Build Universal macOS `.dmg` (Apple Silicon + Intel Monterey `11.0+`)
 ```bash
-# Build native release binary (or cross-compile Monterey x86_64 with MACOSX_DEPLOYMENT_TARGET=11.0)
-cargo build --release --bin soundclud-receiver
-
-# Zero-Homebrew install with standalone SHA-256-verified mpv + launchd/systemd auto-start
-./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver
+npm run package:macos-dmg
 ```
 
-#### Option B — Direct HEOS Network Mode (`127.0.0.1` on Your Client Laptop — Zero Second Mac & Zero `mpv` Needed)
+#### Headless CLI Receiver Install (`macOS 12+` or `Linux x86_64/aarch64`)
 ```bash
 cargo build --release --bin soundclud-receiver
+
+# Optical TOSLINK + HEOS Server (downloads SHA-256-verified standalone mpv on macOS; add --keep-awake on headless Macs)
+./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver
+
+# Or pure-Rust Direct HEOS Network Mode (zero mpv needed)
 ./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver --heos-only
 ```
-
-### 2. Build & Load the Chromium Manifest V3 Extension (`Chrome` / `Brave` / `Arc` / `Edge`)
-```bash
-npm install
-npm run package:extension
-```
-1. Open `chrome://extensions` in your Chromium browser and enable **Developer mode**.
-2. Click **Load unpacked** and select `packages/extension/dist`.
-3. Open `https://soundcloud.com` (logged into your Free or Go+ account as normal), click the **SoundClud** toolbar icon (or the player-bar cast pill), and pick either your **Optical Out (`TOSLINK 44.1 kHz 0 dB`)** or your **Denon / Marantz HEOS Amplifier (`HEOS 44.1 kHz 0 dB`)**.
 
 ---
 

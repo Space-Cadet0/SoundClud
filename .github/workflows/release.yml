@@ -82,7 +82,8 @@ jobs:
           bash -n \
             packaging/install/install.sh \
             packaging/install/uninstall.sh \
-            packaging/launchd/run-receiver.sh
+            packaging/launchd/run-receiver.sh \
+            scripts/build-macos-dmg.sh
 
       - name: Run strict TypeScript typecheck
         run: npm run typecheck
@@ -266,11 +267,103 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-macos-dmg:
+    name: Build Universal macOS App & DMG
+    needs:
+      - verify-and-package
+      - build-receiver
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Download common extension & packaging artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-common-assets
+          path: staged-inputs
+
+      - name: Download macOS arm64 receiver tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: release-receiver-aarch64-apple-darwin
+          path: staged-inputs
+
+      - name: Download macOS x86_64 receiver tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: release-receiver-x86_64-apple-darwin
+          path: staged-inputs
+
+      - name: Build and verify SoundClud Universal 2 macOS DMG
+        env:
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.verify-and-package.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          EXT_UNPACK_DIR="$(mktemp -d)"
+          MNT_DIR="$(mktemp -d)"
+          cleanup() {
+            if mount | grep -Fq "on ${MNT_DIR} "; then
+              hdiutil detach "${MNT_DIR}" -force >/dev/null 2>&1 || true
+            fi
+            rm -rf "${EXT_UNPACK_DIR}" "${MNT_DIR}"
+          }
+          trap cleanup EXIT
+
+          unzip -q "staged-inputs/soundclud-extension-${RELEASE_TAG}.zip" -d "${EXT_UNPACK_DIR}"
+          mkdir -p dist/dmg
+
+          ./scripts/build-macos-dmg.sh \
+            --version "${RELEASE_VERSION}" \
+            --arm64-bin "staged-inputs/soundclud-receiver-${RELEASE_TAG}-aarch64-apple-darwin.tar.gz" \
+            --x86_64-bin "staged-inputs/soundclud-receiver-${RELEASE_TAG}-x86_64-apple-darwin.tar.gz" \
+            --extension-dir "${EXT_UNPACK_DIR}" \
+            --output-dir "dist/dmg"
+
+          DMG_FILE="dist/dmg/SoundClud-${RELEASE_TAG}-macOS-Universal.dmg"
+          test -s "${DMG_FILE}"
+
+          hdiutil attach -nobrowse -readonly -mountpoint "${MNT_DIR}" "${DMG_FILE}"
+          test -d "${MNT_DIR}/SoundClud.app"
+          test -L "${MNT_DIR}/Applications"
+          test -f "${MNT_DIR}/SoundClud Chrome Extension/manifest.json"
+          plutil -lint -s "${MNT_DIR}/SoundClud.app/Contents/Info.plist"
+          codesign --verify --deep --strict "${MNT_DIR}/SoundClud.app"
+
+          GUI_ARCHS="$(lipo -archs "${MNT_DIR}/SoundClud.app/Contents/MacOS/SoundClud")"
+          REC_ARCHS="$(lipo -archs "${MNT_DIR}/SoundClud.app/Contents/MacOS/soundclud-receiver")"
+          echo "Verified mounted DMG SoundClud GUI archs: ${GUI_ARCHS}"
+          echo "Verified mounted DMG soundclud-receiver archs: ${REC_ARCHS}"
+          [[ " ${GUI_ARCHS} " == *" arm64 "* && " ${GUI_ARCHS} " == *" x86_64 "* ]]
+          [[ " ${REC_ARCHS} " == *" arm64 "* && " ${REC_ARCHS} " == *" x86_64 "* ]]
+
+          hdiutil detach "${MNT_DIR}"
+
+      - name: Upload Universal macOS DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-dmg
+          path: dist/dmg/SoundClud-*-macOS-Universal.dmg
+          if-no-files-found: error
+          retention-days: 7
+
   publish-release:
     name: Generate SHA256SUMS.txt & Publish Release
     needs:
       - verify-and-package
       - build-receiver
+      - build-macos-dmg
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Elevated write scope restricted strictly to this final release-publishing job.
@@ -290,6 +383,7 @@ jobs:
           cd release-assets
           rm -f SHA256SUMS.txt
           LC_ALL=C ls -1 \
+            SoundClud-*-macOS-Universal.dmg \
             soundclud-receiver-*-x86_64-apple-darwin.tar.gz \
             soundclud-receiver-*-aarch64-apple-darwin.tar.gz \
             soundclud-receiver-*-x86_64-unknown-linux-gnu.tar.gz \
