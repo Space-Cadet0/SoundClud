@@ -85,15 +85,6 @@ jobs:
             packaging/launchd/run-receiver.sh \
             scripts/build-macos-dmg.sh
 
-      - name: Run strict TypeScript typecheck
-        run: npm run typecheck
-
-      - name: Run deterministic offline unit tests
-        run: npm test
-
-      - name: Run Rust format, clippy, and unit tests
-        run: npm run check:rust
-
       - name: Build and package Chromium MV3 extension
         env:
           RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
@@ -105,6 +96,15 @@ jobs:
             --source-dir packages/extension/dist \
             --output "dist/release/soundclud-extension-${RELEASE_TAG}.zip"
           rm -f "dist/release/soundclud-extension-${RELEASE_TAG}.zip.sha256"
+
+      - name: Run strict TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Run deterministic offline unit tests
+        run: npm test
+
+      - name: Run Rust format, clippy, and unit tests
+        run: npm run check:rust
 
       - name: Bundle Zero-Homebrew installer & service templates
         env:
