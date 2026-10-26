@@ -4,6 +4,7 @@
 
 **Zero-compromise `0 dB` Bit-Perfect SoundCloud handoff from your native Chromium UI to TOSLINK Hi-Fi receivers and Denon/Marantz HEOS amplifiers.**
 
+[![Release](https://img.shields.io/github/v/release/Space-Cadet0/SoundClud?style=for-the-badge&label=Download)](https://github.com/Space-Cadet0/SoundClud/releases/latest)
 [![CI](https://img.shields.io/github/actions/workflow/status/Space-Cadet0/SoundClud/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/Space-Cadet0/SoundClud/actions)
 [![Receiver](https://img.shields.io/badge/Receiver-macOS%2012%2B%20%7C%20Linux-111827?style=for-the-badge)](./docs/ARCHITECTURE_SPEC.md)
 [![HEOS](https://img.shields.io/badge/HEOS%20Direct-Denon%20%7C%20Marantz-b45309?style=for-the-badge)](./docs/ARCHITECTURE_SPEC.md)
@@ -33,7 +34,7 @@
    - Overrides SoundCloud Web's client-side `sq` default to automatically select **`aac_256k` (`quality: "hq"`, 256 kbps AAC-LC @ 44.1 kHz)** over `hls` and `encrypted-hls` (`AES-128`), with automatic local fallback (`drm_local_fallback`) for single Widevine-only tracks so mixed queues never stall.
 2. **Dual Strictly Independent `0 dB` Bit-Perfect Output Backends**:
    - **Use Case 1 (`LocalMpvBackend`)**: Physical `44,100 Hz` CoreAudio format locking (`--coreaudio-change-physical-format=yes`), `0 dB` unity gain, and continuous idle optical S/PDIF carrier keepalive (`anullsrc`).
-   - **Use Case 2 (`HeosUpnpBackend`)**: Zero-config SSDP/mDNS/HEOS CLI discovery (`ACT-Denon:1` / `TCP 1255`), hands-free Network Standby auto-wake (`ACT:1#SetDevicePowerState`), `DIDL-Lite` front-OLED metadata, and pure-Rust `44,100 Hz / 24-bit` `0 dB` WAV HTTP streaming (`~350–650 ms` warm start & byte-range scrub)—working on a LAN Mac Mini or locally on `127.0.0.1` on your laptop with **amp-knob/remote-only volume** across both modes.
+   - **Use Case 2 (`HeosUpnpBackend`)**: Zero-config SSDP/mDNS/HEOS CLI discovery (`ACT-Denon:1` / `TCP 1255`), hands-free Network Standby auto-wake (`Host MCU :23` + `ACT:1`), `VORBIS_COMMENT` + `DIDL-Lite` front-OLED Track/Artist/Duration display, `60s` anti-standby playback keepalives, and pure-Rust `44,100 Hz / 24-bit` `0 dB` Lossless FLAC HTTP streaming (`~350–650 ms` warm start & `HTTP 206` byte-range scrub)—working on a LAN Mac Mini or locally on `127.0.0.1` on your laptop with **amp-knob/remote-only volume** across both modes.
 3. **Long-Mix HLS Refresh & AES-128 Session Cache**:
    - Caches `#EXT-X-MAP` (`init.mp4`) and `#EXT-X-KEY` (`AES-128`) in RAM while transparently refreshing expiring CloudFront signatures—eliminating mid-set `HTTP 403` dropouts across 1–3 hour DJ mixes.
 4. **3-World Chromium Manifest V3 & Maestro MSE Virtualization**:

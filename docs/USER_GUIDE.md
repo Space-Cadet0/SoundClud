@@ -25,7 +25,7 @@ Inside the **SoundClud — Hi-Fi Setup & Control** window:
 
 1. Under **Step 1 — Receiver Audio Mode & One-Click Install**, pick your setup:
    - **Direct HEOS Network Mode (MacBook / Desktop -> Denon or Marantz HEOS)**:
-     Select this on your everyday laptop/desktop to stream `44.1 kHz / 24-bit` `0 dB` WAV directly over Wi-Fi/Ethernet to your Denon or Marantz HEOS amplifier. Finishes in ~1 second offline.
+     Select this on your everyday laptop/desktop to stream `44.1 kHz / 24-bit` `0 dB` Lossless FLAC directly over Wi-Fi/Ethernet to your Denon or Marantz HEOS amplifier. Finishes in ~1 second offline.
    - **Optical TOSLINK + HEOS Server Mode (Headless Mac Mini -> Optical S/PDIF)**:
      Select this on a dedicated Mac Mini plugged into your amplifier via a **3.5mm Mini-TOSLINK to Standard TOSLINK** optical cable. Automatically downloads and SHA-256-verifies a standalone `mpv` audio engine (no Homebrew needed) and enables **Keep Mac Awake for Headless LAN Playback** so the Mac Mini never sleeps on AC power (no `sudo pmset` needed).
 2. Click **`Install & Start Receiver`**.

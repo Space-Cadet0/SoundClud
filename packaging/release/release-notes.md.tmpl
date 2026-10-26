@@ -1,0 +1,53 @@
+**SoundClud {{RELEASE_TAG}}** brings zero-compromise **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio handoff from the official [soundcloud.com](https://soundcloud.com) web player directly to **Denon & Marantz HEOS Built-In** network amplifiers/speakers and **Optical TOSLINK (S/PDIF)** Hi-Fi DACs.
+
+Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboard's hardware media keys inside `soundcloud.com` as normal—while your computer's internal speakers stay silent and your Hi-Fi amplifier plays bit-perfect lossless audio controlled exclusively by your physical amplifier volume knob or remote.
+
+---
+
+## Downloads — Which File Should I Choose?
+
+| Platform / Setup | Recommended Download | What's Inside |
+| :--- | :--- | :--- |
+| **macOS (Apple Silicon `M1–M4` & Intel `macOS 12 Monterey+`)** | **`SoundClud-{{RELEASE_TAG}}-macOS-Universal.dmg`** | **Recommended Zero-Terminal Installer.** Universal 2 `SoundClud.app` Menu Bar & Setup GUI, background receiver daemon, and unpacked `SoundClud Chrome Extension`. |
+| **Browser Extension Only (`Chrome`, `Brave`, `Arc`, `Edge` `v116+`)** | **`soundclud-extension-{{RELEASE_TAG}}.zip`** | Standalone Chromium Manifest V3 extension archive (for connecting a second laptop/desktop to an existing LAN receiver). |
+| **Linux Receiver (`x86_64`, `systemd --user`)** | **`soundclud-receiver-{{RELEASE_TAG}}-x86_64-unknown-linux-gnu.tar.gz`** | Native Linux `soundclud-receiver` binary + zero-root `install.sh` (`ALSA IEC958` Optical S/PDIF + Direct HEOS). |
+| **macOS Headless CLI (`Apple Silicon` / `Intel`)** | **`soundclud-receiver-{{RELEASE_TAG}}-aarch64-apple-darwin.tar.gz`**<br>**`soundclud-receiver-{{RELEASE_TAG}}-x86_64-apple-darwin.tar.gz`** | Standalone CLI binaries + `launchd` installer scripts for automated/SSH headless deployments. |
+
+---
+
+## 3-Minute Zero-Terminal Setup (macOS)
+
+1. **Install `SoundClud.app`**
+   - Download **`SoundClud-{{RELEASE_TAG}}-macOS-Universal.dmg`**, open it, and drag **`SoundClud.app`** to **`Applications`**.
+   - Launch **`SoundClud`** from **Applications** *(if macOS Gatekeeper prompts on first launch, right-click `SoundClud.app` -> **Open**)*.
+2. **Start the Hi-Fi Receiver (1 Click)**
+   - Choose **Direct HEOS Network Mode** *(for streaming over Wi-Fi/Ethernet from your Mac to a Denon or Marantz HEOS amplifier)* or **Optical TOSLINK + HEOS Server Mode** *(for a Mac Mini plugged into Optical S/PDIF)*.
+   - Click **`Install & Start Receiver`**. Your detected Hi-Fi outputs appear automatically, and the lightweight receiver auto-starts quietly at login.
+3. **Add the Browser Extension**
+   - Inside **`SoundClud.app`** under **Step 2**, click **`Copy "chrome://extensions" & Open Browser`**, paste **`chrome://extensions`** into your browser address bar, and turn **Developer mode** **ON** (top-right).
+   - Click **`Show Extension Folder in Finder`** and drag **`SoundClud Chrome Extension`** onto the `chrome://extensions` tab.
+   - Open **[soundcloud.com](https://soundcloud.com)**, click the **SoundClud** cast pill in the bottom player bar (or toolbar icon), and pick your **HEOS Amplifier** or **Optical Out**.
+
+📖 **Full Step-by-Step Guide & Troubleshooting**: **[End-User Installation & Usage Guide (`docs/USER_GUIDE.md`)](https://github.com/Space-Cadet0/SoundClud/blob/{{RELEASE_TAG}}/docs/USER_GUIDE.md)**
+
+---
+
+## Highlights in `{{RELEASE_TAG}}`
+
+- **Automatic SoundCloud Go+ High Quality (`256 kbps` AAC-LC @ `44.1 kHz`)**: Uses your existing `soundcloud.com` browser session with **zero separate login** and **zero disk-stored credentials**, automatically upgrading SoundCloud Web's default `sq` stream to `hq` (`aac_256k`) when available—including private and secret-link tracks. Also works seamlessly with SoundCloud Free and signed-out browsing.
+- **Direct Denon & Marantz HEOS Network Streaming (`0 dB` `44.1 kHz / 24-bit` Lossless FLAC)**:
+  - Automatic SSDP/mDNS/HEOS discovery on your home LAN with zero IP configuration.
+  - **Hands-Free Auto-Wake**: Pressing **Play** on `soundcloud.com` automatically wakes your Denon/Marantz amplifier from Network Standby and switches to **HEOS Music**.
+  - **Front OLED Track Metadata & Exact Duration**: Streams uncompressed RFC 9639 `24-bit / 44.1 kHz` FLAC with `VORBIS_COMMENT` & `DIDL-Lite` tags so your amplifier's front display shows the live **Track Title**, **Artist**, and **Elapsed / Total Time** while preventing unintended EU Auto-Standby shutdowns during playback.
+- **Bit-Perfect Optical TOSLINK Mode (`44.1 kHz` S/PDIF)**: Locks macOS CoreAudio physical sample rate to `44,100 Hz` at `0 dB` unity gain with continuous silent S/PDIF optical clock lock (`anullsrc`) to eliminate DAC relock clicks between tracks.
+- **Strict Amp-Knob-Only Volume (`0 dB` Invariant)**: SoundClud never attenuates digital samples and never sends remote volume commands to your amplifier—your physical Hi-Fi volume knob and remote remain in 100% control.
+- **Multi-Hour DJ Mix Resilience & Instant Waveform Scrubbing**: Transparently refreshes expiring SoundCloud HLS CDN signatures mid-mix (`HTTP 403` recovery) and supports instant `HTTP 206` byte-range waveform seeking across 1–4+ hour sets.
+- **Graceful Widevine DRM Local Fallback**: If an individual major-label track requires hardware Widevine DRM, SoundClud plays that single track locally in your browser and automatically resumes Hi-Fi handoff on the very next track in your queue.
+
+---
+
+## SHA-256 Checksums (`SHA256SUMS.txt`)
+
+```text
+{{SHA256SUMS_CONTENT}}
+```

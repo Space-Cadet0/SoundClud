@@ -371,6 +371,11 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout repository for release notes template
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download all staged release artifacts
         uses: actions/download-artifact@v4
         with:
@@ -393,6 +398,27 @@ jobs:
           cat SHA256SUMS.txt
           sha256sum --check SHA256SUMS.txt
 
+      - name: Render user-facing GitHub Release notes
+        env:
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.verify-and-package.outputs.release_version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          tmpl = Path("packaging/release/release-notes.md.tmpl").read_text(encoding="utf-8")
+          sums = Path("release-assets/SHA256SUMS.txt").read_text(encoding="utf-8").strip()
+          rendered = (
+              tmpl.replace("{{RELEASE_TAG}}", os.environ["RELEASE_TAG"])
+              .replace("{{RELEASE_VERSION}}", os.environ["RELEASE_VERSION"])
+              .replace("{{SHA256SUMS_CONTENT}}", sums)
+          )
+          Path("/tmp/RELEASE_NOTES.md").write_text(rendered, encoding="utf-8")
+          PY
+          test -s /tmp/RELEASE_NOTES.md
+
       - name: Upload complete verified release bundle artifact
         uses: actions/upload-artifact@v4
         with:
@@ -414,13 +440,19 @@ jobs:
             echo "No release assets found to publish" >&2
             exit 1
           fi
+          RELEASE_TITLE="SoundClud ${RELEASE_TAG} — 0 dB Bit-Perfect Hi-Fi Audio for SoundCloud"
           if gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "${RELEASE_TITLE}" \
+              --notes-file /tmp/RELEASE_NOTES.md
             gh release upload "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "${ASSETS[@]}"
           else
             gh release create "${RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
-              --generate-notes \
-              --title "SoundClud ${RELEASE_TAG}" \
+              --latest \
+              --title "${RELEASE_TITLE}" \
+              --notes-file /tmp/RELEASE_NOTES.md \
               "${ASSETS[@]}"
           fi
