@@ -1454,6 +1454,297 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
   );
 
   it(
+    'verifies SetupWindowController.swift AppKit Auto Layout geometry, non-overlapping card intervals, and zero ambiguous layouts headlessly',
+    async () => {
+      if (process.platform !== 'darwin') {
+        return;
+      }
+
+      interface LayoutRectTelemetry {
+        readonly minX: number;
+        readonly maxX: number;
+        readonly minY: number;
+        readonly maxY: number;
+        readonly width: number;
+        readonly height: number;
+      }
+
+      interface SetupWindowLayoutTelemetry {
+        readonly contentWidth: number;
+        readonly contentHeight: number;
+        readonly minWindowWidth: number;
+        readonly minWindowHeight: number;
+        readonly isDocumentFlipped: boolean;
+        readonly statusIconMinX: number;
+        readonly sections: readonly LayoutRectTelemetry[];
+        readonly outputRows: readonly LayoutRectTelemetry[];
+        readonly visitedViewCount: number;
+        readonly sawDocumentView: boolean;
+        readonly ambiguousViews: readonly string[];
+        readonly horizontalOverflows: readonly string[];
+      }
+
+      const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-swift-layout-'));
+      try {
+        const isolatedHomeDir = path.join(tmpRoot, 'isolated-home');
+        await fsp.mkdir(isolatedHomeDir, { recursive: true, mode: 0o700 });
+
+        const swiftHarnessPath = path.join(tmpRoot, 'main.swift');
+        const compiledHarnessPath = path.join(tmpRoot, 'verify-setup-window-layout');
+
+        const swiftHarnessSource = [
+          'import AppKit',
+          'import Foundation',
+          '',
+          'let app = NSApplication.shared',
+          'app.setActivationPolicy(.accessory)',
+          '',
+          'let manager = ReceiverServiceManager()',
+          'let controller = SetupWindowController(serviceManager: manager) { _ in }',
+          '',
+          'guard let win = controller.window, let contentView = win.contentView else {',
+          '    fputs("Missing window or contentView\\n", stderr)',
+          '    exit(1)',
+          '}',
+          '',
+          'let syntheticDiscoverPayload: [String: Any] = [',
+          '    "protocolVersion": "1.0",',
+          '    "receiverId": "rec-synthetic-layout-01",',
+          '    "receiverName": "Synthetic Hi-Fi Receiver",',
+          '    "platform": "macos",',
+          '    "arch": "arm64",',
+          '    "requiresPairing": true,',
+          '    "outputs": [',
+          '        [',
+          '            "id": "heos_synthetic_amp",',
+          '            "kind": "heos_upnp",',
+          '            "name": "Synthetic Reference Amp",',
+          '            "model": "Reference Network Amp",',
+          '            "transport": "heos_lan_wav",',
+          '            "isRecommendedDefault": true,',
+          '            "isAvailable": true,',
+          '            "standbyState": "off",',
+          '            "capabilities": [',
+          '                "bitPerfect": true,',
+          '                "fixedGainDb": 0.0,',
+          '                "targetSampleRateHz": 44100,',
+          '                "targetBitDepth": 24,',
+          '                "autoWakeFromStandby": true,',
+          '                "displaysTrackMetadataOnDevice": true,',
+          '                "seekDebounceMs": 150,',
+          '            ],',
+          '        ],',
+          '        [',
+          '            "id": "coreaudio_spdf",',
+          '            "kind": "local_mpv",',
+          '            "name": "Optical Digital-out (S/PDIF)",',
+          '            "model": "Built-in Digital Output",',
+          '            "transport": "optical_toslink",',
+          '            "isRecommendedDefault": false,',
+          '            "isAvailable": true,',
+          '            "capabilities": [',
+          '                "bitPerfect": true,',
+          '                "fixedGainDb": 0.0,',
+          '                "targetSampleRateHz": 44100,',
+          '                "targetBitDepth": 24,',
+          '                "autoWakeFromStandby": false,',
+          '                "displaysTrackMetadataOnDevice": false,',
+          '                "seekDebounceMs": 60,',
+          '            ],',
+          '        ],',
+          '    ],',
+          ']',
+          '',
+          'let discoverData = try JSONSerialization.data(withJSONObject: syntheticDiscoverPayload)',
+          'let discover = try JSONDecoder().decode(DiscoverResponse.self, from: discoverData)',
+          'let snapshot = ServiceSnapshot(',
+          '    receipt: InstallReceiptState(isInstalled: true, hasReceipt: true, heosOnly: false, keepAwake: true),',
+          '    isRunning: true,',
+          '    discover: discover,',
+          '    lastCheckedAt: Date()',
+          ')',
+          '',
+          'controller.applySnapshot(snapshot, forceSyncControls: true)',
+          'win.contentView?.layoutSubtreeIfNeeded()',
+          '',
+          'guard let scrollView = contentView.subviews.compactMap({ $0 as? NSScrollView }).first,',
+          '      let docView = scrollView.documentView,',
+          '      let rootStack = docView.subviews.compactMap({ $0 as? NSStackView }).first else {',
+          '    fputs("Missing NSScrollView, documentView, or rootStack\\n", stderr)',
+          '    exit(1)',
+          '}',
+          '',
+          'func encodeRect(view: NSView, in referenceView: NSView) -> [String: Double] {',
+          '    let rect = referenceView.convert(view.bounds, from: view)',
+          '    return [',
+          '        "minX": Double(rect.minX),',
+          '        "maxX": Double(rect.maxX),',
+          '        "minY": Double(rect.minY),',
+          '        "maxY": Double(rect.maxY),',
+          '        "width": Double(view.frame.width),',
+          '        "height": Double(view.frame.height),',
+          '    ]',
+          '}',
+          '',
+          'let sections = rootStack.arrangedSubviews.map { encodeRect(view: $0, in: docView) }',
+          '',
+          'var statusIconMinX: Double = -1.0',
+          'if rootStack.arrangedSubviews.count > 1 {',
+          '    let statusCard = rootStack.arrangedSubviews[1]',
+          '    if let cardStack = statusCard.subviews.compactMap({ $0 as? NSStackView }).first,',
+          '       let badgeRow = cardStack.arrangedSubviews.compactMap({ $0 as? NSStackView }).first,',
+          '       let statusIcon = badgeRow.arrangedSubviews.compactMap({ $0 as? NSImageView }).first {',
+          '        statusIconMinX = Double(docView.convert(statusIcon.bounds, from: statusIcon).minX)',
+          '    }',
+          '}',
+          '',
+          'var outputRows: [[String: Double]] = []',
+          'if rootStack.arrangedSubviews.count > 3 {',
+          '    let outputsCard = rootStack.arrangedSubviews[3]',
+          '    if let cardStack = outputsCard.subviews.compactMap({ $0 as? NSStackView }).first,',
+          '       let innerOutputsStack = cardStack.arrangedSubviews.compactMap({ $0 as? NSStackView }).first {',
+          '        outputRows = innerOutputsStack.arrangedSubviews.map { encodeRect(view: $0, in: docView) }',
+          '    }',
+          '}',
+          '',
+          'var visitedViewCount = 0',
+          'var sawDocumentView = false',
+          'var ambiguousViews: [String] = []',
+          'var horizontalOverflows: [String] = []',
+          '',
+          'func walkHierarchy(_ view: NSView, path: String, insideDocument: Bool) {',
+          '    visitedViewCount += 1',
+          '    let nowInsideDoc = insideDocument || (view === docView)',
+          '    if view === docView {',
+          '        sawDocumentView = true',
+          '    }',
+          '    if view.hasAmbiguousLayout {',
+          '        ambiguousViews.append("\\(path) frame=\\(view.frame)")',
+          '    }',
+          '    if nowInsideDoc && !view.isHidden {',
+          '        let rectInDoc = docView.convert(view.bounds, from: view)',
+          '        if rectInDoc.minX < -4.0 || rectInDoc.maxX > docView.bounds.width + 4.0 {',
+          '            horizontalOverflows.append("\\(path) rectInDoc=\\(rectInDoc) docWidth=\\(docView.bounds.width)")',
+          '        }',
+          '    }',
+          '    for (idx, subview) in view.subviews.enumerated() {',
+          '        walkHierarchy(subview, path: "\\(path)/\\(type(of: subview))[\\(idx)]", insideDocument: nowInsideDoc)',
+          '    }',
+          '}',
+          '',
+          'walkHierarchy(contentView, path: "\\(type(of: contentView))", insideDocument: false)',
+          '',
+          'let report: [String: Any] = [',
+          '    "contentWidth": Double(contentView.frame.size.width),',
+          '    "contentHeight": Double(contentView.frame.size.height),',
+          '    "minWindowWidth": Double(win.minSize.width),',
+          '    "minWindowHeight": Double(win.minSize.height),',
+          '    "isDocumentFlipped": docView.isFlipped,',
+          '    "statusIconMinX": statusIconMinX,',
+          '    "sections": sections,',
+          '    "outputRows": outputRows,',
+          '    "visitedViewCount": visitedViewCount,',
+          '    "sawDocumentView": sawDocumentView,',
+          '    "ambiguousViews": ambiguousViews,',
+          '    "horizontalOverflows": horizontalOverflows,',
+          ']',
+          'let reportData = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])',
+          'print(String(data: reportData, encoding: .utf8)!)',
+          '',
+        ].join('\n');
+        await fsp.writeFile(swiftHarnessPath, swiftHarnessSource, 'utf8');
+
+        const swiftArch = process.arch === 'arm64' ? 'arm64' : 'x86_64';
+        const macSourcesDir = path.join(REPO_ROOT, 'packaging', 'macos-app', 'Sources');
+        const swiftSourceFiles = [
+          'Models.swift',
+          'ReceiverServiceManager.swift',
+          'RelocationHelper.swift',
+          'SetupWindowController.swift',
+        ].map((fileName) => path.join(macSourcesDir, fileName));
+
+        execFileSync(
+          'swiftc',
+          [
+            '-target',
+            `${swiftArch}-apple-macosx11.0`,
+            ...swiftSourceFiles,
+            swiftHarnessPath,
+            '-o',
+            compiledHarnessPath,
+          ],
+          { stdio: 'pipe' },
+        );
+
+        const rawTelemetry = execFileSync(compiledHarnessPath, [], {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            HOME: isolatedHomeDir,
+          },
+          stdio: 'pipe',
+        }).trim();
+
+        const report = JSON.parse(rawTelemetry) as SetupWindowLayoutTelemetry;
+
+        // 1. Window contentView frame size equals (720, 760) (>= 660 × 560, never collapsed)
+        expect(report.contentWidth).toBe(720);
+        expect(report.contentHeight).toBe(760);
+        expect(report.contentWidth).toBeGreaterThanOrEqual(660);
+        expect(report.contentHeight).toBeGreaterThanOrEqual(560);
+        expect(report.minWindowWidth).toBeGreaterThanOrEqual(660);
+        expect(report.minWindowHeight).toBeGreaterThanOrEqual(560);
+        expect(report.isDocumentFlipped).toBe(true);
+        expect(report.statusIconMinX).toBe(38);
+
+        // 2. All 5 rootStack.arrangedSubviews have height >= 40, width >= 600, and monotonic non-overlapping [minY, maxY]
+        expect(report.sections).toHaveLength(5);
+        for (let idx = 0; idx < report.sections.length; idx += 1) {
+          const section = report.sections[idx];
+          expect(section).toBeDefined();
+          if (section === undefined) {
+            continue;
+          }
+          expect(section.height).toBeGreaterThanOrEqual(40);
+          expect(section.width).toBeGreaterThanOrEqual(600);
+          expect(section.maxY).toBeGreaterThan(section.minY);
+
+          if (idx > 0) {
+            const prev = report.sections[idx - 1];
+            expect(prev).toBeDefined();
+            if (prev !== undefined) {
+              expect(prev.maxY).toBeLessThan(section.minY);
+            }
+          }
+        }
+
+        // Verify both synthetic outputs (HEOS + Optical) rendered non-overlapping rows inside Detected Hi-Fi Outputs
+        expect(report.outputRows).toHaveLength(2);
+        const firstOutputRow = report.outputRows[0];
+        const secondOutputRow = report.outputRows[1];
+        expect(firstOutputRow).toBeDefined();
+        expect(secondOutputRow).toBeDefined();
+        if (firstOutputRow !== undefined && secondOutputRow !== undefined) {
+          expect(firstOutputRow.height).toBeGreaterThanOrEqual(28);
+          expect(secondOutputRow.height).toBeGreaterThanOrEqual(28);
+          expect(firstOutputRow.width).toBeGreaterThanOrEqual(560);
+          expect(secondOutputRow.width).toBeGreaterThanOrEqual(560);
+          expect(firstOutputRow.maxY).toBeLessThan(secondOutputRow.minY);
+        }
+
+        // 3. Recursive walk of every NSView in window.contentView asserts hasAmbiguousLayout == false
+        expect(report.sawDocumentView).toBe(true);
+        expect(report.visitedViewCount).toBeGreaterThanOrEqual(80);
+        expect(report.ambiguousViews).toEqual([]);
+        expect(report.horizontalOverflows).toEqual([]);
+      } finally {
+        await fsp.rm(tmpRoot, { recursive: true, force: true });
+      }
+    },
+    20_000,
+  );
+
+  it(
     'adversarially verifies live /heos/{token}/stream.flac RFC 9639 SUBFRAME_VERBATIM 24-bit framing, CRC-8/CRC-16, SEEKTABLE, VORBIS_COMMENT, HTTP 206 byte ranges, macOS CoreAudio afinfo/afconvert, and Host-MCU anti-standby invariants',
     async () => {
       const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'sc-heos-flac-qa-'));

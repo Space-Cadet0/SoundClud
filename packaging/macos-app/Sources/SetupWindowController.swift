@@ -7,9 +7,45 @@ private final class FlippedDocumentView: NSView {
     }
 }
 
+private final class CardContainerView: NSView {
+    override var wantsUpdateLayer: Bool {
+        return true
+    }
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.masksToBounds = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    override func updateLayer() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.masksToBounds = true
+        layer?.backgroundColor = isDark
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.055).cgColor
+            : NSColor(calibratedWhite: 0.0, alpha: 0.03).cgColor
+        layer?.borderColor = isDark
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.14).cgColor
+            : NSColor(calibratedWhite: 0.0, alpha: 0.11).cgColor
+    }
+}
+
 /// Native macOS AppKit controller for `"SoundClud — Hi-Fi Setup & Control"`.
 /// Built exclusively with AppKit/Foundation (`MACOSX_DEPLOYMENT_TARGET=11.0`, zero SwiftUI).
 final class SetupWindowController: NSWindowController {
+    private static let initialContentSize = NSSize(width: 720, height: 760)
+    private static let minimumWindowSize = NSSize(width: 660, height: 560)
+
     private let serviceManager: ReceiverServiceManager
     private let onSnapshotUpdated: (ServiceSnapshot) -> Void
 
@@ -21,7 +57,12 @@ final class SetupWindowController: NSWindowController {
     private let statusIndicatorImageView = NSImageView()
     private let statusProgressIndicator = NSProgressIndicator()
     private let statusBadgeLabel = NSTextField(labelWithString: "Checking receiver status…")
-    private let statusSubtitleLabel = NSTextField(wrappingLabelWithString: "")
+    private let statusSubtitleLabel = SetupWindowController.createWrappingLabel(
+        "",
+        size: 12,
+        weight: .regular,
+        color: .secondaryLabelColor
+    )
     private lazy var refreshButton = NSButton(
         title: "Refresh",
         target: self,
@@ -59,7 +100,12 @@ final class SetupWindowController: NSWindowController {
         target: self,
         action: #selector(handleInstallOrApplyClicked)
     )
-    private let installFeedbackLabel = NSTextField(wrappingLabelWithString: "")
+    private let installFeedbackLabel = SetupWindowController.createWrappingLabel(
+        "",
+        size: 12,
+        weight: .regular,
+        color: .secondaryLabelColor
+    )
 
     // Detected Outputs Card controls
     private let outputsStackView = NSStackView()
@@ -80,7 +126,12 @@ final class SetupWindowController: NSWindowController {
         target: self,
         action: #selector(handleOpenSoundCloud)
     )
-    private let browserConfirmationLabel = NSTextField(wrappingLabelWithString: "")
+    private let browserConfirmationLabel = SetupWindowController.createWrappingLabel(
+        "",
+        size: 12,
+        weight: .medium,
+        color: .systemGreen
+    )
 
     init(
         serviceManager: ReceiverServiceManager,
@@ -90,18 +141,20 @@ final class SetupWindowController: NSWindowController {
         self.onSnapshotUpdated = onSnapshotUpdated
 
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 690, height: 740),
+            contentRect: NSRect(origin: .zero, size: Self.initialContentSize),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         win.title = "SoundClud — Hi-Fi Setup & Control"
-        win.minSize = NSSize(width: 620, height: 600)
+        win.minSize = Self.minimumWindowSize
         win.isReleasedWhenClosed = false
-        win.center()
 
         super.init(window: win)
         buildUserInterface(in: win)
+        win.setContentSize(Self.initialContentSize)
+        win.contentView?.layoutSubtreeIfNeeded()
+        win.center()
         applyInitialDefaults()
     }
 
@@ -112,8 +165,36 @@ final class SetupWindowController: NSWindowController {
 
     // MARK: - UI Construction
 
+    private static func createWrappingLabel(
+        _ text: String,
+        size: CGFloat = 12,
+        weight: NSFont.Weight = .regular,
+        color: NSColor = .secondaryLabelColor
+    ) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: size, weight: weight)
+        label.textColor = color
+        label.lineBreakMode = .byWordWrapping
+        label.maximumNumberOfLines = 0
+        label.usesSingleLineMode = false
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
+        label.setContentHuggingPriority(.defaultHigh, for: .vertical)
+        return label
+    }
+
+    private func makeWrappingLabel(
+        _ text: String,
+        size: CGFloat = 12,
+        weight: NSFont.Weight = .regular,
+        color: NSColor = .secondaryLabelColor
+    ) -> NSTextField {
+        return Self.createWrappingLabel(text, size: size, weight: weight, color: color)
+    }
+
     private func buildUserInterface(in window: NSWindow) {
-        let scrollView = NSScrollView()
+        let scrollView = NSScrollView(frame: NSRect(origin: .zero, size: Self.initialContentSize))
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -137,14 +218,21 @@ final class SetupWindowController: NSWindowController {
         rootStack.orientation = .vertical
         rootStack.alignment = .leading
         rootStack.spacing = 14
+        rootStack.setHuggingPriority(.defaultHigh, for: .vertical)
 
         documentView.addSubview(rootStack)
 
-        let container = NSView()
+        let container = NSView(frame: NSRect(origin: .zero, size: Self.initialContentSize))
         container.addSubview(scrollView)
         window.contentView = container
 
         let clipView = scrollView.contentView
+        let fitDocumentHeight = documentView.bottomAnchor.constraint(
+            equalTo: rootStack.bottomAnchor,
+            constant: 22
+        )
+        fitDocumentHeight.priority = .fittingSizeCompression
+
         NSLayoutConstraint.activate([
             scrollView.topAnchor.constraint(equalTo: container.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -153,16 +241,18 @@ final class SetupWindowController: NSWindowController {
 
             documentView.topAnchor.constraint(equalTo: clipView.topAnchor),
             documentView.leadingAnchor.constraint(equalTo: clipView.leadingAnchor),
-            documentView.trailingAnchor.constraint(equalTo: clipView.trailingAnchor),
             documentView.widthAnchor.constraint(equalTo: clipView.widthAnchor),
+            documentView.heightAnchor.constraint(greaterThanOrEqualTo: clipView.heightAnchor),
 
             rootStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 20),
             rootStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 22),
             rootStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -22),
-            rootStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -22),
+            rootStack.bottomAnchor.constraint(lessThanOrEqualTo: documentView.bottomAnchor, constant: -22),
+            fitDocumentHeight,
         ])
 
         for arranged in rootStack.arrangedSubviews {
+            arranged.translatesAutoresizingMaskIntoConstraints = false
             arranged.widthAnchor.constraint(equalTo: rootStack.widthAnchor).isActive = true
         }
     }
@@ -172,6 +262,8 @@ final class SetupWindowController: NSWindowController {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.image = NSApp.applicationIconImage
         iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.setContentHuggingPriority(.required, for: .horizontal)
+        iconView.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             iconView.widthAnchor.constraint(equalToConstant: 44),
             iconView.heightAnchor.constraint(equalToConstant: 44),
@@ -179,99 +271,114 @@ final class SetupWindowController: NSWindowController {
 
         let versionString = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
         let titleLabel = NSTextField(labelWithString: "SoundClud — Hi-Fi Setup & Control")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = NSFont.systemFont(ofSize: 18, weight: .bold)
         titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        let subtitleLabel = NSTextField(
-            wrappingLabelWithString:
-                "0 dB Bit-Perfect 44.1 kHz / 24-bit Audio for Denon/Marantz HEOS & Optical S/PDIF (v\(versionString))"
+        let subtitleLabel = makeWrappingLabel(
+            "0 dB Bit-Perfect 44.1 kHz / 24-bit Audio for Denon/Marantz HEOS & Optical S/PDIF (v\(versionString))",
+            size: 12.5,
+            weight: .regular,
+            color: .secondaryLabelColor
         )
-        subtitleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
-        subtitleLabel.textColor = .secondaryLabelColor
 
         let textStack = NSStackView(views: [titleLabel, subtitleLabel])
+        textStack.translatesAutoresizingMaskIntoConstraints = false
         textStack.orientation = .vertical
+        textStack.distribution = .fill
         textStack.alignment = .leading
         textStack.spacing = 3
+        textStack.setHuggingPriority(.required, for: .vertical)
 
         let row = NSStackView(views: [iconView, textStack])
+        row.translatesAutoresizingMaskIntoConstraints = false
         row.orientation = .horizontal
+        row.distribution = .fill
         row.alignment = .centerY
         row.spacing = 12
+
+        NSLayoutConstraint.activate([
+            titleLabel.widthAnchor.constraint(equalTo: textStack.widthAnchor),
+            subtitleLabel.widthAnchor.constraint(equalTo: textStack.widthAnchor),
+        ])
+
         return row
     }
 
-    private func makeCardContainer(with contentStack: NSStackView) -> NSBox {
-        let box = NSBox()
-        box.translatesAutoresizingMaskIntoConstraints = false
-        box.boxType = .custom
-        box.titlePosition = .noTitle
-        box.cornerRadius = 10
-        box.borderWidth = 1
-        box.fillColor = NSColor(name: nil) { appearance in
-            if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
-                return NSColor(calibratedWhite: 1.0, alpha: 0.045)
-            }
-            return NSColor(calibratedWhite: 0.0, alpha: 0.028)
-        }
-        box.borderColor = NSColor(name: nil) { appearance in
-            if appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua {
-                return NSColor(calibratedWhite: 1.0, alpha: 0.12)
-            }
-            return NSColor(calibratedWhite: 0.0, alpha: 0.10)
-        }
-
-        let wrapper = NSView()
-        wrapper.translatesAutoresizingMaskIntoConstraints = false
+    private func makeCardContainer(with contentStack: NSStackView) -> NSView {
+        let card = CardContainerView()
         contentStack.translatesAutoresizingMaskIntoConstraints = false
-        wrapper.addSubview(contentStack)
-        box.contentView = wrapper
+        card.addSubview(contentStack)
 
         NSLayoutConstraint.activate([
-            contentStack.topAnchor.constraint(equalTo: wrapper.topAnchor, constant: 14),
-            contentStack.leadingAnchor.constraint(equalTo: wrapper.leadingAnchor, constant: 16),
-            contentStack.trailingAnchor.constraint(equalTo: wrapper.trailingAnchor, constant: -16),
-            contentStack.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor, constant: -14),
+            contentStack.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            contentStack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 16),
+            contentStack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -16),
+            contentStack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
         ])
 
-        return box
+        return card
     }
 
     private func makeSectionTitle(_ text: String) -> NSTextField {
         let label = NSTextField(labelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
         label.font = NSFont.systemFont(ofSize: 13.5, weight: .semibold)
         label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.required, for: .vertical)
         return label
     }
 
     private func makeStatusCard() -> NSView {
         statusIndicatorImageView.translatesAutoresizingMaskIntoConstraints = false
+        statusIndicatorImageView.setContentHuggingPriority(.required, for: .horizontal)
+        statusIndicatorImageView.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             statusIndicatorImageView.widthAnchor.constraint(equalToConstant: 16),
             statusIndicatorImageView.heightAnchor.constraint(equalToConstant: 16),
         ])
 
+        statusProgressIndicator.translatesAutoresizingMaskIntoConstraints = false
         statusProgressIndicator.style = .spinning
         statusProgressIndicator.controlSize = .small
         statusProgressIndicator.isDisplayedWhenStopped = false
+        statusProgressIndicator.isHidden = true
+        statusProgressIndicator.setContentHuggingPriority(.required, for: .horizontal)
+        statusProgressIndicator.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        statusBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
         statusBadgeLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .semibold)
         statusBadgeLabel.textColor = .labelColor
+        statusBadgeLabel.lineBreakMode = .byTruncatingTail
+        statusBadgeLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusBadgeLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let badgeRow = NSStackView(views: [
             statusProgressIndicator,
             statusIndicatorImageView,
             statusBadgeLabel,
         ])
+        badgeRow.translatesAutoresizingMaskIntoConstraints = false
         badgeRow.orientation = .horizontal
         badgeRow.alignment = .centerY
         badgeRow.spacing = 7
 
-        statusSubtitleLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        statusSubtitleLabel.textColor = .secondaryLabelColor
+        for btn in [refreshButton, viewLogsButton, uninstallButton] {
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.setContentHuggingPriority(.required, for: .horizontal)
+            btn.setContentCompressionResistancePriority(.required, for: .horizontal)
+            btn.setContentCompressionResistancePriority(.required, for: .vertical)
+        }
 
         let spacer = NSView()
+        spacer.translatesAutoresizingMaskIntoConstraints = false
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         let buttonRow = NSStackView(views: [
             refreshButton,
@@ -279,15 +386,23 @@ final class SetupWindowController: NSWindowController {
             spacer,
             uninstallButton,
         ])
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
         buttonRow.orientation = .horizontal
+        buttonRow.distribution = .fill
         buttonRow.alignment = .centerY
         buttonRow.spacing = 8
 
         let stack = NSStackView(views: [badgeRow, statusSubtitleLabel, buttonRow])
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            badgeRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            statusSubtitleLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
 
         return makeCardContainer(with: stack)
     }
@@ -295,48 +410,72 @@ final class SetupWindowController: NSWindowController {
     private func makeStepOneInstallCard() -> NSView {
         let title = makeSectionTitle("Step 1 — Receiver Audio Mode & One-Click Install")
 
+        heosDirectRadio.translatesAutoresizingMaskIntoConstraints = false
         heosDirectRadio.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        let heosHint = NSTextField(
-            wrappingLabelWithString:
-                "Instant offline setup with zero mpv download. Streams bit-perfect 44.1 kHz / 24-bit 0 dB WAV directly over LAN UPnP."
-        )
-        heosHint.font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
-        heosHint.textColor = .secondaryLabelColor
+        heosDirectRadio.lineBreakMode = .byTruncatingTail
+        heosDirectRadio.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        heosDirectRadio.setContentCompressionResistancePriority(.required, for: .vertical)
 
+        let heosHint = makeWrappingLabel(
+            "Instant offline setup with zero mpv download. Streams bit-perfect 44.1 kHz / 24-bit 0 dB Lossless FLAC directly over LAN UPnP.",
+            size: 11.5,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
+        let heosHintHolder = indentedView(heosHint, leading: 20)
+
+        opticalServerRadio.translatesAutoresizingMaskIntoConstraints = false
         opticalServerRadio.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        let opticalHint = NSTextField(
-            wrappingLabelWithString:
-                "Enables local CoreAudio S/PDIF optical output + LAN HEOS Direct. Downloads & SHA-256 verifies standalone mpv if needed."
+        opticalServerRadio.lineBreakMode = .byTruncatingTail
+        opticalServerRadio.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        opticalServerRadio.setContentCompressionResistancePriority(.required, for: .vertical)
+
+        let opticalHint = makeWrappingLabel(
+            "Enables local CoreAudio S/PDIF optical output + LAN HEOS Direct. Downloads & SHA-256 verifies standalone mpv if needed.",
+            size: 11.5,
+            weight: .regular,
+            color: .secondaryLabelColor
         )
-        opticalHint.font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
-        opticalHint.textColor = .secondaryLabelColor
+        let opticalHintHolder = indentedView(opticalHint, leading: 20)
 
+        keepAwakeCheckbox.translatesAutoresizingMaskIntoConstraints = false
         keepAwakeCheckbox.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        keepAwakeCheckbox.lineBreakMode = .byTruncatingTail
+        keepAwakeCheckbox.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        keepAwakeCheckbox.setContentCompressionResistancePriority(.required, for: .vertical)
 
+        primaryInstallButton.translatesAutoresizingMaskIntoConstraints = false
         primaryInstallButton.bezelStyle = .rounded
         primaryInstallButton.controlSize = .large
         primaryInstallButton.keyEquivalent = "\r"
         primaryInstallButton.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        primaryInstallButton.setContentCompressionResistancePriority(.required, for: .vertical)
 
-        installFeedbackLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        installFeedbackLabel.textColor = .secondaryLabelColor
         installFeedbackLabel.isHidden = true
 
         let stack = NSStackView(views: [
             title,
             heosDirectRadio,
-            indentedView(heosHint, leading: 20),
+            heosHintHolder,
             opticalServerRadio,
-            indentedView(opticalHint, leading: 20),
+            opticalHintHolder,
             keepAwakeCheckbox,
             primaryInstallButton,
             installFeedbackLabel,
         ])
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
         stack.setCustomSpacing(10, after: title)
         stack.setCustomSpacing(10, after: keepAwakeCheckbox)
+
+        NSLayoutConstraint.activate([
+            title.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            heosHintHolder.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            opticalHintHolder.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            installFeedbackLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
 
         return makeCardContainer(with: stack)
     }
@@ -344,15 +483,21 @@ final class SetupWindowController: NSWindowController {
     private func makeDetectedOutputsCard() -> NSView {
         let title = makeSectionTitle("Detected Hi-Fi Outputs")
 
+        outputsStackView.translatesAutoresizingMaskIntoConstraints = false
         outputsStackView.orientation = .vertical
         outputsStackView.alignment = .leading
         outputsStackView.spacing = 8
 
         let stack = NSStackView(views: [title, outputsStackView])
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 10
-        outputsStackView.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+
+        NSLayoutConstraint.activate([
+            title.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            outputsStackView.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
 
         populateOutputsPlaceholder(isReceiverRunning: false)
         return makeCardContainer(with: stack)
@@ -361,37 +506,58 @@ final class SetupWindowController: NSWindowController {
     private func makeStepTwoExtensionCard() -> NSView {
         let title = makeSectionTitle("Step 2 — Browser Extension Setup (Zero Terminal)")
 
-        let instructions = NSTextField(
-            wrappingLabelWithString:
-                "1. Click Copy \"chrome://extensions\" & Open Browser, press Cmd+V in your browser address bar, and turn on Developer mode (top-right).\n"
+        let instructions = makeWrappingLabel(
+            "1. Click Copy \"chrome://extensions\" & Open Browser, press Cmd+V in your browser address bar, and turn on Developer mode (top-right).\n"
                 + "2. Click Show Extension Folder in Finder and drag \"SoundClud Chrome Extension\" onto the Extensions page (or click Load unpacked).\n"
-                + "3. Open SoundCloud.com, click the SoundClud icon in your browser toolbar, and choose your Hi-Fi output."
+                + "3. Open SoundCloud.com, click the SoundClud icon in your browser toolbar, and choose your Hi-Fi output.",
+            size: 12,
+            weight: .regular,
+            color: .secondaryLabelColor
         )
-        instructions.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        instructions.textColor = .secondaryLabelColor
 
-        let buttonRow = NSStackView(views: [
+        for btn in [copyExtensionsButton, showExtensionFinderButton, openSoundCloudButton] {
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            btn.setContentHuggingPriority(.required, for: .horizontal)
+            btn.setContentCompressionResistancePriority(.required, for: .horizontal)
+            btn.setContentCompressionResistancePriority(.required, for: .vertical)
+        }
+
+        let setupButtonsRow = NSStackView(views: [
             copyExtensionsButton,
             showExtensionFinderButton,
+        ])
+        setupButtonsRow.translatesAutoresizingMaskIntoConstraints = false
+        setupButtonsRow.orientation = .horizontal
+        setupButtonsRow.alignment = .centerY
+        setupButtonsRow.spacing = 8
+
+        let buttonGroup = NSStackView(views: [
+            setupButtonsRow,
             openSoundCloudButton,
         ])
-        buttonRow.orientation = .horizontal
-        buttonRow.alignment = .centerY
-        buttonRow.spacing = 8
+        buttonGroup.translatesAutoresizingMaskIntoConstraints = false
+        buttonGroup.orientation = .vertical
+        buttonGroup.alignment = .leading
+        buttonGroup.spacing = 6
 
-        browserConfirmationLabel.font = NSFont.systemFont(ofSize: 12, weight: .medium)
-        browserConfirmationLabel.textColor = .systemGreen
         browserConfirmationLabel.isHidden = true
 
         let stack = NSStackView(views: [
             title,
             instructions,
-            buttonRow,
+            buttonGroup,
             browserConfirmationLabel,
         ])
+        stack.translatesAutoresizingMaskIntoConstraints = false
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 9
+
+        NSLayoutConstraint.activate([
+            title.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            instructions.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            browserConfirmationLabel.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
 
         return makeCardContainer(with: stack)
     }
@@ -444,6 +610,7 @@ final class SetupWindowController: NSWindowController {
         }
 
         statusProgressIndicator.stopAnimation(nil)
+        statusProgressIndicator.isHidden = true
         statusIndicatorImageView.isHidden = false
 
         if snapshot.isRunning {
@@ -496,6 +663,7 @@ final class SetupWindowController: NSWindowController {
 
         if busy {
             statusIndicatorImageView.isHidden = true
+            statusProgressIndicator.isHidden = false
             statusProgressIndicator.startAnimation(nil)
             statusBadgeLabel.stringValue = "Configuring…"
             if let msg = message {
@@ -503,6 +671,7 @@ final class SetupWindowController: NSWindowController {
             }
         } else {
             statusProgressIndicator.stopAnimation(nil)
+            statusProgressIndicator.isHidden = true
             statusIndicatorImageView.isHidden = false
         }
     }
@@ -529,30 +698,48 @@ final class SetupWindowController: NSWindowController {
             icon.translatesAutoresizingMaskIntoConstraints = false
             icon.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: output.name)
             icon.contentTintColor = output.isHeos ? .systemOrange : .controlAccentColor
+            icon.setContentHuggingPriority(.required, for: .horizontal)
+            icon.setContentCompressionResistancePriority(.required, for: .horizontal)
             NSLayoutConstraint.activate([
                 icon.widthAnchor.constraint(equalToConstant: 18),
                 icon.heightAnchor.constraint(equalToConstant: 18),
             ])
 
             let nameLabel = NSTextField(labelWithString: output.name)
+            nameLabel.translatesAutoresizingMaskIntoConstraints = false
             nameLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
             nameLabel.textColor = .labelColor
+            nameLabel.lineBreakMode = .byTruncatingTail
+            nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            nameLabel.setContentCompressionResistancePriority(.required, for: .vertical)
 
-            let detailLabel = NSTextField(wrappingLabelWithString: output.detailSubtitle)
-            detailLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .regular)
-            detailLabel.textColor = .secondaryLabelColor
+            let detailLabel = makeWrappingLabel(
+                output.detailSubtitle,
+                size: 11.5,
+                weight: .regular,
+                color: .secondaryLabelColor
+            )
 
             let textCol = NSStackView(views: [nameLabel, detailLabel])
+            textCol.translatesAutoresizingMaskIntoConstraints = false
             textCol.orientation = .vertical
             textCol.alignment = .leading
             textCol.spacing = 2
 
             let row = NSStackView(views: [icon, textCol])
+            row.translatesAutoresizingMaskIntoConstraints = false
             row.orientation = .horizontal
+            row.distribution = .fill
             row.alignment = .top
             row.spacing = 10
 
             outputsStackView.addArrangedSubview(row)
+
+            NSLayoutConstraint.activate([
+                nameLabel.widthAnchor.constraint(equalTo: textCol.widthAnchor),
+                detailLabel.widthAnchor.constraint(equalTo: textCol.widthAnchor),
+                row.widthAnchor.constraint(equalTo: outputsStackView.widthAnchor),
+            ])
         }
     }
 
@@ -560,10 +747,14 @@ final class SetupWindowController: NSWindowController {
         let text = isReceiverRunning
             ? "No outputs detected right now. Power on your Denon/Marantz HEOS amplifier or connect Optical TOSLINK, then click Refresh."
             : "Install and start the receiver above to discover Denon/Marantz HEOS amplifiers and Optical TOSLINK outputs."
-        let placeholder = NSTextField(wrappingLabelWithString: text)
-        placeholder.font = NSFont.systemFont(ofSize: 12, weight: .regular)
-        placeholder.textColor = .secondaryLabelColor
+        let placeholder = makeWrappingLabel(
+            text,
+            size: 12,
+            weight: .regular,
+            color: .secondaryLabelColor
+        )
         outputsStackView.addArrangedSubview(placeholder)
+        placeholder.widthAnchor.constraint(equalTo: outputsStackView.widthAnchor).isActive = true
     }
 
     // MARK: - Actions
