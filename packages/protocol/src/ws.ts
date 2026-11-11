@@ -70,6 +70,13 @@ export interface SelectOutputWsCommand {
   readonly outputId: string;
 }
 
+export interface SetVolumeWsCommand {
+  readonly type: 'set_volume';
+  readonly commandSeq: number;
+  readonly volume?: number | undefined;
+  readonly muted?: boolean | undefined;
+}
+
 export interface RefreshLocatorResponseWsCommand {
   readonly type: 'refresh_locator_response';
   readonly requestId: string;
@@ -90,6 +97,7 @@ export type ClientWsCommand =
   | PreloadNextWsCommand
   | StopWsCommand
   | SelectOutputWsCommand
+  | SetVolumeWsCommand
   | RefreshLocatorResponseWsCommand
   | PingWsCommand;
 
@@ -116,6 +124,13 @@ export interface OutputsUpdatedWsEvent {
   readonly type: 'outputs_updated';
   readonly activeOutputId?: string;
   readonly outputs: readonly OutputDevice[];
+}
+
+export interface VolumeChangedWsEvent {
+  readonly type: 'volume_changed';
+  readonly volume: number;
+  readonly muted: boolean;
+  readonly outputId?: string;
 }
 
 export interface TrackEndedWsEvent {
@@ -155,6 +170,7 @@ export type ServerWsEvent =
   | WelcomeWsEvent
   | StateTickWsEvent
   | OutputsUpdatedWsEvent
+  | VolumeChangedWsEvent
   | TrackEndedWsEvent
   | RefreshLocatorRequestWsEvent
   | SessionClaimedWsEvent

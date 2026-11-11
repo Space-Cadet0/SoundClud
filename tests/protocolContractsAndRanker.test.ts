@@ -13,12 +13,15 @@ import {
   parseAudioDevicesResponse,
   parseClientWsCommand,
   parseDiscoverResponse,
+  parseGetVolumeResponse,
   parseOutputDevice,
   parsePairRequest,
   parsePairResponse,
   parsePlaybackTelemetry,
   parseReceiverConfig,
   parseServerWsEvent,
+  parseSetVolumeRequest,
+  parseSetVolumeResponse,
   parseStatusResponse,
   parseStreamLocatorPayload,
   parseUpdateConfigRequest,
@@ -633,7 +636,10 @@ describe('@soundclud/protocol — Runtime Wire Validators & Bit-Perfect Invarian
       }).ok,
     ).toBe(true);
     expect(parseClientWsCommand({ type: 'ping', clientTimestampMs: 123_456 }).ok).toBe(true);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 1, volume: 50 }).ok).toBe(true);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 1, volume: 50, muted: false }).ok).toBe(true);
     expect(parseClientWsCommand({ type: 'set_volume', volume: 50 }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 1, volume: 150 }).ok).toBe(false);
 
     const baseTelemetry = {
       protocolVersion: PROTOCOL_VERSION,
@@ -693,6 +699,14 @@ describe('@soundclud/protocol — Runtime Wire Validators & Bit-Perfect Invarian
     if (outputsUpdated.ok && outputsUpdated.value.type === 'outputs_updated') {
       expect('activeOutputId' in outputsUpdated.value).toBe(false);
     }
+
+    expect(
+      parseServerWsEvent({
+        type: 'volume_changed',
+        volume: 42,
+        muted: false,
+      }).ok,
+    ).toBe(true);
 
     expect(
       parseServerWsEvent({
@@ -816,5 +830,125 @@ describe('@soundclud/protocol — Runtime Wire Validators & Bit-Perfect Invarian
     expect(parsePlaybackTelemetry({ ...validTel, fixedGainDb: -6 }).ok).toBe(false);
     expect(parsePlaybackTelemetry({ ...validTel, sampleRateHz: 48000 }).ok).toBe(false);
     expect(parsePlaybackTelemetry({ ...validTel, bitDepth: 16 }).ok).toBe(false);
+  });
+
+  it('validates decoupled SetVolumeWsCommand and SetVolumeRequest with strict invariants', () => {
+    // 1. WebSocket: Volume-only valid
+    const volOnlyWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 1, volume: 45 });
+    expect(volOnlyWs.ok).toBe(true);
+    if (volOnlyWs.ok && volOnlyWs.value.type === 'set_volume') {
+      expect(volOnlyWs.value.volume).toBe(45);
+      expect('muted' in volOnlyWs.value).toBe(false);
+    }
+
+    // 2. WebSocket: Mute-only valid (true and false)
+    const muteTrueWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 2, muted: true });
+    expect(muteTrueWs.ok).toBe(true);
+    if (muteTrueWs.ok && muteTrueWs.value.type === 'set_volume') {
+      expect(muteTrueWs.value.muted).toBe(true);
+      expect('volume' in muteTrueWs.value).toBe(false);
+    }
+
+    const muteFalseWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 3, muted: false });
+    expect(muteFalseWs.ok).toBe(true);
+    if (muteFalseWs.ok && muteFalseWs.value.type === 'set_volume') {
+      expect(muteFalseWs.value.muted).toBe(false);
+      expect('volume' in muteFalseWs.value).toBe(false);
+    }
+
+    // 3. WebSocket: Both fields valid + boundaries 0 and 100
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 4, volume: 0, muted: true }).ok).toBe(true);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 5, volume: 100, muted: false }).ok).toBe(true);
+
+    // 4. WebSocket: Null normalization
+    const nullNormWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 6, volume: 50, muted: null });
+    expect(nullNormWs.ok).toBe(true);
+    if (nullNormWs.ok && nullNormWs.value.type === 'set_volume') {
+      expect(nullNormWs.value.volume).toBe(50);
+      expect('muted' in nullNormWs.value).toBe(false);
+    }
+
+    // 5. WebSocket: Neither provided (invalid)
+    const neitherWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 7 });
+    expect(neitherWs.ok).toBe(false);
+    if (!neitherWs.ok) {
+      expect(neitherWs.error).toContain('either volume or muted must be provided');
+    }
+
+    const bothNullWs = parseClientWsCommand({ type: 'set_volume', commandSeq: 8, volume: null, muted: null });
+    expect(bothNullWs.ok).toBe(false);
+    if (!bothNullWs.ok) {
+      expect(bothNullWs.error).toContain('either volume or muted must be provided');
+    }
+
+    // 6. WebSocket: Invalid volume types and bounds
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 9, volume: 101 }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 10, volume: -1 }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 11, volume: 45.5 }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 12, volume: Number.NaN }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 13, volume: '50' }).ok).toBe(false);
+
+    // 7. WebSocket: Invalid muted types
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 14, volume: 50, muted: 'true' }).ok).toBe(false);
+    expect(parseClientWsCommand({ type: 'set_volume', commandSeq: 15, muted: 1 }).ok).toBe(false);
+
+    // 8. REST: parseSetVolumeRequest valid cases
+    const volOnlyRest = parseSetVolumeRequest({ volume: 45 });
+    expect(volOnlyRest.ok).toBe(true);
+    if (volOnlyRest.ok) {
+      expect(volOnlyRest.value.volume).toBe(45);
+      expect('muted' in volOnlyRest.value).toBe(false);
+    }
+
+    const muteOnlyRest = parseSetVolumeRequest({ muted: true });
+    expect(muteOnlyRest.ok).toBe(true);
+    if (muteOnlyRest.ok) {
+      expect(muteOnlyRest.value.muted).toBe(true);
+      expect('volume' in muteOnlyRest.value).toBe(false);
+    }
+
+    const bothRest = parseSetVolumeRequest({ volume: 75, muted: false, outputId: 'heos/pm7000n' });
+    expect(bothRest.ok).toBe(true);
+    if (bothRest.ok) {
+      expect(bothRest.value.volume).toBe(75);
+      expect(bothRest.value.muted).toBe(false);
+      expect(bothRest.value.outputId).toBe('heos/pm7000n');
+    }
+
+    // 9. REST: parseSetVolumeRequest invalid cases
+    expect(parseSetVolumeRequest({}).ok).toBe(false);
+    expect(parseSetVolumeRequest({ outputId: 'heos/pm7000n' }).ok).toBe(false);
+    expect(parseSetVolumeRequest({ volume: 105 }).ok).toBe(false);
+    expect(parseSetVolumeRequest({ volume: -5 }).ok).toBe(false);
+    expect(parseSetVolumeRequest({ muted: 'true' }).ok).toBe(false);
+
+    // 10. REST: parseGetVolumeResponse & parseSetVolumeResponse
+    const getVol = parseGetVolumeResponse({
+      protocolVersion: PROTOCOL_VERSION,
+      volume: 45,
+      muted: false,
+      supportsHardwareVolume: true,
+      outputId: 'heos/pm7000n',
+    });
+    expect(getVol.ok).toBe(true);
+    if (getVol.ok) {
+      expect(getVol.value.volume).toBe(45);
+      expect(getVol.value.muted).toBe(false);
+      expect(getVol.value.supportsHardwareVolume).toBe(true);
+      expect(getVol.value.outputId).toBe('heos/pm7000n');
+    }
+
+    const setVol = parseSetVolumeResponse({
+      protocolVersion: PROTOCOL_VERSION,
+      volume: 50,
+      muted: true,
+      supportsHardwareVolume: true,
+    });
+    expect(setVol.ok).toBe(true);
+    if (setVol.ok) {
+      expect(setVol.value.volume).toBe(50);
+      expect(setVol.value.muted).toBe(true);
+      expect(setVol.value.supportsHardwareVolume).toBe(true);
+    }
   });
 });

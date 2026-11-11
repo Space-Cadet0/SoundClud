@@ -2216,17 +2216,18 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
         expect(capturedDidlXml).toContain('<upnp:artist>SoundCloud</upnp:artist>');
         expect(capturedDidlXml).toContain('http-get:*:audio/flac:DLNA.ORG_OP=01;');
 
-        // Verify Host-MCU woke FIRST (`PW? -> PWON -> SI? -> SINET -> SLP? -> SLPOFF`), ACT woke once, and CLI bound pid=99
-        expect(mcuCommands.slice(0, 6)).toEqual(['PW?', 'PWON', 'SI?', 'SINET', 'SLP?', 'SLPOFF']);
+        // Verify Host-MCU woke FIRST (`PW? -> PWON -> SI? -> SINET`), ACT woke once, and CLI bound pid=99
+        expect(mcuCommands.slice(0, 4)).toEqual(['PW?', 'PWON', 'SI?', 'SINET']);
+        expect(mcuCommands.filter((c) => c === 'SLPOFF' || c === 'SLP?')).toHaveLength(0);
         expect(setPowerStateOnCalls).toBe(1);
         const playAssertDeadline = Date.now() + 1_000;
         while (
           Date.now() < playAssertDeadline &&
-          !cliCommands.includes('heos://player/set_play_state?pid=99&state=play')
+          !cliCommands.includes('heos://player/get_play_state?pid=99')
         ) {
           await new Promise<void>((r) => setTimeout(r, 20));
         }
-        expect(cliCommands).toContain('heos://player/set_play_state?pid=99&state=play');
+        expect(cliCommands).toContain('heos://player/get_play_state?pid=99');
 
         // Forged capability token must be rejected with HTTP 403
         const forgedRes = await fetch(`${baseUrl}/heos/forged_capability_token/stream.flac`);
@@ -2341,8 +2342,8 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
         expect(sawVorbisComment).toBe(true);
         expect(vorbisComments).toContain('TITLE=SoundCloud Track');
         expect(vorbisComments).toContain('ARTIST=SoundCloud');
-        expect(vorbisComments).toContain('ALBUM=SoundCloud');
-        expect(vorbisComments).toContain('GENRE=Music');
+        expect(vorbisComments).not.toContain('ALBUM=SoundCloud');
+        expect(vorbisComments).not.toContain('GENRE=Music');
 
         // Independent CRC-8 (poly 0x07) & CRC-16 (poly 0x8005) tables
         const crc8Table = new Uint8Array(256);
@@ -2548,7 +2549,7 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
         }
 
         // Verify keepalive cannot be starved by repeated seeks (< 140ms keepalive_interval)
-        const slpoffBefore = mcuCommands.filter((c) => c === 'SLPOFF').length;
+        const pwQueriesBefore = mcuCommands.filter((c) => c === 'PW?').length;
         const heartbeatsBefore = cliCommands.filter((c) => c.includes('heart_beat')).length;
         for (let step = 0; step < 3; step += 1) {
           await new Promise<void>((r) => setTimeout(r, 55));
@@ -2559,7 +2560,8 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
           });
         }
         await new Promise<void>((r) => setTimeout(r, 90));
-        expect(mcuCommands.filter((c) => c === 'SLPOFF').length).toBeGreaterThan(slpoffBefore);
+        expect(mcuCommands.filter((c) => c === 'PW?').length).toBeGreaterThan(pwQueriesBefore);
+        expect(mcuCommands.filter((c) => c === 'SLPOFF' || c === 'SLP?')).toHaveLength(0);
         expect(cliCommands.filter((c) => c.includes('heart_beat')).length).toBeGreaterThan(
           heartbeatsBefore,
         );
@@ -2589,7 +2591,7 @@ describe('Cross-Language Extension <-> Rust Receiver E2E & Offline Packaging Ver
         expect(renderingControlHits).toBe(0);
         expect(mcuCommands.some((c) => c.startsWith('MV') || c.startsWith('MU'))).toBe(false);
         expect(
-          cliCommands.some((c) => c.toLowerCase().includes('volume') || c.toLowerCase().includes('mute')),
+          cliCommands.some((c) => c.toLowerCase().includes('set_volume') || c.toLowerCase().includes('set_mute')),
         ).toBe(false);
         expect(
           soapActions.some((a) => a.toLowerCase().includes('volume') || a.toLowerCase().includes('mute')),

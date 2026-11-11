@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  API_V1_AUDIO_VOLUME_PATH,
   HEOS_SEEK_DEBOUNCE_MS,
   PROTOCOL_VERSION,
   TOSLINK_SEEK_DEBOUNCE_MS,
@@ -12,6 +13,10 @@ import {
   attachMainWorldNonceBridge,
   BRIDGE_BOOTSTRAP_ATTR,
   BRIDGE_BOOTSTRAP_EVENT,
+  clickSoundCloudTransportButton,
+  ConnectedDomCache,
+  createDefaultDurableLocalConfig,
+  createDefaultEphemeralSessionState,
   createInMemoryStorageArea,
   createIsolatedWorldNonceBridge,
   ExtensionBackgroundCoordinator,
@@ -24,7 +29,10 @@ import {
   parseOAuthTokenFromAuthorizationHeader,
   parseOAuthTokenFromCookieString,
   promoteSoundCloudLocalSettingsToHq,
+  querySoundCloudPlayerTitleHint,
+  readDurableLocalConfig,
   readEphemeralSessionState,
+  ReceiverWsController,
   SeekDebouncer,
   SOUNDCLOUD_LOCAL_SETTINGS_KEY,
   SoundCloudSessionObserver,
@@ -35,6 +43,7 @@ import {
   type IsolatedToMainMessage,
   type MainToIsolatedMessage,
   type MinimalKeyValueStorage,
+  type MinimalWebSocket,
   type NativeMediaBridge,
 } from '@soundclud/extension';
 
@@ -1738,7 +1747,7 @@ describe('MV3 Manifest, PNG Icon IHDR & Zero-Volume-Mutation Rust Static Audit',
     }
   });
 
-  it('asserts ZERO set_volume (HEOS CLI) and ZERO SetVolume (UPnP RenderingControl) volume-mutation calls exist in crates/receiver/src/', () => {
+  it('asserts ZERO UPnP RenderingControl / SetVolume calls exist in crates/receiver/src/ and restricts HEOS CLI set_volume to hardware volume control', () => {
     const receiverSrcRoot = path.join(REPO_ROOT, 'crates', 'receiver', 'src');
     const rustFiles: string[] = [];
 
@@ -1756,20 +1765,542 @@ describe('MV3 Manifest, PNG Icon IHDR & Zero-Volume-Mutation Rust Static Audit',
     expect(rustFiles.length).toBeGreaterThan(0);
 
     const violations: string[] = [];
-    const forbiddenVolumePattern = /\b(?:set_volume|SetVolume)\b|heos:\/\/player\/set_volume|RenderingControl/;
+    const forbiddenUniversalPattern = /#(?:SetVolume|SetMute)|<(?:SetVolume|SetMute)\b|RenderingControl/;
+    const allowedHardwareVolumeFiles = new Set<string>([
+      'crates/receiver/src/backends/heos_mcu.rs',
+      'crates/receiver/src/backends/heos_upnp.rs',
+      'crates/receiver/src/coordinator.rs',
+      'crates/receiver/src/protocol_ws.rs',
+      'crates/receiver/src/server.rs',
+      'crates/receiver/src/ws_handler.rs',
+    ]);
 
     for (const filePath of rustFiles) {
+      const rel = path.relative(REPO_ROOT, filePath).split(path.sep).join('/');
       const content = fs.readFileSync(filePath, 'utf8');
       const lines = content.split(/\r?\n/);
       for (let i = 0; i < lines.length; i += 1) {
         const line = lines[i] ?? '';
-        if (forbiddenVolumePattern.test(line)) {
-          const rel = path.relative(REPO_ROOT, filePath).split(path.sep).join('/');
-          violations.push(`${rel}:${String(i + 1)}`);
+        if (line.trimStart().startsWith('//')) {
+          continue;
+        }
+        if (forbiddenUniversalPattern.test(line)) {
+          violations.push(`${rel}:${String(i + 1)} (forbidden UPnP RenderingControl/SetVolume)`);
+        } else if (
+          !allowedHardwareVolumeFiles.has(rel) &&
+          (/\b(?:set_volume|SetVolume)\b/.test(line) || line.includes('heos://player/set_volume'))
+        ) {
+          violations.push(`${rel}:${String(i + 1)} (unauthorized volume mutation outside hardware modules)`);
         }
       }
     }
 
     expect(violations).toEqual([]);
+  });
+});
+
+describe('@soundclud/extension & @soundclud/protocol — Remote HEOS Hardware Master Volume Invariants', () => {
+  it('validates dedicated amplifier master volume UI elements exist in popup.html', () => {
+    const popupHtmlPath = path.join(
+      REPO_ROOT,
+      'packages',
+      'extension',
+      'src',
+      'popup',
+      'popup.html',
+    );
+    const html = fs.readFileSync(popupHtmlPath, 'utf8');
+
+    expect(html).toContain('id="amp-volume-card"');
+    expect(html).toContain('id="amp-volume-slider"');
+    expect(html).toContain('id="amp-volume-label"');
+    expect(html).toContain('id="amp-mute-btn"');
+    expect(html).toContain('id="amp-vol-down-btn"');
+    expect(html).toContain('id="amp-vol-up-btn"');
+    expect(html).toContain('Amplifier Master Volume');
+  });
+
+  it('verifies REST /api/v1/audio/volume endpoint contract constant and schema', () => {
+    expect(API_V1_AUDIO_VOLUME_PATH).toBe('/api/v1/audio/volume');
+  });
+
+  it('asserts native web player slider mutations are decoupled to prevent acoustic shock', () => {
+    const storage = new InMemoryKeyValueStorage();
+    const observer = new SoundCloudSessionObserver(storage);
+    observer.ingestHydration([{ hydratable: 'apiClient', data: { id: 'cid_maestro_volume_test' } }]);
+    observer.observeApiRequest('https://api-v2.soundcloud.com/me', {
+      Authorization: 'OAuth synthetic_test_token_maestro_vol',
+    });
+
+    const catalog = new SoundCloudTrackCatalog();
+    catalog.ingestPayload(makePlayableTrackPayload('701', 'Bit-Perfect Decoupled Volume Test Track'));
+
+    const outboundMessages: MainToIsolatedMessage[] = [];
+
+    const controller = new MaestroVirtualizerController({
+      catalog,
+      sessionObserver: observer,
+      sendToIsolated: (msg) => {
+        outboundMessages.push(msg);
+      },
+      nativeBridge: {
+        pauseElement: () => {},
+        getNativeCurrentTimeSeconds: () => 0,
+        getNativePaused: () => true,
+      },
+    });
+
+    // Synchronize into remote handoff mode (e.g. streaming to Marantz PM7000N)
+    controller.handleIsolatedMessage({
+      type: 'sync_runtime_state',
+      handoffEnabled: true,
+      seekDebounceMs: TOSLINK_SEEK_DEBOUNCE_MS,
+      connectionState: 'connected',
+      lastAckedCommandSeq: 0,
+    });
+
+    const mediaEl = new EventTarget();
+    const playOutcome = controller.interceptPlay(mediaEl);
+    expect(playOutcome.handledRemotely).toBe(true);
+    expect(controller.getMode()).toBe('remote');
+
+    // Flush initial playback negotiation messages
+    outboundMessages.length = 0;
+
+    // Simulate native web player slider movement (e.g. dragging SoundCloud volume to 25% and muting)
+    controller.recordLocalUiVolumeMutation(0.25, true);
+
+    // 1. Invariant: local virtual volume tracks mutations so native UI does not crash or desynchronize
+    expect(controller.getVirtualVolume()).toBe(0.25);
+    expect(controller.getVirtualMuted()).toBe(true);
+
+    // 2. Law 1 Invariant: web player UI volume changes are decoupled from remote hardware volume
+    // Zero messages emitted across the isolated bridge; remote amplifier master volume is never altered by web player slider!
+    expect(outboundMessages).toHaveLength(0);
+    const remoteVolumeCommands = outboundMessages.filter(
+      (msg) =>
+        (msg as { type?: string }).type === 'set_volume' ||
+        (msg as { type?: string }).type === 'request_set_volume',
+    );
+    expect(remoteVolumeCommands).toHaveLength(0);
+
+    // 3. Acoustic Shock Invariant: subsequent slider jumps (e.g. slamming slider to 100% and unmuting)
+    controller.recordLocalUiVolumeMutation(1.0, false);
+    expect(controller.getVirtualVolume()).toBe(1.0);
+    expect(controller.getVirtualMuted()).toBe(false);
+    expect(outboundMessages).toHaveLength(0);
+  });
+
+  it('verifies popup volume slider debounces drag ticks by 100ms and receiver serializes CLI volume commands via cli_command_lock', () => {
+    const popupTsPath = path.join(
+      REPO_ROOT,
+      'packages',
+      'extension',
+      'src',
+      'popup',
+      'popup.ts',
+    );
+    const popupTs = fs.readFileSync(popupTsPath, 'utf8');
+
+    expect(popupTs).toContain('const SLIDER_DEBOUNCE_MS = 100;');
+    expect(popupTs).toContain('debouncedSendVolumeCommand(val);');
+    expect(popupTs).toContain('clearTimeout(sliderDebounceTimer);');
+
+    const heosUpnpPath = path.join(
+      REPO_ROOT,
+      'crates',
+      'receiver',
+      'src',
+      'backends',
+      'heos_upnp.rs',
+    );
+    const heosUpnpRs = fs.readFileSync(heosUpnpPath, 'utf8');
+
+    expect(heosUpnpRs).toContain('cli_command_lock: Mutex<()>,');
+    expect(heosUpnpRs).toContain('let _guard = self.cli_command_lock.lock().await;');
+  });
+
+  describe('ReceiverWsController — mDNS IP failover & reconnect timer guard', () => {
+    it('prioritizes discovered mDNS endpointBaseUrl for activeReceiverId over stale persisted activeEndpointBaseUrl', async () => {
+      const storage = {
+        local: createInMemoryStorageArea(),
+        session: createInMemoryStorageArea(),
+      };
+
+      await updateDurableLocalConfig(storage.local, () => ({
+        ...createDefaultDurableLocalConfig('sc-ext-test-controller'),
+        clientLabel: 'Test Controller',
+        handoffEnabled: true,
+        activeReceiverId: 'rcv_monterey',
+        activeEndpointBaseUrl: 'http://127.0.0.1:9876', // Stale persisted URL
+        pairingTokensByReceiverId: {
+          rcv_monterey: 'test_token_123',
+        },
+      }));
+
+      // Discovered receivers list discovers rcv_monterey on fresh port 9877 (e.g. DHCP/port change)
+      await updateEphemeralSessionState(storage.session, () => ({
+        ...createDefaultEphemeralSessionState(),
+        discoveredReceivers: [
+          {
+            receiverId: 'rcv_monterey',
+            endpointBaseUrl: 'http://127.0.0.1:9877', // Fresh discovered URL
+            host: '127.0.0.1',
+            port: 9877,
+            receiverName: 'Monterey Mac',
+            isLoopback: true,
+            requiresPairing: false,
+            outputs: [],
+            discoveredAtMs: Date.now(),
+          },
+        ],
+      }));
+
+      const openedUrls: string[] = [];
+      const mockWsFactory = (url: string): MinimalWebSocket => {
+        openedUrls.push(url);
+        const listeners = new Map<string, Array<(event: unknown) => void>>();
+        const ws: MinimalWebSocket = {
+          readyState: 0,
+          send: vi.fn(),
+          close: vi.fn(),
+          addEventListener: (type, listener) => {
+            const list = listeners.get(type) ?? [];
+            list.push(listener);
+            listeners.set(type, list);
+          },
+        };
+        setTimeout(() => {
+          (ws as { readyState: number }).readyState = 1;
+          for (const l of listeners.get('open') ?? []) l({});
+          for (const l of listeners.get('message') ?? []) {
+            l({
+              data: JSON.stringify({
+                type: 'welcome',
+                receiverId: 'rcv_monterey',
+                receiverName: 'Monterey Mac',
+                controllerId: 'ctrl_test_1',
+                protocolVersion: PROTOCOL_VERSION,
+                config: {
+                  volumeMode: 'bit_perfect',
+                  opticalIdleKeepalive: true,
+                  opticalDitherSubaudible: false,
+                },
+                outputs: [],
+                telemetry: {
+                  protocolVersion: PROTOCOL_VERSION,
+                  serverSeq: 1,
+                  phase: 'idle',
+                  volumeMode: 'bit_perfect',
+                  fixedGainDb: 0,
+                  sampleRateHz: 44100,
+                  bitDepth: 24,
+                  positionMs: 0,
+                  durationMs: 0,
+                  bufferedMs: 0,
+                  timestampMs: Date.now(),
+                },
+              }),
+            });
+          }
+        }, 10);
+        return ws;
+      };
+
+      const controller = new ReceiverWsController({
+        storage,
+        createWebSocket: mockWsFactory,
+        onStateChanged: () => undefined,
+        onForwardToMain: () => undefined,
+      });
+
+      const connected = await controller.ensureConnected();
+      expect(connected).toBe(true);
+
+      // Invariant: Controller MUST connect to the freshly discovered port 9877, NOT stale 9876!
+      expect(openedUrls).toEqual(['ws://127.0.0.1:9877/api/v1/ws']);
+
+      // Invariant: Durable storage is healed to the fresh endpointBaseUrl upon welcome
+      const updatedLocal = await readDurableLocalConfig(storage.local);
+      expect(updatedLocal.activeEndpointBaseUrl).toBe('http://127.0.0.1:9877');
+
+      await controller.disconnect();
+    });
+
+    it('cancels pending reconnectTimer upon imperative ensureConnected() invocation', async () => {
+      vi.useFakeTimers();
+      try {
+        const storage = {
+          local: createInMemoryStorageArea(),
+          session: createInMemoryStorageArea(),
+        };
+
+        await updateDurableLocalConfig(storage.local, () => ({
+          ...createDefaultDurableLocalConfig('sc-ext-test-controller'),
+          clientLabel: 'Test Controller',
+          handoffEnabled: true,
+          activeReceiverId: 'rcv_monterey',
+          activeEndpointBaseUrl: 'http://127.0.0.1:9876',
+          pairingTokensByReceiverId: {
+            rcv_monterey: 'test_token_123',
+          },
+        }));
+
+        const closeHandlerRef: { current: (() => void) | null } = { current: null };
+        let connectionAttempts = 0;
+
+        const mockWsFactory = (url: string): MinimalWebSocket => {
+          connectionAttempts += 1;
+          const listeners = new Map<string, Array<(event: unknown) => void>>();
+          const ws: MinimalWebSocket = {
+            readyState: 0,
+            send: vi.fn(),
+            close: vi.fn(),
+            addEventListener: (type, listener) => {
+              const list = listeners.get(type) ?? [];
+              list.push(listener);
+              listeners.set(type, list);
+            },
+          };
+
+          setTimeout(() => {
+            (ws as { readyState: number }).readyState = 1;
+            closeHandlerRef.current = () => {
+              for (const l of listeners.get('close') ?? []) l({});
+            };
+            for (const l of listeners.get('open') ?? []) l({});
+            for (const l of listeners.get('message') ?? []) {
+              l({
+                data: JSON.stringify({
+                  type: 'welcome',
+                  receiverId: 'rcv_monterey',
+                  receiverName: 'Monterey Mac',
+                  controllerId: 'ctrl_test_1',
+                  protocolVersion: PROTOCOL_VERSION,
+                  config: {
+                    volumeMode: 'bit_perfect',
+                    opticalIdleKeepalive: true,
+                    opticalDitherSubaudible: false,
+                  },
+                  outputs: [],
+                  telemetry: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    serverSeq: 1,
+                    phase: 'idle',
+                    volumeMode: 'bit_perfect',
+                    fixedGainDb: 0,
+                    sampleRateHz: 44100,
+                    bitDepth: 24,
+                    positionMs: 0,
+                    durationMs: 0,
+                    bufferedMs: 0,
+                    timestampMs: Date.now(),
+                  },
+                }),
+              });
+            }
+          }, 0);
+          return ws;
+        };
+
+        const controller = new ReceiverWsController({
+          storage,
+          createWebSocket: mockWsFactory,
+          onStateChanged: () => undefined,
+          onForwardToMain: () => undefined,
+        });
+
+        // Initial connect
+        const initialConnectPromise = controller.ensureConnected();
+        await vi.runAllTimersAsync();
+        const connected = await initialConnectPromise;
+        expect(connected).toBe(true);
+        expect(connectionAttempts).toBe(1);
+
+        // Simulate unexpected drop
+        expect(closeHandlerRef.current).not.toBeNull();
+        closeHandlerRef.current?.();
+        // Wait for inboundChain and handleUnexpectedClose to complete microtasks
+        for (let i = 0; i < 20; i++) {
+          await Promise.resolve();
+        }
+
+        // After unexpected close, scheduleReconnect() sets a reconnectTimer (250ms)
+        expect(controller.hasPendingReconnectTimer()).toBe(true);
+
+        // Imperative invocation (e.g. user clicks Play or popup opens) before timer fires
+        const imperativeConnectPromise = controller.ensureConnected();
+
+        // Invariant: imperative ensureConnected() MUST cancel the pending reconnectTimer immediately
+        expect(controller.hasPendingReconnectTimer()).toBe(false);
+
+        await vi.runAllTimersAsync();
+        await imperativeConnectPromise;
+
+        // Verify that advancing time does NOT fire duplicate reconnect attempts
+        await vi.advanceTimersByTimeAsync(10_000);
+        expect(controller.hasPendingReconnectTimer()).toBe(false);
+        expect(connectionAttempts).toBe(2);
+
+        await controller.disconnect();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  describe('ConnectedDomCache & Player-Bar DOM Lookups', () => {
+    it('provides O(1) steady-state lookups and validates .isConnected on each query', () => {
+      let querySelectorCallCount = 0;
+      let titleAnchorConnected = true;
+
+      const mockAnchor = {
+        isConnected: true,
+        getAttribute: (attr: string) => {
+          if (attr === 'href') return '/artist-foo/track-bar';
+          if (attr === 'title') return 'Track Bar Title';
+          return null;
+        },
+        textContent: 'Track Bar Title',
+      } as unknown as HTMLAnchorElement;
+
+      const mockDoc: Pick<Document, 'querySelector' | 'querySelectorAll'> = {
+        querySelector: (selector: string) => {
+          querySelectorCallCount += 1;
+          if (selector === '.playbackSoundBadge__titleLink' && titleAnchorConnected) {
+            return mockAnchor;
+          }
+          return null;
+        },
+        querySelectorAll: () => [] as unknown as NodeListOf<HTMLAnchorElement>,
+      };
+
+      const cache = new ConnectedDomCache(mockDoc);
+
+      // First query: cache miss -> document.querySelector called
+      const first = cache.query<HTMLAnchorElement>('.playbackSoundBadge__titleLink');
+      expect(first).toBe(mockAnchor);
+      expect(querySelectorCallCount).toBe(1);
+      expect(cache.size()).toBe(1);
+
+      // Subsequent 10 queries during steady state: cache hits -> O(1), zero querySelector calls
+      for (let i = 0; i < 10; i++) {
+        const next = cache.query<HTMLAnchorElement>('.playbackSoundBadge__titleLink');
+        expect(next).toBe(mockAnchor);
+      }
+      expect(querySelectorCallCount).toBe(1);
+
+      // Element detaches from DOM (e.g. SoundCloud SPA re-renders badge)
+      titleAnchorConnected = false;
+      Object.defineProperty(mockAnchor, 'isConnected', { value: false, configurable: true });
+
+      // Query on detached element: cache invalidation triggered -> querySelector re-run
+      const detachedResult = cache.query<HTMLAnchorElement>('.playbackSoundBadge__titleLink');
+      expect(detachedResult).toBeNull();
+      expect(querySelectorCallCount).toBe(2);
+      expect(cache.size()).toBe(0);
+
+      // New element attaches
+      const newMockAnchor = {
+        isConnected: true,
+        getAttribute: (attr: string) => (attr === 'href' ? '/artist-foo/next-track' : null),
+        textContent: 'Next Track Title',
+      } as unknown as HTMLAnchorElement;
+
+      titleAnchorConnected = true;
+      mockDoc.querySelector = (selector: string) => {
+        querySelectorCallCount += 1;
+        if (selector === '.playbackSoundBadge__titleLink') {
+          return newMockAnchor;
+        }
+        return null;
+      };
+
+      const refreshed = cache.query<HTMLAnchorElement>('.playbackSoundBadge__titleLink');
+      expect(refreshed).toBe(newMockAnchor);
+      expect(querySelectorCallCount).toBe(3);
+      expect(cache.size()).toBe(1);
+    });
+
+    it('caches transport and play/pause button queries while verifying .isConnected', () => {
+      let queryCount = 0;
+      let nextBtnClicked = false;
+
+      const mockNextBtn = {
+        isConnected: true,
+        click: () => {
+          nextBtnClicked = true;
+        },
+      } as unknown as HTMLButtonElement;
+
+      const mockDoc: Pick<Document, 'querySelector' | 'querySelectorAll'> = {
+        querySelector: (selector: string) => {
+          queryCount += 1;
+          if (selector.includes('skipControl__next')) {
+            return mockNextBtn;
+          }
+          return null;
+        },
+        querySelectorAll: () => [] as unknown as NodeListOf<HTMLAnchorElement>,
+      };
+
+      const cache = new ConnectedDomCache(mockDoc);
+
+      clickSoundCloudTransportButton('next', cache);
+      expect(nextBtnClicked).toBe(true);
+      expect(queryCount).toBe(1);
+
+      // Next invocation hits cache
+      nextBtnClicked = false;
+      clickSoundCloudTransportButton('next', cache);
+      expect(nextBtnClicked).toBe(true);
+      expect(queryCount).toBe(1);
+    });
+
+    it('resolves track title hint with live attribute updates on cached connected anchor', () => {
+      let currentHref = '/original-artist/track-one';
+      let currentTitle = 'Track One Title';
+
+      const mockAnchor = {
+        isConnected: true,
+        getAttribute: (attr: string) => {
+          if (attr === 'href') return currentHref;
+          if (attr === 'title') return currentTitle;
+          return null;
+        },
+        textContent: currentTitle,
+      } as unknown as HTMLAnchorElement;
+
+      let docCalls = 0;
+      const mockDoc: Pick<Document, 'querySelector' | 'querySelectorAll'> = {
+        querySelector: () => {
+          docCalls += 1;
+          return mockAnchor;
+        },
+        querySelectorAll: () => [] as unknown as NodeListOf<HTMLAnchorElement>,
+      };
+
+      const cache = new ConnectedDomCache(mockDoc);
+      const hint1 = querySoundCloudPlayerTitleHint(cache);
+      expect(hint1).toEqual({
+        permalinkOrPath: '/original-artist/track-one',
+        title: 'Track One Title',
+        isPlayerBadge: true,
+      });
+      expect(docCalls).toBe(1);
+
+      // In-place SPA DOM attribute mutation on the same connected anchor
+      currentHref = '/original-artist/track-two';
+      currentTitle = 'Track Two Title';
+
+      const hint2 = querySoundCloudPlayerTitleHint(cache);
+      expect(hint2).toEqual({
+        permalinkOrPath: '/original-artist/track-two',
+        title: 'Track Two Title',
+        isPlayerBadge: true,
+      });
+      // Zero additional querySelector calls!
+      expect(docCalls).toBe(1);
+    });
   });
 });

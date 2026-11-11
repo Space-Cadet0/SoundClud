@@ -16,6 +16,12 @@ export * from './main-world/mediaKeyKeepalive.js';
 export * from './main-world/mseVirtualizer.js';
 export * from './main-world/playerVirtualizer.js';
 export * from './main-world/mediaPrototypeHooks.js';
+export {
+  ConnectedDomCache,
+  defaultDomCache,
+  querySoundCloudPlayerTitleHint,
+  clickSoundCloudTransportButton,
+} from './main-world/entry.js';
 
 export * from './isolated-world/nonceBridge.js';
 export * from './isolated-world/castPill.js';

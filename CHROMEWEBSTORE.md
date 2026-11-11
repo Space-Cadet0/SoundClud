@@ -24,14 +24,14 @@ FEATURES
 • Automatic SoundCloud Go+ 256 kbps HQ Quality — Automatically selects the highest available stream quality (including 256 kbps AAC High Quality for SoundCloud Go+ listeners) with no separate sign-in window required.
 • Native SoundCloud Controls & Waveform Scrubbing — Play, pause, skip tracks, queue playlists, scrub multi-hour DJ mixes on the SoundCloud waveform, and use your keyboard media keys with instant response.
 • Hands-Free Amplifier Auto-Wake & Front-Panel Display — Automatically wakes compatible Denon and Marantz HEOS amplifiers from network standby on Play and shows live track title, artist, and elapsed time on the amplifier display.
-• Pure Amplifier Volume Integrity — Locks digital audio output at 0 dB unity gain so volume is controlled exclusively at your physical Hi-Fi amplifier knob or remote.
+• Pure 0 dB Amplifier Volume Integrity — Locks digital audio output at 0 dB unity gain with zero software attenuation, while offering optional remote hardware master volume and mute control for Denon and Marantz HEOS amplifiers right from the toolbar popup and SoundCloud player bar.
 • Seamless Protected-Track Fallback — Plays DRM-restricted tracks locally in your browser automatically and resumes Hi-Fi receiver output on the next track in your queue.
 
 HOW TO USE
 1. Install and start the open-source SoundClud Receiver app on your local computer (127.0.0.1:9876) or a headless Mac / Linux Hi-Fi server on your home network (soundclud.local:9876).
 2. Open https://soundcloud.com in Chrome, Brave, Arc, or Edge.
 3. Click the SoundClud toolbar icon or the Hi-Fi output pill in the SoundCloud player bar and choose your Optical TOSLINK DAC or Denon/Marantz HEOS amplifier.
-4. Press Play on any track, playlist, or mix and adjust listening volume on your amplifier.
+4. Press Play on any track, playlist, or mix and adjust listening volume on your amplifier (or directly from the SoundClud popup or player bar on Denon/Marantz HEOS amplifiers).
 
 PRIVACY & LOCAL-ONLY DESIGN
 SoundClud runs entirely between your browser and your own local SoundClud Receiver on your computer or home network. SoundClud operates zero cloud servers, collects zero analytics or telemetry, never sells or shares data, and requires no separate account login.

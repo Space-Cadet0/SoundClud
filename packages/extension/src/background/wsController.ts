@@ -9,6 +9,7 @@
 import {
   API_V1_PAIR_PATH,
   API_V1_WS_PATH,
+  DEFAULT_DISCOVERY_PORT,
   PROTOCOL_VERSION,
   parsePairResponse,
   parseServerWsEvent,
@@ -44,9 +45,18 @@ export interface ReceiverWsControllerOptions {
   readonly createWebSocket?: ((url: string) => MinimalWebSocket) | undefined;
 }
 
-const WS_OPEN_READY_STATE = 1;
-const RECONNECT_BASE_DELAY_MS = 250;
-const RECONNECT_MAX_DELAY_MS = 5000;
+export const WS_OPEN_READY_STATE = 1;
+export const WS_CLOSE_CODE_NORMAL = 1000;
+export const WS_CLOSE_CODE_HELLO_TIMEOUT = 4000;
+export const WS_HELLO_TIMEOUT_MS = 4000;
+export const RECONNECT_BASE_DELAY_MS = 250;
+export const RECONNECT_MAX_DELAY_MS = 5000;
+export const MAX_PENDING_COMMANDS = 32;
+export const COMMAND_SEQ_MODULUS = 1_000_000;
+
+export function allocateTimestampCommandSeq(): number {
+  return Date.now() % COMMAND_SEQ_MODULUS;
+}
 
 function extractMessageEventText(event: unknown): string | null {
   if (typeof event !== 'object' || event === null) {
@@ -140,52 +150,74 @@ export class ReceiverWsController {
     );
   }
 
+  public hasPendingReconnectTimer(): boolean {
+    return this.reconnectTimer !== null;
+  }
+
+  public getConnectedEndpointBaseUrl(): string | null {
+    return this.connectedEndpointBaseUrl;
+  }
+
   public async ensureConnected(): Promise<boolean> {
-    const local = await readDurableLocalConfig(this.storage.local);
-    const session = await readEphemeralSessionState(this.storage.session);
-
-    if (!local.handoffEnabled) {
-      return false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
 
-    const targetReceiver =
-      session.discoveredReceivers.find(
-        (r) =>
-          (local.activeReceiverId !== null && r.receiverId === local.activeReceiverId) ||
-          (local.activeEndpointBaseUrl !== null &&
-            r.endpointBaseUrl === local.activeEndpointBaseUrl),
-      ) ?? session.discoveredReceivers[0];
-
-    const endpointBaseUrl =
-      local.activeEndpointBaseUrl ?? targetReceiver?.endpointBaseUrl ?? null;
-    const receiverId =
-      local.activeReceiverId ?? targetReceiver?.receiverId ?? 'default-receiver';
-
-    if (endpointBaseUrl === null) {
-      return false;
-    }
-
-    if (this.isConnectedTo(endpointBaseUrl)) {
-      return true;
-    }
-
-    if (
-      this.connectInFlight !== null &&
-      this.connectedEndpointBaseUrl === endpointBaseUrl
-    ) {
+    if (this.connectInFlight !== null) {
       return await this.connectInFlight;
     }
 
-    this.connectInFlight = this.openSessionInternal(
-      endpointBaseUrl,
-      receiverId,
-      targetReceiver?.requiresPairing ?? true,
-    );
-    try {
-      return await this.connectInFlight;
-    } finally {
-      this.connectInFlight = null;
-    }
+    this.connectInFlight = (async (): Promise<boolean> => {
+      try {
+        const local = await readDurableLocalConfig(this.storage.local);
+        const session = await readEphemeralSessionState(this.storage.session);
+
+        if (!local.handoffEnabled) {
+          return false;
+        }
+
+        const matchedById =
+          local.activeReceiverId !== null
+            ? session.discoveredReceivers.find((r) => r.receiverId === local.activeReceiverId)
+            : undefined;
+
+        const targetReceiver =
+          matchedById ??
+          session.discoveredReceivers.find(
+            (r) =>
+              local.activeEndpointBaseUrl !== null &&
+              r.endpointBaseUrl === local.activeEndpointBaseUrl,
+          ) ??
+          session.discoveredReceivers[0];
+
+        const endpointBaseUrl =
+          matchedById?.endpointBaseUrl ??
+          local.activeEndpointBaseUrl ??
+          targetReceiver?.endpointBaseUrl ??
+          null;
+        const receiverId =
+          local.activeReceiverId ?? targetReceiver?.receiverId ?? 'default-receiver';
+
+        if (endpointBaseUrl === null) {
+          return false;
+        }
+
+        if (this.isConnectedTo(endpointBaseUrl)) {
+          return true;
+        }
+
+        return await this.openSessionInternal(
+          endpointBaseUrl,
+          receiverId,
+          targetReceiver?.requiresPairing ?? true,
+        );
+      } finally {
+        this.connectInFlight = null;
+      }
+    })();
+
+    return await this.connectInFlight;
   }
 
   public async sendCommand(command: ClientWsCommand): Promise<boolean> {
@@ -198,7 +230,7 @@ export class ReceiverWsController {
       return true;
     }
 
-    if (this.pendingCommands.length < 32) {
+    if (this.pendingCommands.length < MAX_PENDING_COMMANDS) {
       this.pendingCommands.push(command);
     }
     const ok = await this.ensureConnected();
@@ -335,13 +367,13 @@ export class ReceiverWsController {
       const handshakeTimeout = setTimeout(() => {
         if (!this.isWelcomed) {
           try {
-            socket.close(4000, 'hello_timeout');
+            socket.close(WS_CLOSE_CODE_HELLO_TIMEOUT, 'hello_timeout');
           } catch {
             // Ignore close errors.
           }
           finish(false);
         }
-      }, 4000);
+      }, WS_HELLO_TIMEOUT_MS);
 
       socket.addEventListener('open', () => {
         const hello: ClientWsCommand = {
@@ -470,18 +502,23 @@ export class ReceiverWsController {
               )
             : [
                 ...prev.discoveredReceivers,
-                {
-                  endpointBaseUrl,
-                  host: new URL(endpointBaseUrl).hostname,
-                  port: Number(new URL(endpointBaseUrl).port) || 9876,
-                  isLoopback: new URL(endpointBaseUrl).hostname === '127.0.0.1',
-                  receiverId: event.receiverId,
-                  receiverName: event.receiverName,
-                  requiresPairing: true,
-                  activeOutputId: event.config.activeOutputId,
-                  outputs: event.outputs,
-                  discoveredAtMs: Date.now(),
-                },
+                (() => {
+                  const parsedUrl = new URL(endpointBaseUrl);
+                  const port =
+                    parsedUrl.port.length > 0 ? Number(parsedUrl.port) : DEFAULT_DISCOVERY_PORT;
+                  return {
+                    endpointBaseUrl,
+                    host: parsedUrl.hostname,
+                    port,
+                    isLoopback: parsedUrl.hostname === '127.0.0.1',
+                    receiverId: event.receiverId,
+                    receiverName: event.receiverName,
+                    requiresPairing: true,
+                    activeOutputId: event.config.activeOutputId,
+                    outputs: event.outputs,
+                    discoveredAtMs: Date.now(),
+                  };
+                })(),
               ];
           return {
             ...prev,
@@ -499,7 +536,7 @@ export class ReceiverWsController {
         ) {
           const selectCmd: ClientWsCommand = {
             type: 'select_output',
-            commandSeq: Date.now() % 1_000_000,
+            commandSeq: allocateTimestampCommandSeq(),
             outputId: local.activeOutputId,
           };
           socket.send(JSON.stringify(selectCmd));
@@ -605,7 +642,7 @@ export class ReceiverWsController {
           this.isWelcomed = false;
         }
         try {
-          socket.close(1000, 'session_claimed');
+          socket.close(WS_CLOSE_CODE_NORMAL, 'session_claimed');
         } catch {
           // Ignore close errors on displaced socket.
         }
@@ -638,6 +675,24 @@ export class ReceiverWsController {
         await updateEphemeralSessionState(this.storage.session, (prev) => ({
           ...prev,
           lastError: `${event.code}: ${event.message}`,
+        }));
+        await this.onStateChanged();
+        break;
+      }
+
+      case 'volume_changed': {
+        await updateEphemeralSessionState(this.storage.session, (prev) => ({
+          ...prev,
+          hardwareVolume: event.volume,
+          hardwareMuted: event.muted,
+          lastTelemetry:
+            prev.lastTelemetry !== null
+              ? {
+                  ...prev.lastTelemetry,
+                  hardwareVolume: event.volume,
+                  hardwareMuted: event.muted,
+                }
+              : null,
         }));
         await this.onStateChanged();
         break;

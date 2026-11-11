@@ -5,7 +5,7 @@
 1. **Setup A — Direct HEOS Network Amplifier / Speaker** (e.g., **Marantz PM7000N** or any Denon/Marantz HEOS Built-In device over Wi-Fi/Ethernet, with **zero second computer required**).
 2. **Setup B — Headless Optical TOSLINK Server** (e.g., a **2014 Intel Mac Mini** on macOS 12 Monterey+ or a Linux machine wired into your amplifier's **OPTICAL / S/PDIF** input).
 
-Volume in both modes is controlled **exclusively by your physical Hi-Fi amplifier knob or remote** (`0 dB` fixed digital output—SoundClud never attenuates digital bits or changes your amplifier's volume).
+Digital audio output in both modes is locked at **`0 dB` Bit-Perfect unity gain** (zero software DSP attenuation). On Denon/Marantz HEOS amplifiers, you can adjust your amplifier's physical analog master volume & mute either from your **physical knob / IR remote** or remotely from **SoundClud's Extension Popup and SoundCloud player-bar Cast Pill** with live bidirectional sync.
 
 ---
 
@@ -69,7 +69,7 @@ Once **Handoff** is **On**, use `https://soundcloud.com` **100% normally**:
 | **HEOS Auto-Wake & Front OLED Display** | If your Denon/Marantz amplifier is in Network Standby, pressing **Play** shows **`Waking Amplifier...`** (~3–5 s), powers on the amp, switches its input to **HEOS Music**, and displays the live **Track Title & Artist** on the front OLED screen. |
 | **Waveform Scrubbing** | Click or drag anywhere along SoundCloud's orange waveform—even hours into a long DJ mix. |
 | **MacBook Hardware Media Keys** | Press **`F7` (Previous)**, **`F8` (Play/Pause)**, and **`F9` (Next)** on your keyboard even when your browser is in the background. |
-| **Volume Control (`0 dB` Bit-Perfect)** | Turn your **physical amplifier volume knob** or use your **amplifier remote**. SoundClud locks digital output at `0 dB` unity gain and never alters your amplifier's volume. |
+| **Volume Control (`0 dB` Bit-Perfect)** | Digital output stays locked at `0 dB` unity gain. On **Denon/Marantz HEOS**, adjust analog master volume & mute from your **physical knob/remote** or remotely from **SoundClud's Popup & player-bar Cast Pill**; on **Optical TOSLINK**, use your physical amplifier knob/remote. |
 | **Widevine DRM Tracks (`Mixed Queues`)** | If a single major-label track uses hardware Widevine DRM, the pill shows **`Widevine DRM • Local`**, plays that full song locally, and **automatically resumes Hi-Fi TOSLINK/HEOS handoff on the very next track**. |
 | **Switch Back to Laptop Speakers** | Click the SoundClud player-bar pill (or flip the popup switch to **Off**) to return immediately to normal laptop playback. |
 

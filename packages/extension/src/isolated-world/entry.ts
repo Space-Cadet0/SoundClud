@@ -159,6 +159,18 @@ function bootstrapIsolatedWorld(): void {
         }
       })();
     },
+    onSetVolume: (volume, muted) => {
+      void (async () => {
+        const res = await sendRuntimeRequest({
+          type: 'set_volume',
+          ...(volume !== undefined ? { volume } : {}),
+          ...(muted !== undefined ? { muted } : {}),
+        });
+        if (res?.ok === true && res.snapshot) {
+          applySnapshot(res.snapshot);
+        }
+      })();
+    },
   });
 
   const mountPillWhenReady = (): void => {

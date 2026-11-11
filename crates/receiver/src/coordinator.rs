@@ -16,12 +16,20 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
+pub const DEFAULT_INITIAL_VOLUME: u8 = 25;
+pub const COORDINATOR_STATE_TICK_INTERVAL: Duration = Duration::from_millis(500);
+pub const LOCATOR_REFRESH_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_RETAINED_HEOS_TOKENS: usize = 6;
 
 struct ControllerHandle {
     controller_id: String,
     client_label: String,
     tx: mpsc::UnboundedSender<ServerWsEvent>,
+}
+
+struct HeosCliListenerHandle {
+    target: (std::net::IpAddr, u16),
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 pub struct ReceiverCoordinator {
@@ -40,6 +48,10 @@ pub struct ReceiverCoordinator {
     active_controller_conn: RwLock<Option<u64>>,
     pending_refreshes:
         Mutex<HashMap<String, oneshot::Sender<Result<StreamLocatorPayload, String>>>>,
+    current_volume: RwLock<u8>,
+    current_muted: RwLock<bool>,
+    heos_cli_listener: std::sync::Mutex<Option<HeosCliListenerHandle>>,
+    weak_self: RwLock<std::sync::Weak<ReceiverCoordinator>>,
     local_http_port: AtomicU16,
     server_seq: AtomicU64,
     last_acked_seq: AtomicU64,
@@ -73,11 +85,20 @@ impl ReceiverCoordinator {
             controllers: RwLock::new(HashMap::new()),
             active_controller_conn: RwLock::new(None),
             pending_refreshes: Mutex::new(HashMap::new()),
-            local_http_port: AtomicU16::new(9876),
+            current_volume: RwLock::new(DEFAULT_INITIAL_VOLUME),
+            current_muted: RwLock::new(false),
+            heos_cli_listener: std::sync::Mutex::new(None),
+            weak_self: RwLock::new(std::sync::Weak::new()),
+            local_http_port: AtomicU16::new(crate::protocol::DEFAULT_DISCOVERY_PORT),
             server_seq: AtomicU64::new(1),
             last_acked_seq: AtomicU64::new(0),
             next_conn_id: AtomicU64::new(1),
         });
+
+        *coord
+            .weak_self
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::downgrade(&coord);
 
         let coord_ev = Arc::downgrade(&coord);
         tokio::spawn(async move {
@@ -105,7 +126,7 @@ impl ReceiverCoordinator {
 
         let coord_tick = Arc::downgrade(&coord);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            let mut interval = tokio::time::interval(COORDINATOR_STATE_TICK_INTERVAL);
             loop {
                 interval.tick().await;
                 let Some(c) = coord_tick.upgrade() else { break };
@@ -228,6 +249,7 @@ impl ReceiverCoordinator {
             .cached_outputs
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = all.clone();
+        self.ensure_heos_cli_listener(None);
         all
     }
 
@@ -482,7 +504,7 @@ impl ReceiverCoordinator {
                             "no active controller connected for locator refresh".to_string()
                         );
                     }
-                    match tokio::time::timeout(Duration::from_secs(6), rx).await {
+                    match tokio::time::timeout(LOCATOR_REFRESH_TIMEOUT, rx).await {
                         Ok(Ok(res)) => res,
                         _ => {
                             coord.pending_refreshes.lock().await.remove(&req_id);
@@ -544,7 +566,282 @@ impl ReceiverCoordinator {
             active_output_id: updated_cfg.active_output_id.clone(),
             outputs: outputs.clone(),
         });
+        if let Some(target_id) = &updated_cfg.active_output_id {
+            self.ensure_heos_cli_listener(Some(target_id));
+        }
         Ok((updated_cfg, outputs))
+    }
+
+    #[must_use]
+    pub fn cached_volume(&self) -> (u8, bool) {
+        let vol = *self
+            .current_volume
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let muted = *self
+            .current_muted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (vol, muted)
+    }
+
+    #[must_use]
+    pub fn supports_hardware_volume(&self, output_id: Option<&str>) -> bool {
+        let outputs = self.outputs_snapshot();
+        let target_output = if let Some(oid) = output_id {
+            outputs.into_iter().find(|o| o.id == oid)
+        } else {
+            let active_id = self.config_snapshot().active_output_id;
+            outputs
+                .into_iter()
+                .find(|o| Some(&o.id) == active_id.as_ref())
+                .or_else(|| self.outputs_snapshot().into_iter().next())
+        };
+
+        target_output
+            .as_ref()
+            .is_some_and(|o| o.kind == OutputDeviceKind::HeosUpnp)
+    }
+
+    pub fn ensure_heos_cli_listener(&self, output_id: Option<&str>) {
+        let target_id = output_id
+            .map(String::from)
+            .or_else(|| self.config_snapshot().active_output_id);
+        let endpoint = self.heos_backend.active_cli_endpoint(target_id.as_deref());
+        let mut guard = self
+            .heos_cli_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let Some((ip, cli_port)) = endpoint else {
+            // Active output is non-HEOS (e.g. TOSLINK) or not found: cleanly abort existing tasks
+            if let Some(handle) = guard.take() {
+                for task in handle.tasks {
+                    task.abort();
+                }
+            }
+            return;
+        };
+
+        if let Some(ref handle) = *guard {
+            if handle.target == (ip, cli_port) {
+                return; // Deduplicated: already listening to this target
+            }
+        }
+
+        // Target changed: abort previous listener tasks
+        if let Some(handle) = guard.take() {
+            for task in handle.tasks {
+                task.abort();
+            }
+        }
+
+        let weak = self
+            .weak_self
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+
+        let (vol_tx, mut vol_rx) = mpsc::unbounded_channel::<(Option<u8>, Option<bool>)>();
+        let forwarder_task = tokio::spawn(async move {
+            while let Some((opt_vol, opt_mute)) = vol_rx.recv().await {
+                let Some(c) = weak.upgrade() else { break };
+                let mut changed = false;
+                if let Some(v) = opt_vol {
+                    let mut vol = c
+                        .current_volume
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *vol != v {
+                        *vol = v;
+                        changed = true;
+                    }
+                }
+                if let Some(m) = opt_mute {
+                    let mut mute = c
+                        .current_muted
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *mute != m {
+                        *mute = m;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let volume = *c
+                        .current_volume
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let muted = *c
+                        .current_muted
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    c.broadcast_event(&ServerWsEvent::VolumeChanged { volume, muted });
+                }
+            }
+        });
+
+        let listener_task = tokio::spawn(async move {
+            crate::backends::heos_mcu::register_heos_cli_change_events(ip, cli_port, vol_tx).await;
+        });
+
+        *guard = Some(HeosCliListenerHandle {
+            target: (ip, cli_port),
+            tasks: vec![forwarder_task, listener_task],
+        });
+    }
+
+    pub async fn get_hardware_volume(
+        &self,
+        output_id: Option<&str>,
+    ) -> Result<(u8, bool, bool), String> {
+        let outputs = self.outputs_snapshot();
+        let target_output = if let Some(oid) = output_id {
+            outputs.into_iter().find(|o| o.id == oid)
+        } else {
+            let active_id = self.config_snapshot().active_output_id;
+            outputs
+                .into_iter()
+                .find(|o| Some(&o.id) == active_id.as_ref())
+                .or_else(|| self.outputs_snapshot().into_iter().next())
+        };
+
+        let is_heos = target_output
+            .as_ref()
+            .is_some_and(|o| o.kind == OutputDeviceKind::HeosUpnp);
+        if !is_heos {
+            let vol = *self
+                .current_volume
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let muted = *self
+                .current_muted
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Ok((vol, muted, false));
+        }
+
+        self.ensure_heos_cli_listener(target_output.as_ref().map(|o| o.id.as_str()));
+
+        match self.heos_backend.get_hardware_volume(output_id).await {
+            Ok((vol, muted)) => {
+                *self
+                    .current_volume
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = vol;
+                *self
+                    .current_muted
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = muted;
+                Ok((vol, muted, true))
+            }
+            Err(_) => {
+                let vol = *self
+                    .current_volume
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let muted = *self
+                    .current_muted
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok((vol, muted, true))
+            }
+        }
+    }
+
+    pub async fn set_hardware_volume(
+        &self,
+        output_id: Option<&str>,
+        volume: u8,
+    ) -> Result<u8, String> {
+        let clamped = volume.min(100);
+        let outputs = self.outputs_snapshot();
+        let target_output = if let Some(oid) = output_id {
+            outputs.into_iter().find(|o| o.id == oid)
+        } else {
+            let active_id = self.config_snapshot().active_output_id;
+            outputs
+                .into_iter()
+                .find(|o| Some(&o.id) == active_id.as_ref())
+                .or_else(|| self.outputs_snapshot().into_iter().next())
+        };
+
+        let is_heos = target_output
+            .as_ref()
+            .is_some_and(|o| o.kind == OutputDeviceKind::HeosUpnp);
+        if !is_heos {
+            return Err(
+                "Hardware volume control is not supported on this output (use physical amplifier knob)"
+                    .to_string(),
+            );
+        }
+
+        self.ensure_heos_cli_listener(target_output.as_ref().map(|o| o.id.as_str()));
+
+        let new_vol = self
+            .heos_backend
+            .set_hardware_volume(output_id, clamped)
+            .await?;
+        *self
+            .current_volume
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_vol;
+        let muted = *self
+            .current_muted
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.broadcast_event(&ServerWsEvent::VolumeChanged {
+            volume: new_vol,
+            muted,
+        });
+        Ok(new_vol)
+    }
+
+    pub async fn set_hardware_mute(
+        &self,
+        output_id: Option<&str>,
+        muted: bool,
+    ) -> Result<bool, String> {
+        let outputs = self.outputs_snapshot();
+        let target_output = if let Some(oid) = output_id {
+            outputs.into_iter().find(|o| o.id == oid)
+        } else {
+            let active_id = self.config_snapshot().active_output_id;
+            outputs
+                .into_iter()
+                .find(|o| Some(&o.id) == active_id.as_ref())
+                .or_else(|| self.outputs_snapshot().into_iter().next())
+        };
+
+        let is_heos = target_output
+            .as_ref()
+            .is_some_and(|o| o.kind == OutputDeviceKind::HeosUpnp);
+        if !is_heos {
+            return Err(
+                "Hardware mute control is not supported on this output (use physical amplifier knob)"
+                    .to_string(),
+            );
+        }
+
+        self.ensure_heos_cli_listener(target_output.as_ref().map(|o| o.id.as_str()));
+
+        let new_mute = self
+            .heos_backend
+            .set_hardware_mute(output_id, muted)
+            .await?;
+        *self
+            .current_muted
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = new_mute;
+        let volume = *self
+            .current_volume
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.broadcast_event(&ServerWsEvent::VolumeChanged {
+            volume,
+            muted: new_mute,
+        });
+        Ok(new_mute)
     }
 
     pub async fn load_track(
@@ -661,6 +958,7 @@ impl ReceiverCoordinator {
         };
 
         let res = if target_dev.kind == OutputDeviceKind::HeosUpnp {
+            self.ensure_heos_cli_listener(Some(&target_dev.id));
             self.heos_backend.load(load_req).await
         } else {
             self.local_backend.load(load_req).await
@@ -791,6 +1089,16 @@ impl ReceiverCoordinator {
     }
 
     pub async fn shutdown(&self) {
+        if let Some(handle) = self
+            .heos_cli_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            for task in handle.tasks {
+                task.abort();
+            }
+        }
         let _ = self.stop_playback(None).await;
         let _ = self.local_backend.deactivate().await;
         let _ = self.heos_backend.deactivate().await;

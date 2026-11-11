@@ -32,6 +32,7 @@ export interface DiscoveredReceiverRecord {
   readonly activeOutputId?: string | undefined;
   readonly outputs: readonly OutputDevice[];
   readonly discoveredAtMs: number;
+  readonly supportsHardwareVolume?: boolean | undefined;
 }
 
 export interface DiscoveredOutputEntry {
@@ -72,6 +73,8 @@ export interface ExtensionUiSnapshot {
   readonly accountTier: AccountTier;
   readonly drmFallback: DrmFallbackNotice | null;
   readonly lastError: string | null;
+  readonly hardwareVolume?: number | undefined;
+  readonly hardwareMuted?: boolean | undefined;
 }
 
 export type MainToIsolatedMessage =
@@ -170,6 +173,11 @@ export type ExtensionRuntimeRequest =
   | {
       readonly type: 'forward_main_message';
       readonly message: MainToIsolatedMessage;
+    }
+  | {
+      readonly type: 'set_volume';
+      readonly volume?: number | undefined;
+      readonly muted?: boolean | undefined;
     };
 
 export type ExtensionRuntimeResponse =

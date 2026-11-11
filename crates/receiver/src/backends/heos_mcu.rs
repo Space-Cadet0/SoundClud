@@ -1,11 +1,27 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex as TokioMutex;
 use url::Url;
 
 pub const DENON_AVR_CONTROL_PORT: u16 = 23;
+
+static MCU_ENDPOINT_LOCKS: LazyLock<StdMutex<HashMap<SocketAddr, Arc<TokioMutex<()>>>>> =
+    LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn get_mcu_lock(addr: SocketAddr) -> Arc<TokioMutex<()>> {
+    let mut locks = MCU_ENDPOINT_LOCKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks
+        .entry(addr)
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum McuPowerStatus {
@@ -16,6 +32,9 @@ pub enum McuPowerStatus {
 
 #[derive(Debug, Deserialize)]
 struct CliMeta {
+    #[allow(dead_code)]
+    command: Option<String>,
+    result: Option<String>,
     message: Option<String>,
 }
 
@@ -111,12 +130,16 @@ impl CrFrameReader {
 /// Connects to Denon/Marantz Host-MCU TCP control (`:23`) when supported by the amplifier:
 /// 1. Queries `PW?\r` and wakes from `PWSTANDBY` via `PWON\r` (returning `true` when woken).
 /// 2. Queries `SI?\r` and switches active zone source to `SINET\r` (`HEOS Music / Network`).
-/// 3. Queries `SLP?\r` and, when `SLPOFF`, sends `SLPOFF\r` so every track load/switch executes
-///    a genuine non-volume Host-MCU command cycle resetting EU ErP Auto-Standby timers.
 ///
 /// Strictly `0 dB` Amp-Knob/Remote-Only: never sends any volume or mute command.
+/// Never sends `SLPOFF\r` or `SLP?\r` to avoid triggering intrusive "Sleep > Off" OLED popups.
 pub async fn activate_host_mcu_zone(ip: IpAddr, port: u16) -> bool {
+    if port == 0 {
+        return false;
+    }
     let addr = SocketAddr::new(ip, port);
+    let mcu_lock = get_mcu_lock(addr);
+    let _lock = mcu_lock.lock().await;
     let Ok(Ok(stream)) =
         tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(addr)).await
     else {
@@ -156,25 +179,17 @@ pub async fn activate_host_mcu_zone(ip: IpAddr, port: u16) -> bool {
         }
     }
 
-    if mcu.send_cmd(b"SLP?\r").await {
-        if let Some(slp) = mcu
-            .read_matching_prefix("SLP", Duration::from_millis(250))
-            .await
-        {
-            if slp.starts_with("SLPOFF") && mcu.send_cmd(b"SLPOFF\r").await {
-                let _ = mcu
-                    .read_matching_prefix("SLPOFF", Duration::from_millis(250))
-                    .await;
-            }
-        }
-    }
-
     woke_from_standby
 }
 
 /// Read-only Host-MCU (`:23`) power query (`PW?\r`) without side effects.
 pub async fn check_host_mcu_power(ip: IpAddr, port: u16) -> McuPowerStatus {
+    if port == 0 {
+        return McuPowerStatus::Unavailable;
+    }
     let addr = SocketAddr::new(ip, port);
+    let mcu_lock = get_mcu_lock(addr);
+    let _lock = mcu_lock.lock().await;
     let Ok(Ok(stream)) =
         tokio::time::timeout(Duration::from_millis(400), TcpStream::connect(addr)).await
     else {
@@ -201,9 +216,15 @@ pub async fn check_host_mcu_power(ip: IpAddr, port: u16) -> McuPowerStatus {
 
 /// Periodic `60s` anti-Auto-Standby check on Host-MCU (`:23`):
 /// - If `PWSTANDBY`, returns `McuPowerStatus::Standby` immediately (never re-wakes!).
-/// - If `PWON` and `SI?` is `SINET*` (or unavailable), refreshes `SLPOFF\r` when `SLP?` is `SLPOFF`.
+/// - If `PWON`, queries `SI?\r` to reset the Host-MCU inactivity watchdog with zero display side-effects.
+/// - Never sends `SLPOFF\r` or `SLP?\r` to prevent "Sleep > Off" OSD popup modals.
 pub async fn keepalive_host_mcu(ip: IpAddr, port: u16) -> McuPowerStatus {
+    if port == 0 {
+        return McuPowerStatus::Unavailable;
+    }
     let addr = SocketAddr::new(ip, port);
+    let mcu_lock = get_mcu_lock(addr);
+    let _lock = mcu_lock.lock().await;
     let Ok(Ok(stream)) =
         tokio::time::timeout(Duration::from_millis(450), TcpStream::connect(addr)).await
     else {
@@ -226,28 +247,11 @@ pub async fn keepalive_host_mcu(ip: IpAddr, port: u16) -> McuPowerStatus {
         return McuPowerStatus::Unavailable;
     }
 
+    // Passive source query resets MCU watchdog timer without modifying state or displaying OSD popup
     if mcu.send_cmd(b"SI?\r").await {
-        if let Some(si) = mcu
+        let _ = mcu
             .read_matching_prefix("SI", Duration::from_millis(300))
-            .await
-        {
-            if !si.starts_with("SINET") {
-                return McuPowerStatus::On;
-            }
-        }
-    }
-
-    if mcu.send_cmd(b"SLP?\r").await {
-        if let Some(slp) = mcu
-            .read_matching_prefix("SLP", Duration::from_millis(250))
-            .await
-        {
-            if slp.starts_with("SLPOFF") && mcu.send_cmd(b"SLPOFF\r").await {
-                let _ = mcu
-                    .read_matching_prefix("SLPOFF", Duration::from_millis(250))
-                    .await;
-            }
-        }
+            .await;
     }
 
     McuPowerStatus::On
@@ -339,7 +343,8 @@ async fn drain_cli_responses(
     }
 }
 
-/// Immediately registers `state=play` on HEOS CLI (`:1255`) for `pid` (zero volume commands).
+/// Queries read-only `player/get_play_state?pid=..` on HEOS CLI (`:1255`) for `pid`
+/// to verify player state without mutating native queue transport while streaming via UPnP DMR.
 pub async fn assert_heos_cli_play_state(ip: IpAddr, cli_port: u16, pid: i64) {
     if cli_port == 0 {
         return;
@@ -351,15 +356,16 @@ pub async fn assert_heos_cli_play_state(ip: IpAddr, cli_port: u16, pid: i64) {
         return;
     };
     let (read_half, mut write_half) = stream.into_split();
-    let cmd = format!("heos://player/set_play_state?pid={pid}&state=play\r\n");
+    let cmd = format!("heos://player/get_play_state?pid={pid}\r\n");
     if write_half.write_all(cmd.as_bytes()).await.is_err() {
         return;
     }
     drain_cli_responses(read_half, 1, Duration::from_millis(350)).await;
 }
 
-/// Pings HEOS CLI (`:1255`) with `system/heart_beat` and `player/set_play_state?pid=..&state=play`
-/// during active playback (lazily resolving `pid` if `None`) to keep AIOS & Host-MCU timers alive.
+/// Pings HEOS CLI (`:1255`) with `system/heart_beat` and read-only `player/get_play_state?pid=..`
+/// during active playback (lazily resolving `pid` if `None`) to keep AIOS & Host-MCU timers alive
+/// without issuing transport mutations that halt 1 Hz UART elapsed time progress telemetry.
 pub async fn ping_heos_cli_keepalive(ip: IpAddr, cli_port: u16, pid: Option<i64>) -> Option<i64> {
     if cli_port == 0 {
         return pid;
@@ -377,9 +383,7 @@ pub async fn ping_heos_cli_keepalive(ip: IpAddr, cli_port: u16, pid: Option<i64>
     let (read_half, mut write_half) = stream.into_split();
     let (payload, expected_count) = match resolved_pid {
         Some(p) => (
-            format!(
-                "heos://system/heart_beat\r\nheos://player/set_play_state?pid={p}&state=play\r\n"
-            ),
+            format!("heos://system/heart_beat\r\nheos://player/get_play_state?pid={p}\r\n"),
             2usize,
         ),
         None => ("heos://system/heart_beat\r\n".to_string(), 1usize),
@@ -388,4 +392,217 @@ pub async fn ping_heos_cli_keepalive(ip: IpAddr, cli_port: u16, pid: Option<i64>
         drain_cli_responses(read_half, expected_count, Duration::from_millis(350)).await;
     }
     resolved_pid
+}
+
+fn parse_cli_message_kv(message: &str) -> Vec<(&str, &str)> {
+    message
+        .split('&')
+        .filter_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let k = parts.next()?.trim();
+            let v = parts.next()?.trim();
+            Some((k, v))
+        })
+        .collect()
+}
+
+/// Queries current hardware master volume (0..100) and mute state from HEOS CLI (`:1255`).
+pub async fn get_heos_cli_volume(ip: IpAddr, cli_port: u16, pid: i64) -> Option<(u8, bool)> {
+    if cli_port == 0 {
+        return None;
+    }
+    let addr = SocketAddr::new(ip, cli_port);
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await
+    else {
+        return None;
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    let cmd = format!("heos://player/get_volume?pid={pid}\r\nheos://player/get_mute?pid={pid}\r\n");
+    if write_half.write_all(cmd.as_bytes()).await.is_err() {
+        return None;
+    }
+
+    let mut lines = BufReader::new(read_half).lines();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    let mut volume: Option<u8> = None;
+    let mut muted: Option<bool> = None;
+
+    while volume.is_none() || muted.is_none() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let Ok(Ok(Some(line))) = tokio::time::timeout(deadline - now, lines.next_line()).await
+        else {
+            break;
+        };
+        if line.to_ascii_lowercase().contains("command under process") {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<CliPlayersEnvelope>(&line) {
+            if let Some(meta) = parsed.heos {
+                if let Some(msg) = meta.message {
+                    for (k, v) in parse_cli_message_kv(&msg) {
+                        if k == "level" {
+                            if let Ok(lvl) = v.parse::<u8>() {
+                                volume = Some(lvl.min(100));
+                            }
+                        } else if k == "state" || k == "mute" {
+                            muted = Some(v == "on");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    volume.map(|v| (v, muted.unwrap_or(false)))
+}
+
+async fn wait_cli_command_success(
+    read_half: tokio::net::tcp::OwnedReadHalf,
+    max_wait: Duration,
+) -> bool {
+    let mut lines = BufReader::new(read_half).lines();
+    let deadline = tokio::time::Instant::now() + max_wait;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let Ok(Ok(Some(line))) = tokio::time::timeout(deadline - now, lines.next_line()).await
+        else {
+            return false;
+        };
+        if line.to_ascii_lowercase().contains("command under process") {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<CliPlayersEnvelope>(&line) {
+            if let Some(meta) = parsed.heos {
+                if let Some(res) = meta.result {
+                    return res.eq_ignore_ascii_case("success");
+                }
+            }
+        }
+    }
+}
+
+/// Sets hardware master volume (0..100) on HEOS CLI (`:1255`) for the specified `pid`.
+/// This operates strictly downstream on the physical amplifier pre-amplifier attenuator,
+/// leaving the 44.1 kHz / 24-bit PCM audio stream completely unaltered at 0 dBFS unity gain.
+pub async fn set_heos_cli_volume(ip: IpAddr, cli_port: u16, pid: i64, level: u8) -> bool {
+    if cli_port == 0 {
+        return false;
+    }
+    let clamped_level = level.min(100);
+    let addr = SocketAddr::new(ip, cli_port);
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await
+    else {
+        return false;
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    let cmd = format!("heos://player/set_volume?pid={pid}&level={clamped_level}\r\n");
+    if write_half.write_all(cmd.as_bytes()).await.is_err() {
+        return false;
+    }
+    wait_cli_command_success(read_half, Duration::from_millis(350)).await
+}
+
+/// Sets hardware mute state on HEOS CLI (`:1255`) for the specified `pid`.
+pub async fn set_heos_cli_mute(ip: IpAddr, cli_port: u16, pid: i64, muted: bool) -> bool {
+    if cli_port == 0 {
+        return false;
+    }
+    let state_str = if muted { "on" } else { "off" };
+    let addr = SocketAddr::new(ip, cli_port);
+    let Ok(Ok(stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await
+    else {
+        return false;
+    };
+    let (read_half, mut write_half) = stream.into_split();
+    let cmd = format!("heos://player/set_mute?pid={pid}&state={state_str}\r\n");
+    if write_half.write_all(cmd.as_bytes()).await.is_err() {
+        return false;
+    }
+    wait_cli_command_success(read_half, Duration::from_millis(350)).await
+}
+
+/// Subscribes to HEOS CLI change events (`system/register_for_change_events?enable=on`)
+/// and streams volume changes through a callback channel with automatic reconnection.
+pub async fn register_heos_cli_change_events(
+    ip: IpAddr,
+    cli_port: u16,
+    event_tx: tokio::sync::mpsc::UnboundedSender<(Option<u8>, Option<bool>)>,
+) {
+    if cli_port == 0 {
+        return;
+    }
+    let addr = SocketAddr::new(ip, cli_port);
+
+    loop {
+        let stream = match tokio::time::timeout(
+            Duration::from_millis(800),
+            TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            _ => {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                continue;
+            }
+        };
+
+        let (read_half, mut write_half) = stream.into_split();
+        let cmd = "heos://system/register_for_change_events?enable=on\r\nheos://player/get_volume\r\nheos://player/get_mute\r\n";
+        if write_half.write_all(cmd.as_bytes()).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            continue;
+        }
+
+        let mut lines = BufReader::new(read_half).lines();
+        let mut disconnected = false;
+        while !disconnected {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let is_vol_event = line.contains("event/player_volume_changed")
+                        || line.contains("player/get_volume");
+                    let is_mute_event = line.contains("event/player_mute_changed")
+                        || line.contains("player/get_mute");
+
+                    if is_vol_event || is_mute_event {
+                        if let Ok(parsed) = serde_json::from_str::<CliPlayersEnvelope>(&line) {
+                            if let Some(meta) = parsed.heos {
+                                if let Some(msg) = meta.message {
+                                    let mut opt_vol: Option<u8> = None;
+                                    let mut opt_mute: Option<bool> = None;
+                                    for (k, v) in parse_cli_message_kv(&msg) {
+                                        if k == "level" {
+                                            if let Ok(lvl) = v.parse::<u8>() {
+                                                opt_vol = Some(lvl.min(100));
+                                            }
+                                        } else if k == "mute" || k == "state" {
+                                            opt_mute = Some(v == "on");
+                                        }
+                                    }
+                                    if (opt_vol.is_some() || opt_mute.is_some())
+                                        && event_tx.send((opt_vol, opt_mute)).is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    disconnected = true;
+                }
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
 }

@@ -47,6 +47,8 @@ export interface EphemeralSessionState {
   readonly drmFallback: DrmFallbackNotice | null;
   readonly activeTabId: number | null;
   readonly lastError: string | null;
+  readonly hardwareVolume?: number | undefined;
+  readonly hardwareMuted?: boolean | undefined;
 }
 
 export interface StorageAreaLike {
@@ -98,6 +100,8 @@ export function createDefaultEphemeralSessionState(): EphemeralSessionState {
     drmFallback: null,
     activeTabId: null,
     lastError: null,
+    hardwareVolume: undefined,
+    hardwareMuted: undefined,
   };
 }
 
@@ -212,6 +216,10 @@ export async function readEphemeralSessionState(
       typeof raw['activeTabId'] === 'number' ? raw['activeTabId'] : defaults.activeTabId,
     lastError:
       typeof raw['lastError'] === 'string' ? raw['lastError'] : defaults.lastError,
+    hardwareVolume:
+      typeof raw['hardwareVolume'] === 'number' ? raw['hardwareVolume'] : defaults.hardwareVolume,
+    hardwareMuted:
+      typeof raw['hardwareMuted'] === 'boolean' ? raw['hardwareMuted'] : defaults.hardwareMuted,
   };
 }
 
@@ -296,6 +304,8 @@ export function deriveUiSnapshot(
     accountTier: session.scSessionAuth?.accountTier ?? 'anonymous',
     drmFallback: session.drmFallback,
     lastError: session.lastError,
+    hardwareVolume: session.hardwareVolume,
+    hardwareMuted: session.hardwareMuted,
   };
 }
 

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 const EXCLUDED_DIRS = new Set([
   '.git',
+  '.agents',
   'node_modules',
   'target',
   'dist',

@@ -90,6 +90,14 @@ pub async fn handle_ws_socket(socket: WebSocket, coord: Arc<ReceiverCoordinator>
                 if outputs.is_empty() {
                     outputs = coord.refresh_outputs().await;
                 }
+                let is_heos_active = {
+                    let cfg = coord.config_snapshot();
+                    outputs
+                        .iter()
+                        .find(|o| Some(&o.id) == cfg.active_output_id.as_ref())
+                        .or_else(|| outputs.first())
+                        .is_some_and(|o| o.kind == crate::protocol::OutputDeviceKind::HeosUpnp)
+                };
                 let (receiver_id, receiver_name) = coord.receiver_identity();
                 let welcome = ServerWsEvent::Welcome {
                     protocol_version: PROTOCOL_VERSION.to_string(),
@@ -101,6 +109,26 @@ pub async fn handle_ws_socket(socket: WebSocket, coord: Arc<ReceiverCoordinator>
                     outputs,
                 };
                 let _ = out_tx.send(welcome);
+
+                let (cached_vol, cached_muted) = coord.cached_volume();
+                let _ = out_tx.send(ServerWsEvent::VolumeChanged {
+                    volume: cached_vol,
+                    muted: cached_muted,
+                });
+
+                if is_heos_active {
+                    let coord_bg = Arc::clone(&coord);
+                    tokio::spawn(async move {
+                        if let Ok((vol, muted, true)) = coord_bg.get_hardware_volume(None).await {
+                            if vol != cached_vol || muted != cached_muted {
+                                coord_bg.broadcast_event(&ServerWsEvent::VolumeChanged {
+                                    volume: vol,
+                                    muted,
+                                });
+                            }
+                        }
+                    });
+                }
             }
             other => {
                 let Some(conn_id) = registered_conn_id else {
@@ -131,7 +159,8 @@ const fn command_seq_of(cmd: &ClientWsCommand) -> Option<u64> {
         | ClientWsCommand::Seek { command_seq, .. }
         | ClientWsCommand::PreloadNext { command_seq, .. }
         | ClientWsCommand::Stop { command_seq, .. }
-        | ClientWsCommand::SelectOutput { command_seq, .. } => Some(*command_seq),
+        | ClientWsCommand::SelectOutput { command_seq, .. }
+        | ClientWsCommand::SetVolume { command_seq, .. } => Some(*command_seq),
         ClientWsCommand::Hello { .. }
         | ClientWsCommand::RefreshLocatorResponse { .. }
         | ClientWsCommand::Ping { .. } => None,
@@ -222,6 +251,54 @@ async fn dispatch_authenticated_command(
                 Err(msg) => {
                     let _ = out_tx.send(ServerWsEvent::Error {
                         code: "select_output_failed".to_string(),
+                        message: msg,
+                        command_seq: Some(command_seq),
+                    });
+                }
+            }
+        }
+        ClientWsCommand::SetVolume {
+            command_seq,
+            volume,
+            muted,
+        } => {
+            coord.claim_session_if_needed(conn_id);
+
+            if volume.is_none() && muted.is_none() {
+                let _ = out_tx.send(ServerWsEvent::Error {
+                    code: "invalid_payload".to_string(),
+                    message: "either volume or muted must be provided".to_string(),
+                    command_seq: Some(command_seq),
+                });
+                return;
+            }
+
+            if let Some(vol) = volume {
+                if vol > 100 {
+                    let _ = out_tx.send(ServerWsEvent::Error {
+                        code: "invalid_volume_range".to_string(),
+                        message: "volume must be within 0..=100".to_string(),
+                        command_seq: Some(command_seq),
+                    });
+                    return;
+                }
+            }
+
+            if let Some(vol) = volume {
+                if let Err(msg) = coord.set_hardware_volume(None, vol).await {
+                    let _ = out_tx.send(ServerWsEvent::Error {
+                        code: "set_volume_failed".to_string(),
+                        message: msg,
+                        command_seq: Some(command_seq),
+                    });
+                    return;
+                }
+            }
+
+            if let Some(m) = muted {
+                if let Err(msg) = coord.set_hardware_mute(None, m).await {
+                    let _ = out_tx.send(ServerWsEvent::Error {
+                        code: "set_volume_failed".to_string(),
                         message: msg,
                         command_seq: Some(command_seq),
                     });

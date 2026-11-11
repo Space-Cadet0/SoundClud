@@ -20,10 +20,11 @@
 
 **SoundClud** lets you browse, queue, scrub waveforms, and press hardware media keys directly inside the native first-party `soundcloud.com` web interface in Chromium (`Chrome`, `Brave`, `Arc`, `Edge`)—while offloading 100% of stream fetching, decoding, and **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio output to either:
 1. **Headless Optical TOSLINK / CoreAudio / ALSA** (`LocalMpvBackend`, e.g., a Mac Mini wired via Mini-TOSLINK S/PDIF), or
-2. **Denon / Marantz HEOS Built-In Amplifiers & Speakers Directly Over LAN** (`HeosUpnpBackend`, e.g., Marantz PM7000N — auto-waking from Network Standby, displaying live Track/Artist titles on the front OLED, and streaming asynchronous `44.1 kHz / 24-bit` `0 dB` PCM with **zero** remote volume mutations).
+2. **Denon / Marantz HEOS Built-In Amplifiers & Speakers Directly Over LAN** (`HeosUpnpBackend`, e.g., Marantz PM7000N — auto-waking from Network Standby, displaying live Track/Artist/Elapsed Time on the front OLED, streaming asynchronous `44.1 kHz / 24-bit` `0 dB` FLAC with zero digital attenuation, and providing bidirectional remote hardware analog preamplifier Master Volume & Mute control).
 
 - **End-User Guide**: **[`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md)** — Step-by-step installation, configuration, everyday usage, service management, and troubleshooting.
 - **Architecture & Wire Protocol Spec**: **[`docs/ARCHITECTURE_SPEC.md`](./docs/ARCHITECTURE_SPEC.md)** — Full first-principles engineering specification (`v1.2`).
+- **E2E Testing Infrastructure**: **[`docs/E2E_TESTING.md`](./docs/E2E_TESTING.md)** — Offline deterministic 4-tier end-to-end verification architecture.
 
 ---
 
@@ -34,7 +35,7 @@
    - Overrides SoundCloud Web's client-side `sq` default to automatically select **`aac_256k` (`quality: "hq"`, 256 kbps AAC-LC @ 44.1 kHz)** over `hls` and `encrypted-hls` (`AES-128`), with automatic local fallback (`drm_local_fallback`) for single Widevine-only tracks so mixed queues never stall.
 2. **Dual Strictly Independent `0 dB` Bit-Perfect Output Backends**:
    - **Use Case 1 (`LocalMpvBackend`)**: Physical `44,100 Hz` CoreAudio format locking (`--coreaudio-change-physical-format=yes`), `0 dB` unity gain, and continuous idle optical S/PDIF carrier keepalive (`anullsrc`).
-   - **Use Case 2 (`HeosUpnpBackend`)**: Zero-config SSDP/mDNS/HEOS CLI discovery (`ACT-Denon:1` / `TCP 1255`), hands-free Network Standby auto-wake (`Host MCU :23` + `ACT:1`), `VORBIS_COMMENT` + `DIDL-Lite` front-OLED Track/Artist/Duration display, `60s` anti-standby playback keepalives, and pure-Rust `44,100 Hz / 24-bit` `0 dB` Lossless FLAC HTTP streaming (`~350–650 ms` warm start & `HTTP 206` byte-range scrub)—working on a LAN Mac Mini or locally on `127.0.0.1` on your laptop with **amp-knob/remote-only volume** across both modes.
+   - **Use Case 2 (`HeosUpnpBackend`)**: Zero-config SSDP/mDNS/HEOS CLI discovery (`ACT-Denon:1` / `TCP 1255`), hands-free Network Standby auto-wake (`Host MCU :23` + `ACT:1`), `VORBIS_COMMENT` + `DIDL-Lite` front-OLED Track/Artist/Duration display, non-intrusive `60s` anti-standby playback keepalives, pure-Rust `44,100 Hz / 24-bit` `0 dB` Lossless FLAC HTTP streaming (`~350–650 ms` warm start & `HTTP 206` byte-range scrub), and bidirectional HEOS CLI (`:1255`) hardware analog preamplifier Master Volume & Mute control in both the Extension Popup and SoundCloud player-bar Cast Pill.
 3. **Long-Mix HLS Refresh & AES-128 Session Cache**:
    - Caches `#EXT-X-MAP` (`init.mp4`) and `#EXT-X-KEY` (`AES-128`) in RAM while transparently refreshing expiring CloudFront signatures—eliminating mid-set `HTTP 403` dropouts across 1–3 hour DJ mixes.
 4. **3-World Chromium Manifest V3 & Maestro MSE Virtualization**:
@@ -50,6 +51,7 @@ SoundClud/
 ├── .agents/                         # Specialist subagents, workflow skills & session hooks
 ├── docs/
 │   ├── ARCHITECTURE_SPEC.md         # Full technical specification & wire protocol (v1.2)
+│   ├── E2E_TESTING.md               # 4-tier offline E2E verification specification
 │   └── USER_GUIDE.md                # End-user installation, configuration & usage guide
 ├── crates/
 │   └── receiver/                    # Rust receiver gateway (`LocalMpvBackend` + `HeosUpnpBackend`)

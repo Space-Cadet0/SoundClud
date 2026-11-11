@@ -73,6 +73,14 @@ export interface StatusResponse {
   readonly outputs: readonly OutputDevice[];
 }
 
+export type {
+  GetVolumeResponse,
+  SetVolumeRequest,
+  SetVolumeResponse,
+  VolumeStatus,
+} from './models.js';
+export { API_V1_AUDIO_VOLUME_PATH } from './models.js';
+
 export interface ApiErrorDetail {
   readonly code: string;
   readonly message: string;

@@ -16,6 +16,10 @@ export interface CastPillCallbacks {
   readonly onToggleHandoff: (nextEnabled: boolean) => void;
   readonly onSelectOutput: (entry: DiscoveredOutputEntry) => void;
   readonly onRefreshOutputs: () => void;
+  readonly onSetVolume: (
+    volume?: number | undefined,
+    muted?: boolean | undefined,
+  ) => void;
 }
 
 const CAST_PILL_STYLES = `
@@ -237,6 +241,130 @@ button:focus-visible {
   color: var(--sc-muted);
   text-align: center;
 }
+
+.pill-quick-vol {
+  padding: 0 6px;
+  border-left: 1px solid var(--sc-border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--sc-accent);
+}
+
+.pill-quick-vol[hidden] {
+  display: none !important;
+}
+
+.pill-volume {
+  padding: 4px 4px 10px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--sc-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pill-volume[hidden] {
+  display: none !important;
+}
+
+.pill-volume-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pill-volume-title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--sc-text);
+}
+
+.pill-volume-badge {
+  font-size: 9.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  color: var(--sc-ok);
+  background: rgba(13, 138, 82, 0.12);
+  padding: 2px 5px;
+  border-radius: 4px;
+}
+
+.pill-volume-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.pill-mute-btn,
+.pill-vol-down-btn,
+.pill-vol-up-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--sc-border);
+  background: transparent;
+  color: var(--sc-text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.pill-mute-btn:hover,
+.pill-vol-down-btn:hover,
+.pill-vol-up-btn:hover {
+  background: var(--sc-border);
+}
+
+.pill-mute-btn:focus-visible,
+.pill-vol-down-btn:focus-visible,
+.pill-vol-up-btn:focus-visible {
+  outline: 2px solid var(--sc-accent);
+  outline-offset: 1px;
+}
+
+.pill-mute-btn[aria-pressed="true"] {
+  color: var(--sc-accent);
+  background: rgba(217, 78, 15, 0.14);
+  border-color: var(--sc-accent);
+}
+
+.pill-slider-wrapper {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.pill-volume-slider {
+  width: 100%;
+  height: 5px;
+  border-radius: 3px;
+  accent-color: var(--sc-accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+.pill-volume-slider:focus-visible {
+  outline: 2px solid var(--sc-accent);
+  outline-offset: 2px;
+}
+
+.pill-volume-label {
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 32px;
+  text-align: right;
+  color: var(--sc-text);
+  flex-shrink: 0;
+}
 `;
 
 let sharedSheet: CSSStyleSheet | null = null;
@@ -268,6 +396,9 @@ function getPillTemplate(): HTMLTemplateElement {
         <span class="dot" aria-hidden="true"></span>
         <span class="pill-label">SoundClud • Local</span>
       </button>
+      <button type="button" class="pill-quick-vol" hidden aria-label="Amplifier master volume">
+        <span class="pill-quick-vol-text">--%</span>
+      </button>
       <button type="button" class="pill-menu-btn" aria-expanded="false" aria-label="Select Hi-Fi output target">
         <svg width="10" height="10" viewBox="0 0 12 12" fill="none" aria-hidden="true">
           <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
@@ -275,6 +406,34 @@ function getPillTemplate(): HTMLTemplateElement {
       </button>
     </div>
     <div class="menu" hidden role="region" aria-label="SoundClud Hi-Fi Outputs">
+      <section class="pill-volume" hidden aria-label="Amplifier Master Volume">
+        <div class="pill-volume-header">
+          <span class="pill-volume-title">Master Volume</span>
+          <span class="pill-volume-badge">0 dB Bit-Perfect</span>
+        </div>
+        <div class="pill-volume-controls">
+          <button type="button" class="pill-mute-btn" aria-label="Toggle amplifier mute" aria-pressed="false" title="Toggle mute">
+            <svg class="speaker-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+              <path class="speaker-waves" d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+            </svg>
+          </button>
+          <button type="button" class="pill-vol-down-btn" aria-label="Volume down" title="Volume −2%">−</button>
+          <div class="pill-slider-wrapper">
+            <input
+              type="range"
+              class="pill-volume-slider"
+              min="0"
+              max="100"
+              step="1"
+              value="25"
+              aria-label="Amplifier Master Volume"
+            />
+          </div>
+          <button type="button" class="pill-vol-up-btn" aria-label="Volume up" title="Volume +2%">+</button>
+          <span class="pill-volume-label" aria-live="polite">25%</span>
+        </div>
+      </section>
       <div class="menu-header">
         <span>0 dB Bit-Perfect Outputs</span>
         <button type="button" class="menu-refresh">Refresh</button>
@@ -295,8 +454,31 @@ export class ShadowDomCastPill {
   private rafScheduled = false;
   private mutationObserver: MutationObserver | null = null;
 
+  private isDragging = false;
+  private localVolume = 25;
+  private localMuted = false;
+  private sliderDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly SLIDER_DEBOUNCE_MS = 100;
+
+  private readonly onDocumentClick = (event: MouseEvent): void => {
+    if (this.menuOpen && this.hostEl !== null && !event.composedPath().includes(this.hostEl)) {
+      this.menuOpen = false;
+      this.scheduleRender();
+    }
+  };
+
   public constructor(callbacks: CastPillCallbacks) {
     this.callbacks = callbacks;
+  }
+
+  private debouncedSendVolume(level: number): void {
+    if (this.sliderDebounceTimer !== null) {
+      clearTimeout(this.sliderDebounceTimer);
+    }
+    this.sliderDebounceTimer = setTimeout(() => {
+      this.sliderDebounceTimer = null;
+      this.callbacks.onSetVolume(level, undefined);
+    }, this.SLIDER_DEBOUNCE_MS);
   }
 
   public mount(): void {
@@ -343,12 +525,101 @@ export class ShadowDomCastPill {
       this.callbacks.onRefreshOutputs();
     });
 
-    document.addEventListener('click', (event) => {
-      if (this.menuOpen && this.hostEl !== null && !event.composedPath().includes(this.hostEl)) {
-        this.menuOpen = false;
-        this.scheduleRender();
+    const quickVolBtn = shadow.querySelector<HTMLButtonElement>('.pill-quick-vol');
+    const volumeSlider = shadow.querySelector<HTMLInputElement>('.pill-volume-slider');
+    const volDownBtn = shadow.querySelector<HTMLButtonElement>('.pill-vol-down-btn');
+    const volUpBtn = shadow.querySelector<HTMLButtonElement>('.pill-vol-up-btn');
+    const muteBtn = shadow.querySelector<HTMLButtonElement>('.pill-mute-btn');
+    const volumeLabel = shadow.querySelector<HTMLElement>('.pill-volume-label');
+    const quickVolText = shadow.querySelector<HTMLElement>('.pill-quick-vol-text');
+
+    quickVolBtn?.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.menuOpen = !this.menuOpen;
+      if (this.menuOpen) {
+        this.callbacks.onRefreshOutputs();
       }
+      this.scheduleRender();
     });
+
+    volumeSlider?.addEventListener('input', () => {
+      this.isDragging = true;
+      const val = Number(volumeSlider.value);
+      this.localVolume = val;
+      if (volumeLabel !== null) {
+        volumeLabel.textContent = `${val}%`;
+      }
+      if (quickVolText !== null && !this.localMuted) {
+        quickVolText.textContent = `${val}%`;
+      }
+      this.debouncedSendVolume(val);
+    });
+
+    volumeSlider?.addEventListener('change', () => {
+      if (this.sliderDebounceTimer !== null) {
+        clearTimeout(this.sliderDebounceTimer);
+        this.sliderDebounceTimer = null;
+      }
+      this.isDragging = false;
+      const val = Number(volumeSlider.value);
+      this.localVolume = val;
+      this.callbacks.onSetVolume(val, undefined);
+    });
+
+    volumeSlider?.addEventListener('pointerup', () => {
+      this.isDragging = false;
+    });
+
+    volDownBtn?.addEventListener('click', () => {
+      if (this.sliderDebounceTimer !== null) {
+        clearTimeout(this.sliderDebounceTimer);
+        this.sliderDebounceTimer = null;
+      }
+      this.localVolume = Math.max(0, this.localVolume - 2);
+      if (volumeSlider !== null) {
+        volumeSlider.value = String(this.localVolume);
+      }
+      if (volumeLabel !== null) {
+        volumeLabel.textContent = `${this.localVolume}%`;
+      }
+      if (quickVolText !== null && !this.localMuted) {
+        quickVolText.textContent = `${this.localVolume}%`;
+      }
+      this.callbacks.onSetVolume(this.localVolume, undefined);
+    });
+
+    volUpBtn?.addEventListener('click', () => {
+      if (this.sliderDebounceTimer !== null) {
+        clearTimeout(this.sliderDebounceTimer);
+        this.sliderDebounceTimer = null;
+      }
+      this.localVolume = Math.min(100, this.localVolume + 2);
+      if (volumeSlider !== null) {
+        volumeSlider.value = String(this.localVolume);
+      }
+      if (volumeLabel !== null) {
+        volumeLabel.textContent = `${this.localVolume}%`;
+      }
+      if (quickVolText !== null && !this.localMuted) {
+        quickVolText.textContent = `${this.localVolume}%`;
+      }
+      this.callbacks.onSetVolume(this.localVolume, undefined);
+    });
+
+    muteBtn?.addEventListener('click', () => {
+      if (this.sliderDebounceTimer !== null) {
+        clearTimeout(this.sliderDebounceTimer);
+        this.sliderDebounceTimer = null;
+      }
+      this.localMuted = !this.localMuted;
+      muteBtn.setAttribute('aria-pressed', String(this.localMuted));
+      if (quickVolText !== null) {
+        quickVolText.textContent = this.localMuted ? 'Muted' : `${this.localVolume}%`;
+      }
+      this.callbacks.onSetVolume(undefined, this.localMuted);
+    });
+
+    document.addEventListener('click', this.onDocumentClick);
 
     this.attachToBestContainer();
     if (typeof MutationObserver !== 'undefined') {
@@ -376,6 +647,13 @@ export class ShadowDomCastPill {
   }
 
   public dispose(): void {
+    if (this.sliderDebounceTimer !== null) {
+      clearTimeout(this.sliderDebounceTimer);
+      this.sliderDebounceTimer = null;
+    }
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('click', this.onDocumentClick);
+    }
     this.mutationObserver?.disconnect();
     this.mutationObserver = null;
     this.hostEl?.remove();
@@ -447,6 +725,50 @@ export class ShadowDomCastPill {
     }
     if (menuEl !== null) {
       menuEl.hidden = !this.menuOpen;
+    }
+
+    const volumeSection = this.shadow.querySelector<HTMLElement>('.pill-volume');
+    const quickVolBtn = this.shadow.querySelector<HTMLButtonElement>('.pill-quick-vol');
+    const quickVolText = this.shadow.querySelector<HTMLElement>('.pill-quick-vol-text');
+    const volumeSlider = this.shadow.querySelector<HTMLInputElement>('.pill-volume-slider');
+    const volumeLabel = this.shadow.querySelector<HTMLElement>('.pill-volume-label');
+    const muteBtn = this.shadow.querySelector<HTMLButtonElement>('.pill-mute-btn');
+
+    const supportsVolume =
+      snapshot.handoffEnabled &&
+      snapshot.activeOutput !== null &&
+      (snapshot.activeOutput.capabilities.supportsHardwareVolume === true ||
+        snapshot.activeOutput.kind === 'heos_upnp');
+
+    if (volumeSection !== null) {
+      volumeSection.hidden = !supportsVolume;
+    }
+    if (quickVolBtn !== null) {
+      quickVolBtn.hidden = !supportsVolume;
+    }
+
+    if (supportsVolume) {
+      if (typeof snapshot.hardwareMuted === 'boolean') {
+        this.localMuted = snapshot.hardwareMuted;
+      }
+      if (muteBtn !== null) {
+        muteBtn.setAttribute('aria-pressed', String(this.localMuted));
+      }
+
+      if (!this.isDragging) {
+        if (typeof snapshot.hardwareVolume === 'number') {
+          this.localVolume = snapshot.hardwareVolume;
+        }
+        if (volumeSlider !== null) {
+          volumeSlider.value = String(this.localVolume);
+        }
+        if (volumeLabel !== null) {
+          volumeLabel.textContent = `${this.localVolume}%`;
+        }
+        if (quickVolText !== null) {
+          quickVolText.textContent = this.localMuted ? 'Muted' : `${this.localVolume}%`;
+        }
+      }
     }
 
     if (listEl !== null && this.menuOpen) {

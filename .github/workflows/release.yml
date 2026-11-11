@@ -100,11 +100,11 @@ jobs:
       - name: Run strict TypeScript typecheck
         run: npm run typecheck
 
-      - name: Run deterministic offline unit tests
-        run: npm test
-
       - name: Run Rust format, clippy, and unit tests
         run: npm run check:rust
+
+      - name: Run deterministic offline unit tests
+        run: npm test
 
       - name: Bundle Zero-Homebrew installer & service templates
         env:

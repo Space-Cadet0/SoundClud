@@ -138,6 +138,37 @@ pub struct StatusResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetVolumeResponse {
+    pub protocol_version: String,
+    pub volume: u8,
+    pub muted: bool,
+    pub supports_hardware_volume: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetVolumeRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetVolumeResponse {
+    pub protocol_version: String,
+    pub volume: u8,
+    pub muted: bool,
+    pub supports_hardware_volume: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ApiErrorDetail {
     pub code: String,
     pub message: String,
@@ -220,6 +251,13 @@ pub enum ClientWsCommand {
         command_seq: u64,
         output_id: String,
     },
+    SetVolume {
+        command_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        volume: Option<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        muted: Option<bool>,
+    },
     RefreshLocatorResponse {
         request_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -256,6 +294,10 @@ pub enum ServerWsEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         active_output_id: Option<String>,
         outputs: Vec<OutputDevice>,
+    },
+    VolumeChanged {
+        volume: u8,
+        muted: bool,
     },
     TrackEnded {
         track_id: String,

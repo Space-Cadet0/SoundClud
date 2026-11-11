@@ -28,26 +28,103 @@ function getSafeLocalStorage(): Storage | null {
   }
 }
 
-function querySoundCloudPlayerTitleHint(): DomTrackHint | undefined {
-  const primaryTitleAnchor = document.querySelector<HTMLAnchorElement>(
+/**
+ * `ConnectedDomCache` — High-performance cached DOM lookup registry.
+ * Validates `.isConnected` on each access to provide O(1) lookups during steady-state
+ * playback while automatically invalidating and querying fresh elements if the host
+ * SPA unmounts, re-renders, or replaces elements in the DOM tree.
+ */
+export class ConnectedDomCache {
+  private readonly elements = new Map<string, Element>();
+  private readonly doc: Pick<Document, 'querySelector' | 'querySelectorAll'> | undefined;
+
+  public constructor(doc?: Pick<Document, 'querySelector' | 'querySelectorAll'>) {
+    this.doc = doc;
+  }
+
+  private getDocument(): Pick<Document, 'querySelector' | 'querySelectorAll'> | undefined {
+    return this.doc ?? (typeof document !== 'undefined' ? document : undefined);
+  }
+
+  public query<T extends Element>(selector: string): T | null {
+    const doc = this.getDocument();
+    if (doc === undefined) {
+      return null;
+    }
+    const cached = this.elements.get(selector);
+    if (cached !== undefined && cached.isConnected) {
+      return cached as T;
+    }
+    const found = doc.querySelector<T>(selector);
+    if (found !== null) {
+      this.elements.set(selector, found);
+    } else {
+      this.elements.delete(selector);
+    }
+    return found;
+  }
+
+  public getOrResolve<T extends Element>(key: string, resolver: () => T | null): T | null {
+    const cached = this.elements.get(key);
+    if (cached !== undefined && cached.isConnected) {
+      return cached as T;
+    }
+    const resolved = resolver();
+    if (resolved !== null) {
+      this.elements.set(key, resolved);
+    } else {
+      this.elements.delete(key);
+    }
+    return resolved;
+  }
+
+  public clear(): void {
+    this.elements.clear();
+  }
+
+  public size(): number {
+    return this.elements.size;
+  }
+}
+
+export const defaultDomCache = new ConnectedDomCache();
+
+export function querySoundCloudPlayerTitleHint(
+  domCache: ConnectedDomCache = defaultDomCache,
+): DomTrackHint | undefined {
+  const primaryTitleAnchor = domCache.query<HTMLAnchorElement>(
     '.playbackSoundBadge__titleLink',
   );
-  const candidateAnchor =
-    primaryTitleAnchor ??
-    Array.from(
-      document.querySelectorAll<HTMLAnchorElement>('.playbackSoundBadge a[href]'),
-    ).find((anchor) => {
-      const rawHref = anchor.getAttribute('href')?.trim() ?? '';
-      if (rawHref.length === 0) {
-        return false;
-      }
-      try {
-        const parsed = new URL(rawHref, 'https://soundcloud.com');
-        return parsed.pathname.split('/').filter((s) => s.length > 0).length >= 2;
-      } catch {
-        return false;
-      }
-    });
+  let candidateAnchor: HTMLAnchorElement | null = primaryTitleAnchor;
+  if (candidateAnchor === null) {
+    candidateAnchor = domCache.getOrResolve<HTMLAnchorElement>(
+      'fallbackBadgeAnchor',
+      () => {
+        if (typeof document === 'undefined') {
+          return null;
+        }
+        const anchors = Array.from(
+          document.querySelectorAll<HTMLAnchorElement>('.playbackSoundBadge a[href]'),
+        );
+        return (
+          anchors.find((anchor) => {
+            const rawHref = anchor.getAttribute('href')?.trim() ?? '';
+            if (rawHref.length === 0) {
+              return false;
+            }
+            try {
+              const parsed = new URL(rawHref, 'https://soundcloud.com');
+              return (
+                parsed.pathname.split('/').filter((s) => s.length > 0).length >= 2
+              );
+            } catch {
+              return false;
+            }
+          }) ?? null
+        );
+      },
+    );
+  }
 
   const href = candidateAnchor?.getAttribute('href')?.trim();
   const titleAttr = candidateAnchor?.getAttribute('title')?.trim();
@@ -67,17 +144,21 @@ function querySoundCloudPlayerTitleHint(): DomTrackHint | undefined {
     };
   }
   return {
-    permalinkOrPath: window.location.pathname,
+    permalinkOrPath:
+      typeof window !== 'undefined' ? window.location.pathname : '',
     isPlayerBadge: false,
   };
 }
 
-function clickSoundCloudTransportButton(direction: 'next' | 'previous'): void {
+export function clickSoundCloudTransportButton(
+  direction: 'next' | 'previous',
+  domCache: ConnectedDomCache = defaultDomCache,
+): void {
   const selector =
     direction === 'next'
       ? '.playControls__next, button.skipControl__next'
       : '.playControls__prev, button.skipControl__previous';
-  const btn = document.querySelector<HTMLButtonElement>(selector);
+  const btn = domCache.query<HTMLButtonElement>(selector);
   btn?.click();
 }
 
@@ -105,7 +186,7 @@ function bootstrapMainWorld(): void {
 
   const keepalive = new MediaKeyKeepaliveController({
     onPlay: () => {
-      const playBtn = document.querySelector<HTMLButtonElement>(
+      const playBtn = defaultDomCache.query<HTMLButtonElement>(
         '.playControls__play, button.playControl',
       );
       if (playBtn !== null && !playBtn.classList.contains('playing')) {
@@ -113,7 +194,7 @@ function bootstrapMainWorld(): void {
       }
     },
     onPause: () => {
-      const playBtn = document.querySelector<HTMLButtonElement>(
+      const playBtn = defaultDomCache.query<HTMLButtonElement>(
         '.playControls__play, button.playControl',
       );
       if (playBtn !== null && playBtn.classList.contains('playing')) {
@@ -123,10 +204,10 @@ function bootstrapMainWorld(): void {
       }
     },
     onPreviousTrack: () => {
-      clickSoundCloudTransportButton('previous');
+      clickSoundCloudTransportButton('previous', defaultDomCache);
     },
     onNextTrack: () => {
-      clickSoundCloudTransportButton('next');
+      clickSoundCloudTransportButton('next', defaultDomCache);
     },
     onSeekTo: (seconds) => {
       virtualizerRef?.seekFromMediaSession(seconds);
@@ -158,7 +239,7 @@ function bootstrapMainWorld(): void {
         return nativeBridgeProxy?.getNativePaused(el) ?? true;
       },
     },
-    resolveDomTrackHint: querySoundCloudPlayerTitleHint,
+    resolveDomTrackHint: () => querySoundCloudPlayerTitleHint(defaultDomCache),
   });
   virtualizerRef = virtualizer;
 
@@ -253,6 +334,10 @@ function bootstrapMainWorld(): void {
   });
 }
 
-if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+if (
+  typeof window !== 'undefined' &&
+  typeof document !== 'undefined' &&
+  (typeof process === 'undefined' || process.env?.NODE_ENV !== 'test')
+) {
   bootstrapMainWorld();
 }

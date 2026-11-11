@@ -47,6 +47,36 @@
       <p id="now-playing" class="now-playing" hidden></p>
     </section>
 
+    <section class="amp-volume-card" id="amp-volume-card" hidden aria-labelledby="amp-volume-heading">
+      <div class="amp-volume-header">
+        <h2 id="amp-volume-heading" class="amp-volume-title">Amplifier Master Volume</h2>
+        <span class="amp-volume-badge">0 dB Bit-Perfect Stream</span>
+      </div>
+      <div class="amp-volume-controls">
+        <button type="button" id="amp-mute-btn" class="icon-btn" aria-label="Toggle amplifier mute" title="Toggle mute">
+          <svg class="speaker-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+          </svg>
+        </button>
+        <button type="button" id="amp-vol-down-btn" class="step-btn" aria-label="Volume down" title="Volume -2%">−</button>
+        <div class="slider-wrapper">
+          <input
+            type="range"
+            id="amp-volume-slider"
+            min="0"
+            max="100"
+            step="1"
+            value="25"
+            class="amp-volume-slider"
+            aria-label="Amplifier Master Volume"
+          >
+        </div>
+        <button type="button" id="amp-vol-up-btn" class="step-btn" aria-label="Volume up" title="Volume +2%">+</button>
+        <span id="amp-volume-label" class="amp-volume-label" aria-live="polite">25%</span>
+      </div>
+    </section>
+
     <section class="outputs-section" aria-labelledby="outputs-heading">
       <div class="section-header">
         <h2 id="outputs-heading">Hi-Fi Audio Outputs</h2>

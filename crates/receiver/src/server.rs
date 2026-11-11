@@ -6,18 +6,20 @@ use crate::media_routes::{
     get_hls_segment,
 };
 use crate::protocol::{
-    ApiErrorResponse, AudioDevicesResponse, DiscoverResponse, PairRequest, PairResponse,
-    ReceiverArch, ReceiverPlatform, StatusResponse, UpdateConfigRequest, UpdateConfigResponse,
-    DEFAULT_DISCOVERY_PORT, PROTOCOL_VERSION,
+    ApiErrorResponse, AudioDevicesResponse, DiscoverResponse, GetVolumeResponse, PairRequest,
+    PairResponse, ReceiverArch, ReceiverPlatform, SetVolumeRequest, SetVolumeResponse,
+    StatusResponse, UpdateConfigRequest, UpdateConfigResponse, DEFAULT_DISCOVERY_PORT,
+    PROTOCOL_VERSION,
 };
 use crate::security::{is_allowed_receiver_host, validate_origin_header, PersistedReceiverState};
 use crate::ws_handler::handle_ws_socket;
-use axum::extract::{Request, State, WebSocketUpgrade};
+use axum::extract::{Query, Request, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -166,6 +168,10 @@ pub fn build_router(coord: Arc<ReceiverCoordinator>) -> Router {
         .route("/discover", get(handle_discover))
         .route("/pair", post(handle_pair))
         .route("/audio/devices", get(handle_audio_devices))
+        .route(
+            "/audio/volume",
+            get(handle_get_volume).post(handle_set_volume),
+        )
         .route("/config", post(handle_update_config))
         .route("/status", get(handle_status))
         .route("/ws", get(handle_ws_upgrade))
@@ -325,6 +331,137 @@ async fn handle_audio_devices(
         active_output_id: cfg.active_output_id,
         outputs,
     })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GetVolumeQuery {
+    #[serde(default)]
+    output_id: Option<String>,
+}
+
+async fn handle_get_volume(
+    State(coord): State<Arc<ReceiverCoordinator>>,
+    Query(query): Query<GetVolumeQuery>,
+) -> impl IntoResponse {
+    let (vol, muted, supports) = match coord.get_hardware_volume(query.output_id.as_deref()).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new("volume_query_failed", e)),
+            )
+                .into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(GetVolumeResponse {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            volume: vol,
+            muted,
+            supports_hardware_volume: supports,
+            output_id: query.output_id,
+        }),
+    )
+        .into_response()
+}
+
+async fn handle_set_volume(
+    State(coord): State<Arc<ReceiverCoordinator>>,
+    headers: HeaderMap,
+    Json(payload): Json<SetVolumeRequest>,
+) -> Response {
+    // 1. Enforce Bearer pairing token authentication (matching handle_update_config standard)
+    let authorized = extract_bearer_token(&headers).is_some_and(|tok| coord.verify_token(tok));
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ApiErrorResponse::new(
+                "unauthorized",
+                "valid Bearer pairing token required",
+            )),
+        )
+            .into_response();
+    }
+
+    // 2. Validate payload: at least one of volume or muted must be present
+    if payload.volume.is_none() && payload.muted.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorResponse::new(
+                "invalid_payload",
+                "either volume or muted must be provided",
+            )),
+        )
+            .into_response();
+    }
+
+    // 3. Validate volume range: if Some(vol), 0..=100
+    if let Some(vol) = payload.volume {
+        if vol > 100 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiErrorResponse::new(
+                    "invalid_volume_range",
+                    "volume must be within 0..=100",
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    // 4. Decoupled execution with strict ordering:
+    // If both volume and muted are provided, set volume FIRST, then set mute SECOND.
+    // Setting volume first prevents HEOS firmware from unmuting the amplifier.
+    let vol = if let Some(target_vol) = payload.volume {
+        match coord
+            .set_hardware_volume(payload.output_id.as_deref(), target_vol)
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse::new("set_volume_failed", err)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        coord.cached_volume().0
+    };
+
+    let muted = if let Some(m) = payload.muted {
+        match coord
+            .set_hardware_mute(payload.output_id.as_deref(), m)
+            .await
+        {
+            Ok(mute_state) => mute_state,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiErrorResponse::new("set_volume_failed", err)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        coord.cached_volume().1
+    };
+
+    let supports = coord.supports_hardware_volume(payload.output_id.as_deref());
+
+    // 5. Return SetVolumeResponse using confirmed values (eliminates redundant network roundtrip & race condition)
+    (
+        StatusCode::OK,
+        Json(SetVolumeResponse {
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            volume: vol,
+            muted,
+            supports_hardware_volume: supports,
+        }),
+    )
+        .into_response()
 }
 
 async fn handle_update_config(

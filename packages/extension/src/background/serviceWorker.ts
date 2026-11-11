@@ -30,7 +30,7 @@ import {
   discoverReceivers,
   normalizeReceiverEndpointBaseUrl,
 } from './discovery.js';
-import { ReceiverWsController } from './wsController.js';
+import { ReceiverWsController, allocateTimestampCommandSeq } from './wsController.js';
 
 export const KEEPALIVE_ALARM_NAME = 'soundclud-ws-keepalive' as const;
 
@@ -191,6 +191,57 @@ export class ExtensionBackgroundCoordinator {
         case 'forward_main_message': {
           await this.handleMainWorldMessage(request.message, senderTabId);
           const snapshot = await this.broadcastCurrentSnapshot();
+          return { ok: true, snapshot };
+        }
+
+        case 'set_volume': {
+          if (request.volume === undefined && request.muted === undefined) {
+            return {
+              ok: false,
+              error: "At least one of 'volume' or 'muted' must be specified",
+            };
+          }
+          if (
+            request.volume !== undefined &&
+            (typeof request.volume !== 'number' ||
+              !Number.isInteger(request.volume) ||
+              request.volume < 0 ||
+              request.volume > 100)
+          ) {
+            return {
+              ok: false,
+              error: 'Volume must be an integer between 0 and 100',
+            };
+          }
+          if (request.muted !== undefined && typeof request.muted !== 'boolean') {
+            return {
+              ok: false,
+              error: 'Muted must be a boolean',
+            };
+          }
+
+          const commandSeq = allocateTimestampCommandSeq();
+          const sent = await this.wsController.sendCommand({
+            type: 'set_volume',
+            commandSeq,
+            ...(request.volume !== undefined ? { volume: request.volume } : {}),
+            ...(request.muted !== undefined ? { muted: request.muted } : {}),
+          });
+
+          if (!sent) {
+            return {
+              ok: false,
+              error: 'Failed to deliver volume command to receiver',
+            };
+          }
+
+          await updateEphemeralSessionState(this.storage.session, (prev) => ({
+            ...prev,
+            ...(request.volume !== undefined ? { hardwareVolume: request.volume } : {}),
+            ...(request.muted !== undefined ? { hardwareMuted: request.muted } : {}),
+          }));
+
+          const snapshot = await this.getSnapshot();
           return { ok: true, snapshot };
         }
       }

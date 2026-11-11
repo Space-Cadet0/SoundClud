@@ -1,5 +1,10 @@
 use crate::hls_proxy::HlsSession;
 use crate::protocol::{PlayableProtocol, BIT_PERFECT_BIT_DEPTH, BIT_PERFECT_SAMPLE_RATE_HZ};
+use crate::stream_planner::{
+    compute_effective_window_pcm_bytes, MAX_DLNA_PCM_WINDOW_BYTES, MAX_DLNA_WINDOW_DURATION_MS,
+    PCM_BLOCK_ALIGN, PCM_BYTES_PER_SAMPLE, PCM_BYTE_RATE, PCM_CHANNELS,
+};
+pub use crate::stream_planner::{parse_http_byte_range, ByteRangeSpec};
 use bytes::Bytes;
 use std::io::Read;
 use std::sync::Arc;
@@ -13,36 +18,21 @@ use symphonia::core::probe::Hint;
 use tokio::sync::mpsc;
 
 pub const WAV_HEADER_BYTES: u64 = 44;
-pub const WAV_CHANNELS: u16 = 2;
-pub const WAV_BYTES_PER_SAMPLE: u16 = 3; // 24-bit = 3 bytes
-pub const WAV_BLOCK_ALIGN: u16 = WAV_CHANNELS * WAV_BYTES_PER_SAMPLE; // 6 bytes/frame
-pub const WAV_BYTE_RATE: u32 = BIT_PERFECT_SAMPLE_RATE_HZ * (WAV_BLOCK_ALIGN as u32); // 264,600 B/s
 
-/// Capped below signed 32-bit `i32::MAX` (`2,147,483,647`) minus the 44-byte RIFF header,
-/// aligned to `WAV_BLOCK_ALIGN = 6` bytes (`357,913,930` frames, ~`2h 15m 15s` per window)
-/// so 32-bit ARM DLNA/UPnP renderers never overflow signed 32-bit `Content-Length` or `size`.
-pub const MAX_WAV_PCM_WINDOW_BYTES: u32 = 2_147_483_580;
-pub const MAX_WAV_WINDOW_DURATION_MS: u64 =
-    (MAX_WAV_PCM_WINDOW_BYTES as u64 * 1_000) / (WAV_BYTE_RATE as u64);
+// Backward-compatibility aliases
+pub const WAV_CHANNELS: u16 = PCM_CHANNELS;
+pub const WAV_BYTES_PER_SAMPLE: u16 = PCM_BYTES_PER_SAMPLE;
+pub const WAV_BLOCK_ALIGN: u16 = PCM_BLOCK_ALIGN;
+pub const WAV_BYTE_RATE: u32 = PCM_BYTE_RATE;
+pub const MAX_WAV_PCM_WINDOW_BYTES: u32 = MAX_DLNA_PCM_WINDOW_BYTES;
+pub const MAX_WAV_WINDOW_DURATION_MS: u64 = MAX_DLNA_WINDOW_DURATION_MS;
 
 pub const DLNA_WAV_FEATURES: &str =
     "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ByteRangeSpec {
-    pub start: u64,
-    pub end_inclusive: u64,
-}
-
 #[must_use]
 pub fn compute_total_pcm_bytes(duration_ms: u64, start_ms: u64) -> u32 {
-    let rem_ms = duration_ms.saturating_sub(start_ms);
-    let effective_ms = if rem_ms == 0 { 3_600_000 } else { rem_ms };
-    let frames = (u128::from(effective_ms) * u128::from(BIT_PERFECT_SAMPLE_RATE_HZ)) / 1_000;
-    let raw_bytes =
-        (frames * u128::from(WAV_BLOCK_ALIGN)).min(u128::from(MAX_WAV_PCM_WINDOW_BYTES));
-    let aligned = (raw_bytes / u128::from(WAV_BLOCK_ALIGN)) * u128::from(WAV_BLOCK_ALIGN);
-    u32::try_from(aligned).unwrap_or(MAX_WAV_PCM_WINDOW_BYTES)
+    compute_effective_window_pcm_bytes(duration_ms, start_ms, MAX_DLNA_PCM_WINDOW_BYTES)
 }
 
 /// Builds a standard 44-byte RIFF `WAVE` (`WAVE_FORMAT_PCM`, `44,100 Hz`, `24-bit`, stereo) header.
@@ -66,55 +56,6 @@ pub fn build_wav_header(pcm_data_bytes: u32) -> [u8; 44] {
     hdr
 }
 
-/// Parses an HTTP `Range: bytes=<start>-[<end>]` header against `total_file_bytes`.
-pub fn parse_http_byte_range(
-    range_header: &str,
-    total_file_bytes: u64,
-) -> Result<ByteRangeSpec, &'static str> {
-    if total_file_bytes == 0 {
-        return Err("empty_resource");
-    }
-    let spec = range_header
-        .trim()
-        .strip_prefix("bytes=")
-        .ok_or("unsupported_range_unit")?;
-    let first_range = spec.split(',').next().unwrap_or("").trim();
-    let (start_str, end_str) = first_range.split_once('-').ok_or("malformed_range")?;
-    if start_str.is_empty() {
-        let suffix_len = end_str.parse::<u64>().map_err(|_| "invalid_suffix_range")?;
-        if suffix_len == 0 {
-            return Err("zero_suffix_range");
-        }
-        let start = total_file_bytes.saturating_sub(suffix_len);
-        return Ok(ByteRangeSpec {
-            start,
-            end_inclusive: total_file_bytes - 1,
-        });
-    }
-    let start = start_str
-        .parse::<u64>()
-        .map_err(|_| "invalid_range_start")?;
-    if start >= total_file_bytes {
-        return Err("range_start_out_of_bounds");
-    }
-    let end_inclusive = if end_str.trim().is_empty() {
-        total_file_bytes - 1
-    } else {
-        let parsed_end = end_str
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| "invalid_range_end")?;
-        if parsed_end < start {
-            return Err("range_end_before_start");
-        }
-        parsed_end.min(total_file_bytes - 1)
-    };
-    Ok(ByteRangeSpec {
-        start,
-        end_inclusive,
-    })
-}
-
 pub(crate) struct LinearStereoResampler {
     src_rate: u32,
     phase_num: i64,
@@ -128,6 +69,11 @@ impl LinearStereoResampler {
             phase_num: 0,
             prev_frame: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn src_rate(&self) -> u32 {
+        self.src_rate
     }
 
     pub(crate) fn process(&mut self, stereo_in: &[(f32, f32)], out: &mut Vec<(f32, f32)>) {
@@ -489,8 +435,10 @@ async fn stream_progressive_to_wav(
             let Ok(decoded) = decoder.decode(&packet) else {
                 continue;
             };
-            let rs =
-                resampler.get_or_insert_with(|| LinearStereoResampler::new(decoded.spec().rate));
+            let rs = match &mut resampler {
+                Some(rs) if rs.src_rate() == decoded.spec().rate => rs,
+                _ => resampler.insert(LinearStereoResampler::new(decoded.spec().rate)),
+            };
             raw_stereo.clear();
             resampled_stereo.clear();
             extract_stereo_frames(decoded, &mut raw_stereo);

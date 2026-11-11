@@ -13,6 +13,7 @@ import {
   isPlainObject,
   ok,
   readArray,
+  readBoolean,
   readEnum,
   readLiteral,
   readNonEmptyString,
@@ -126,6 +127,27 @@ export function parseServerWsEvent(input: unknown): Result<ServerWsEvent> {
           ? { activeOutputId: activeOutputId.value }
           : {}),
         outputs: outputs.value,
+      });
+    }
+
+    case 'volume_changed': {
+      const ctx = 'ServerWsEvent(volume_changed)';
+      const volume = readNonNegativeInt(obj, 'volume', ctx);
+      if (!volume.ok) return volume;
+      if (volume.value > 100) {
+        return err(
+          `${ctx}.volume: expected volume between 0 and 100, got ${volume.value}`,
+        );
+      }
+      const muted = readBoolean(obj, 'muted', ctx);
+      if (!muted.ok) return muted;
+      const outputId = readOptionalNonEmptyString(obj, 'outputId', ctx, true);
+      if (!outputId.ok) return outputId;
+      return ok({
+        type: 'volume_changed',
+        volume: volume.value,
+        muted: muted.value,
+        ...(outputId.value !== undefined ? { outputId: outputId.value } : {}),
       });
     }
 

@@ -3,6 +3,11 @@
  */
 
 import { PROTOCOL_VERSION } from './constants.js';
+import type {
+  GetVolumeResponse,
+  SetVolumeRequest,
+  SetVolumeResponse,
+} from './models.js';
 import { parseOutputDeviceObject } from './outputValidators.js';
 import type { OutputDevice } from './outputs.js';
 import {
@@ -31,8 +36,10 @@ import {
   readEnum,
   readLiteral,
   readNonEmptyString,
+  readNonNegativeInt,
   readOptionalBoolean,
   readOptionalNonEmptyString,
+  readOptionalNonNegativeInt,
   readString,
   unwrapJsonObject,
   type Result,
@@ -299,5 +306,108 @@ export function parseApiErrorResponse(
       code: code.value,
       message: message.value,
     },
+  });
+}
+
+export function parseSetVolumeRequest(
+  input: unknown,
+): Result<SetVolumeRequest> {
+  const unwrapped = unwrapJsonObject(input, 'SetVolumeRequest');
+  if (!unwrapped.ok) return unwrapped;
+  const obj = unwrapped.value;
+  const ctx = 'SetVolumeRequest';
+
+  const volume = readOptionalNonNegativeInt(obj, 'volume', ctx, true);
+  if (!volume.ok) return volume;
+  if (volume.value !== undefined && volume.value > 100) {
+    return err(
+      `${ctx}.volume: expected volume between 0 and 100, got ${volume.value}`,
+    );
+  }
+
+  const muted = readOptionalBoolean(obj, 'muted', ctx, true);
+  if (!muted.ok) return muted;
+
+  if (volume.value === undefined && muted.value === undefined) {
+    return err(`${ctx}: either volume or muted must be provided`);
+  }
+
+  const outputId = readOptionalNonEmptyString(obj, 'outputId', ctx, true);
+  if (!outputId.ok) return outputId;
+
+  return ok({
+    ...(volume.value !== undefined ? { volume: volume.value } : {}),
+    ...(muted.value !== undefined ? { muted: muted.value } : {}),
+    ...(outputId.value !== undefined ? { outputId: outputId.value } : {}),
+  });
+}
+
+export function parseGetVolumeResponse(
+  input: unknown,
+): Result<GetVolumeResponse> {
+  const unwrapped = unwrapJsonObject(input, 'GetVolumeResponse');
+  if (!unwrapped.ok) return unwrapped;
+  const obj = unwrapped.value;
+  const ctx = 'GetVolumeResponse';
+
+  const protocolVersion = readLiteral(obj, 'protocolVersion', PROTOCOL_VERSION, ctx);
+  if (!protocolVersion.ok) return protocolVersion;
+
+  const volume = readNonNegativeInt(obj, 'volume', ctx);
+  if (!volume.ok) return volume;
+  if (volume.value > 100) {
+    return err(
+      `${ctx}.volume: expected volume between 0 and 100, got ${volume.value}`,
+    );
+  }
+
+  const muted = readBoolean(obj, 'muted', ctx);
+  if (!muted.ok) return muted;
+
+  const supportsHardwareVolume = readBoolean(obj, 'supportsHardwareVolume', ctx);
+  if (!supportsHardwareVolume.ok) return supportsHardwareVolume;
+
+  const outputId = readOptionalNonEmptyString(obj, 'outputId', ctx, true);
+  if (!outputId.ok) return outputId;
+
+  return ok({
+    protocolVersion: protocolVersion.value,
+    volume: volume.value,
+    muted: muted.value,
+    supportsHardwareVolume: supportsHardwareVolume.value,
+    ...(outputId.value !== undefined ? { outputId: outputId.value } : {}),
+  });
+}
+
+export function parseSetVolumeResponse(
+  input: unknown,
+): Result<SetVolumeResponse> {
+  const unwrapped = unwrapJsonObject(input, 'SetVolumeResponse');
+  if (!unwrapped.ok) return unwrapped;
+  const obj = unwrapped.value;
+  const ctx = 'SetVolumeResponse';
+
+  const protocolVersion = readLiteral(obj, 'protocolVersion', PROTOCOL_VERSION, ctx);
+  if (!protocolVersion.ok) return protocolVersion;
+
+  const volume = readNonNegativeInt(obj, 'volume', ctx);
+  if (!volume.ok) return volume;
+  if (volume.value > 100) {
+    return err(
+      `${ctx}.volume: expected volume between 0 and 100, got ${volume.value}`,
+    );
+  }
+
+  const muted = readBoolean(obj, 'muted', ctx);
+  if (!muted.ok) return muted;
+
+  const supportsHardwareVolume = readBoolean(obj, 'supportsHardwareVolume', ctx);
+  if (!supportsHardwareVolume.ok) return supportsHardwareVolume;
+
+  return ok({
+    protocolVersion: protocolVersion.value,
+    volume: volume.value,
+    muted: muted.value,
+    supportsHardwareVolume: supportsHardwareVolume.value,
   });
 }

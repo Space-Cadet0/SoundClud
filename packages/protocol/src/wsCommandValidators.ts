@@ -14,8 +14,10 @@ import {
   readNonEmptyString,
   readNonNegativeInt,
   readNonNegativeNumber,
+  readOptionalBoolean,
   readOptionalEnum,
   readOptionalNonEmptyString,
+  readOptionalNonNegativeInt,
   readOptionalString,
   unwrapJsonObject,
   type Result,
@@ -150,6 +152,34 @@ export function parseClientWsCommand(input: unknown): Result<ClientWsCommand> {
         type: 'select_output',
         commandSeq: commandSeq.value,
         outputId: outputId.value,
+      });
+    }
+
+    case 'set_volume': {
+      const ctx = 'ClientWsCommand(set_volume)';
+      const commandSeq = readNonNegativeInt(obj, 'commandSeq', ctx);
+      if (!commandSeq.ok) return commandSeq;
+
+      const volume = readOptionalNonNegativeInt(obj, 'volume', ctx, true);
+      if (!volume.ok) return volume;
+      if (volume.value !== undefined && volume.value > 100) {
+        return err(
+          `${ctx}.volume: expected volume between 0 and 100, got ${volume.value}`,
+        );
+      }
+
+      const muted = readOptionalBoolean(obj, 'muted', ctx, true);
+      if (!muted.ok) return muted;
+
+      if (volume.value === undefined && muted.value === undefined) {
+        return err(`${ctx}: either volume or muted must be provided`);
+      }
+
+      return ok({
+        type: 'set_volume',
+        commandSeq: commandSeq.value,
+        ...(volume.value !== undefined ? { volume: volume.value } : {}),
+        ...(muted.value !== undefined ? { muted: muted.value } : {}),
       });
     }
 

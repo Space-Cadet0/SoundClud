@@ -562,8 +562,8 @@ async fn wakes_heos_from_standby_streams_24bit_44100_flac_scrubs_and_never_touch
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c == "heos://player/set_play_state?pid=42&state=play"),
-        "must assert state=play on HEOS CLI for bound pid"
+            .any(|c| c == "heos://player/get_play_state?pid=42"),
+        "must query get_play_state on HEOS CLI for bound pid without transport mutation"
     );
 
     // Verify capability-token enforcement on both /stream.flac and /stream.wav
@@ -639,12 +639,10 @@ async fn wakes_heos_from_standby_streams_24bit_44100_flac_scrubs_and_never_touch
     assert!(summary
         .tags
         .contains(&("ARTIST".to_string(), "Studio Ensemble".to_string())));
-    assert!(summary
+    assert!(!summary
         .tags
-        .contains(&("ALBUM".to_string(), "SoundCloud".to_string())));
-    assert!(summary
-        .tags
-        .contains(&("GENRE".to_string(), "Music".to_string())));
+        .iter()
+        .any(|(k, _)| k == "ALBUM" || k == "GENRE"));
 
     // Verify HTTP 206 mid-stream byte-range request (jump into mid-audio block 11 ~ 1.0s)
     // and prove prefix + mid-audio range reassembles to a byte-identical valid symphonia FLAC!
@@ -727,8 +725,8 @@ async fn wakes_heos_from_standby_streams_24bit_44100_flac_scrubs_and_never_touch
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c.to_ascii_lowercase().contains("volume")),
-        "must never call HEOS CLI volume commands"
+            .any(|c| c.to_ascii_lowercase().contains("set_volume")),
+        "must never call HEOS CLI set_volume mutation commands during playback"
     );
     assert_eq!(mpv_connections.load(Ordering::SeqCst), 0);
 

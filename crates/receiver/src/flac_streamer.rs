@@ -1,17 +1,20 @@
 use crate::hls_proxy::HlsSession;
 use crate::protocol::{TrackMetadata, BIT_PERFECT_BIT_DEPTH, BIT_PERFECT_SAMPLE_RATE_HZ};
-use crate::wav_streamer::{spawn_pcm24_window_stream, ByteRangeSpec, WAV_BLOCK_ALIGN};
+use crate::stream_planner::{
+    compute_flac_window_blocks, ByteRangeSpec, MAX_FLAC_DLNA_BLOCKS, PCM_BLOCK_ALIGN,
+};
+use crate::wav_streamer::spawn_pcm24_window_stream;
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub const FLAC_BLOCK_SAMPLES: u16 = 4096;
-pub const FLAC_PCM_BLOCK_BYTES: usize = (FLAC_BLOCK_SAMPLES as usize) * (WAV_BLOCK_ALIGN as usize);
+pub const FLAC_PCM_BLOCK_BYTES: usize = (FLAC_BLOCK_SAMPLES as usize) * (PCM_BLOCK_ALIGN as usize);
 pub const FLAC_BASE_FRAME_BYTES: u64 = 24_585;
 
 /// Capped at `87,300` blocks (`~2h 15m 08s`, `~2,146,554,000` bytes `< i32::MAX`)
 /// so 32-bit DLNA/UPnP renderers never overflow signed 32-bit `Content-Length` or `<res size>`.
-pub const MAX_FLAC_WINDOW_BLOCKS: u32 = 87_300;
+pub const MAX_FLAC_WINDOW_BLOCKS: u32 = MAX_FLAC_DLNA_BLOCKS;
 
 pub const DLNA_FLAC_FEATURES: &str =
     "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
@@ -253,13 +256,16 @@ pub fn build_flac_header(track: &TrackMetadata, total_blocks: u32) -> Vec<u8> {
     // 3. VORBIS_COMMENT (is_last = 1, type = 4, 24-bit BE block len, 32-bit LE string lens)
     let title = sanitize_display_text(&track.title, "SoundCloud Track");
     let artist = sanitize_display_text(&track.artist, "SoundCloud");
+    let mut comments: Vec<String> = Vec::with_capacity(2);
+    comments.push(format!("TITLE={title}"));
+    comments.push(format!("ARTIST={artist}"));
+
     let mut vc = Vec::with_capacity(256);
     push_vorbis_str(&mut vc, "SoundClud");
-    vc.extend_from_slice(&4u32.to_le_bytes());
-    push_vorbis_str(&mut vc, &format!("TITLE={title}"));
-    push_vorbis_str(&mut vc, &format!("ARTIST={artist}"));
-    push_vorbis_str(&mut vc, "ALBUM=SoundCloud");
-    push_vorbis_str(&mut vc, "GENRE=Music");
+    vc.extend_from_slice(&(comments.len() as u32).to_le_bytes());
+    for comment in &comments {
+        push_vorbis_str(&mut vc, comment);
+    }
 
     hdr.push(0x80 | 0x04);
     push_u24_be(&mut hdr, u32::try_from(vc.len()).unwrap_or(0));
@@ -273,13 +279,12 @@ pub fn compute_flac_stream_plan(
     duration_ms: u64,
     start_ms: u64,
 ) -> FlacStreamPlan {
-    let rem_ms = duration_ms.saturating_sub(start_ms);
-    let effective_ms = if rem_ms == 0 { 3_600_000 } else { rem_ms };
-    let frames =
-        (u128::from(effective_ms) * u128::from(BIT_PERFECT_SAMPLE_RATE_HZ)).div_ceil(1_000);
-    let raw_blocks = frames.div_ceil(u128::from(FLAC_BLOCK_SAMPLES));
-    let total_blocks = u32::try_from(raw_blocks.clamp(1, u128::from(MAX_FLAC_WINDOW_BLOCKS)))
-        .unwrap_or(MAX_FLAC_WINDOW_BLOCKS);
+    let total_blocks = compute_flac_window_blocks(
+        duration_ms,
+        start_ms,
+        FLAC_BLOCK_SAMPLES,
+        MAX_FLAC_WINDOW_BLOCKS,
+    );
 
     let header_vec = build_flac_header(track, total_blocks);
     let total_audio_bytes = audio_byte_offset_for_block(u64::from(total_blocks));

@@ -17,7 +17,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-const MAX_CACHED_SEGMENTS: usize = 96;
+/// Maximum number of raw downloaded HLS audio segments retained in RAM cache.
+/// 24 segments at ~6.0s/segment retains ~144 seconds (~2.4 minutes) of audio,
+/// reducing peak RAM footprint by ~75% (~5-8 MB vs ~20-35 MB) while providing
+/// abundant forward buffer headroom and instant local backward-scrub hits.
+const MAX_CACHED_SEGMENTS: usize = 24;
 const MAX_CACHED_PCM_SEGMENTS: usize = 6;
 const PROACTIVE_REFRESH_AGE: Duration = Duration::from_secs(12 * 60);
 

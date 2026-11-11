@@ -3,8 +3,8 @@ use crate::backends::heos_discovery::{
 };
 use crate::backends::heos_mcu::{
     activate_host_mcu_zone, assert_heos_cli_play_state, check_host_mcu_power, extract_device_ip,
-    keepalive_host_mcu, ping_heos_cli_keepalive, resolve_heos_player_pid, resolve_mcu_port,
-    McuPowerStatus,
+    get_heos_cli_volume, keepalive_host_mcu, ping_heos_cli_keepalive, resolve_heos_player_pid,
+    resolve_mcu_port, set_heos_cli_mute, set_heos_cli_volume, McuPowerStatus,
 };
 use crate::backends::heos_soap::{
     avt_get_position_info, avt_get_transport_info, avt_pause, avt_play, avt_seek_rel_time,
@@ -24,11 +24,104 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
+// =========================================================================
+// HEOS Timing, Settle, Retry & Guard Constants
+// =========================================================================
+
+/// Duration HTTP client waits for UPnP SOAP responses from the amplifier.
+pub const HEOS_SOAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Timeout for querying player PID from HEOS CLI on port 1255.
+pub const HEOS_PID_RESOLVE_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// Deadlines for resolving player PID during standby wake sequence.
+pub const HEOS_WAKE_PID_DEADLINE_LOOPBACK: Duration = Duration::from_millis(700);
+pub const HEOS_WAKE_PID_DEADLINE_HARDWARE: Duration = Duration::from_millis(3_500);
+
+/// Minimum UART settle time allowed after waking Host-MCU before streaming.
+pub const HEOS_WAKE_MCU_SETTLE_LOOPBACK: Duration = Duration::from_millis(40);
+pub const HEOS_WAKE_MCU_SETTLE_HARDWARE: Duration = Duration::from_millis(1_200);
+
+/// Duration of the transition guard after track load, seek, or pause/resume (suppresses spurious position jumps).
+pub const HEOS_TRANSITION_GUARD_DURATION: Duration = Duration::from_millis(2_500);
+
+/// Maximum position drift (in milliseconds) permitted during a transition guard before ignoring reported position.
+pub const HEOS_TRANSITION_DRIFT_TOLERANCE_MS: i128 = 2_500;
+
+/// Maximum time allowed for UPnP AVTransport to settle after sending a Stop command.
+pub const HEOS_STOP_SETTLE_DEADLINE: Duration = Duration::from_millis(1_200);
+
+/// Polling sleep duration while waiting for AVTransport to settle after Stop.
+pub const HEOS_STOP_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(80);
+
+/// Maximum retry attempts when sending AVTransport Play command.
+pub const HEOS_AVT_PLAY_MAX_ATTEMPTS: usize = 8;
+
+/// Backoff duration between AVTransport Play retry attempts.
+pub const HEOS_AVT_PLAY_RETRY_BACKOFF: Duration = Duration::from_millis(120);
+
+/// Number of consecutive STOPPED polls required before confirming track end or standby.
+pub const HEOS_STOPPED_CONFIRMATION_THRESHOLD: u8 = 2;
+
+/// Proximity to track duration (in ms) considered "near end" for clean track transitions.
+pub const HEOS_NEAR_END_GUARD_WINDOW_MS: u64 = 5_000;
+
+/// Dynamically scales the near-end window for short tracks (<5s) to avoid premature termination at position 0.
+#[must_use]
+pub fn compute_heos_near_end_window(track_dur_ms: u64) -> u64 {
+    if track_dur_ms == 0 {
+        0
+    } else if track_dur_ms <= HEOS_NEAR_END_GUARD_WINDOW_MS {
+        track_dur_ms / 2
+    } else {
+        HEOS_NEAR_END_GUARD_WINDOW_MS
+    }
+}
+
+/// Verifies that playback has advanced demonstrably beyond the anchor start point before confirming TrackEnded.
+#[must_use]
+pub fn has_playback_progressed(cur_pos_ms: u64, anchor_start_ms: u64, track_dur_ms: u64) -> bool {
+    if track_dur_ms == 0 {
+        return true;
+    }
+    let progress_since_anchor = cur_pos_ms.saturating_sub(anchor_start_ms);
+    let remaining_from_anchor = track_dur_ms.saturating_sub(anchor_start_ms);
+    let min_required = if remaining_from_anchor <= 300 {
+        0
+    } else {
+        (remaining_from_anchor / 4).clamp(100, 1_000)
+    };
+    progress_since_anchor >= min_required
+}
+
+/// Dynamically scales transition guard duration for short tracks to allow prompt state transitions.
+#[must_use]
+pub fn transition_guard_duration_for_track(track_dur_ms: u64) -> Duration {
+    if track_dur_ms > 0 && track_dur_ms < 6_000 {
+        Duration::from_millis((track_dur_ms / 3).max(300))
+    } else {
+        HEOS_TRANSITION_GUARD_DURATION
+    }
+}
+
+/// Synthetic forward buffered advance (in ms) reported to telemetry during playback.
+pub const HEOS_SYNTHETIC_BUFFER_AHEAD_MS: u64 = 2_000;
+
+/// Transition polling interval for fast reaction to seeks, starts, pauses, and wakes.
+pub const HEOS_TRANSITION_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Steady-state polling interval to protect Marantz PM7000N OLED elapsed time progress.
+pub const HEOS_STEADY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+
+/// Default interval for anti-auto-standby Host-MCU ping and HEOS CLI heartbeat.
+pub const HEOS_DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
 pub struct HeosBackendConfig {
     pub enable_lan_multicast: bool,
     pub discovery_seeds: Vec<HeosDiscoverySeed>,
     pub poll_interval: Duration,
+    pub transition_poll_interval: Duration,
     pub keepalive_interval: Duration,
     pub mcu_port_override: Option<u16>,
 }
@@ -38,8 +131,9 @@ impl Default for HeosBackendConfig {
         Self {
             enable_lan_multicast: true,
             discovery_seeds: Vec::new(),
-            poll_interval: Duration::from_millis(250),
-            keepalive_interval: Duration::from_secs(60),
+            poll_interval: HEOS_STEADY_POLL_INTERVAL,
+            transition_poll_interval: HEOS_TRANSITION_POLL_INTERVAL,
+            keepalive_interval: HEOS_DEFAULT_KEEPALIVE_INTERVAL,
             mcu_port_override: None,
         }
     }
@@ -79,6 +173,7 @@ pub struct HeosUpnpBackend {
     event_tx: mpsc::UnboundedSender<BackendEvent>,
     shared: Arc<RwLock<SharedHeosState>>,
     transport_lock: Mutex<()>,
+    cli_command_lock: Mutex<()>,
     active: Mutex<Option<ActiveHeosSession>>,
 }
 
@@ -86,7 +181,7 @@ impl HeosUpnpBackend {
     #[must_use]
     pub fn new(config: HeosBackendConfig, event_tx: mpsc::UnboundedSender<BackendEvent>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(6))
+            .timeout(HEOS_SOAP_CLIENT_TIMEOUT)
             .build()
             .unwrap_or_default();
         Self {
@@ -100,6 +195,7 @@ impl HeosUpnpBackend {
                 last_keepalive_at: None,
             })),
             transport_lock: Mutex::new(()),
+            cli_command_lock: Mutex::new(()),
             active: Mutex::new(None),
         }
     }
@@ -116,6 +212,122 @@ impl HeosUpnpBackend {
             s.snapshot.clone()
         };
         let _ = self.event_tx.send(BackendEvent::StateChanged(snap));
+    }
+
+    pub async fn get_hardware_volume(&self, output_id: Option<&str>) -> Result<(u8, bool), String> {
+        let (ip, cli_port, pid) = {
+            let shared = self
+                .shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ep = if let Some(oid) = output_id {
+                shared.endpoints.get(oid)
+            } else {
+                shared.endpoints.values().next()
+            }
+            .ok_or_else(|| "No HEOS endpoint discovered".to_string())?;
+            (ep.ip, ep.cli_port, ep.heos_pid)
+        };
+
+        let resolved_pid = match pid {
+            Some(p) => p,
+            None => resolve_heos_player_pid(ip, cli_port, HEOS_PID_RESOLVE_TIMEOUT)
+                .await
+                .ok_or_else(|| "Failed to resolve HEOS player PID".to_string())?,
+        };
+
+        get_heos_cli_volume(ip, cli_port, resolved_pid)
+            .await
+            .ok_or_else(|| "Failed to query HEOS master volume".to_string())
+    }
+
+    #[must_use]
+    pub fn active_cli_endpoint(&self, output_id: Option<&str>) -> Option<(IpAddr, u16)> {
+        let shared = self
+            .shared
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ep = if let Some(oid) = output_id {
+            shared.endpoints.get(oid)
+        } else {
+            shared.endpoints.values().next()
+        }?;
+        if ep.cli_port > 0 {
+            Some((ep.ip, ep.cli_port))
+        } else {
+            None
+        }
+    }
+
+    pub async fn set_hardware_volume(
+        &self,
+        output_id: Option<&str>,
+        volume: u8,
+    ) -> Result<u8, String> {
+        let _guard = self.cli_command_lock.lock().await;
+        let clamped = volume.min(100);
+        let (ip, cli_port, pid) = {
+            let shared = self
+                .shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ep = if let Some(oid) = output_id {
+                shared.endpoints.get(oid)
+            } else {
+                shared.endpoints.values().next()
+            }
+            .ok_or_else(|| "No HEOS endpoint discovered".to_string())?;
+            (ep.ip, ep.cli_port, ep.heos_pid)
+        };
+
+        let resolved_pid = match pid {
+            Some(p) => p,
+            None => resolve_heos_player_pid(ip, cli_port, HEOS_PID_RESOLVE_TIMEOUT)
+                .await
+                .ok_or_else(|| "Failed to resolve HEOS player PID".to_string())?,
+        };
+
+        let ok = set_heos_cli_volume(ip, cli_port, resolved_pid, clamped).await;
+        if ok {
+            Ok(clamped)
+        } else {
+            Err("Failed to set HEOS hardware volume".to_string())
+        }
+    }
+
+    pub async fn set_hardware_mute(
+        &self,
+        output_id: Option<&str>,
+        muted: bool,
+    ) -> Result<bool, String> {
+        let _guard = self.cli_command_lock.lock().await;
+        let (ip, cli_port, pid) = {
+            let shared = self
+                .shared
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ep = if let Some(oid) = output_id {
+                shared.endpoints.get(oid)
+            } else {
+                shared.endpoints.values().next()
+            }
+            .ok_or_else(|| "No HEOS endpoint discovered".to_string())?;
+            (ep.ip, ep.cli_port, ep.heos_pid)
+        };
+
+        let resolved_pid = match pid {
+            Some(p) => p,
+            None => resolve_heos_player_pid(ip, cli_port, HEOS_PID_RESOLVE_TIMEOUT)
+                .await
+                .ok_or_else(|| "Failed to resolve HEOS player PID".to_string())?,
+        };
+
+        let ok = set_heos_cli_mute(ip, cli_port, resolved_pid, muted).await;
+        if ok {
+            Ok(muted)
+        } else {
+            Err("Failed to set HEOS mute state".to_string())
+        }
     }
 
     async fn resolve_endpoint(&self, output_id: &str) -> Result<HeosDiscoveredEndpoint, String> {
@@ -166,7 +378,7 @@ impl HeosUpnpBackend {
         let wake_started = Instant::now();
         let mut emitted_waking = false;
 
-        // 1. Wake Host-MCU (:23) FIRST (`PWON` + `SINET` + `SLPOFF`) so UART link is ready
+        // 1. Wake Host-MCU (:23) FIRST (`PWON` + `SINET`) so UART link is ready
         let mut woke_mcu = false;
         if let Some(mcu_port) = resolve_mcu_port(device_ip, self.config.mcu_port_override) {
             if activate_host_mcu_zone(device_ip, mcu_port).await {
@@ -221,9 +433,9 @@ impl HeosUpnpBackend {
         // 3. Wait for HEOS CLI (`:1255` `get_players`) `pid` binding so AIOS bridges metadata & state
         if (woke_mcu || woke_act || endpoint.heos_pid.is_none()) && endpoint.cli_port > 0 {
             let pid_budget = if woke_mcu || woke_act {
-                Duration::from_millis(3_500)
+                HEOS_WAKE_PID_DEADLINE_HARDWARE
             } else {
-                Duration::from_millis(700)
+                HEOS_WAKE_PID_DEADLINE_LOOPBACK
             };
             let pid_deadline = tokio::time::Instant::now() + pid_budget;
             loop {
@@ -231,7 +443,7 @@ impl HeosUpnpBackend {
                 if now >= pid_deadline {
                     break;
                 }
-                let per_try = (pid_deadline - now).min(Duration::from_millis(700));
+                let per_try = (pid_deadline - now).min(HEOS_WAKE_PID_DEADLINE_LOOPBACK);
                 if let Some(pid) =
                     resolve_heos_player_pid(device_ip, endpoint.cli_port, per_try).await
                 {
@@ -258,9 +470,9 @@ impl HeosUpnpBackend {
         // 4. Allow Host-MCU <-> AIOS UART registration settle after waking from standby
         if woke_mcu {
             let min_settle = if device_ip.is_loopback() {
-                Duration::from_millis(40)
+                HEOS_WAKE_MCU_SETTLE_LOOPBACK
             } else {
-                Duration::from_millis(1_200)
+                HEOS_WAKE_MCU_SETTLE_HARDWARE
             };
             let elapsed = wake_started.elapsed();
             if elapsed < min_settle {
@@ -281,20 +493,22 @@ impl HeosUpnpBackend {
     ) -> Result<String, String> {
         session.prewarm_pcm_at(start_ms).await?;
 
+        let track_dur_ms = session.effective_duration_ms();
+        let guard_dur = transition_guard_duration_for_track(track_dur_ms);
         self.shared
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+            .transition_guard_until = Some(Instant::now() + guard_dur);
 
         let _ = avt_stop(&self.client, &endpoint.avt_control_url).await;
-        let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(1_200);
+        let settle_deadline = tokio::time::Instant::now() + HEOS_STOP_SETTLE_DEADLINE;
         while tokio::time::Instant::now() < settle_deadline {
             match avt_get_transport_info(&self.client, &endpoint.avt_control_url).await {
                 Ok(state)
                     if state.eq_ignore_ascii_case("TRANSITIONING")
                         || state.eq_ignore_ascii_case("PAUSED_PLAYBACK") =>
                 {
-                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    tokio::time::sleep(HEOS_STOP_SETTLE_POLL_INTERVAL).await;
                 }
                 _ => break,
             }
@@ -326,7 +540,7 @@ impl HeosUpnpBackend {
 
         let mut last_play_err = String::new();
         let mut play_ok = false;
-        for attempt in 0..8 {
+        for attempt in 0..HEOS_AVT_PLAY_MAX_ATTEMPTS {
             match avt_play(&self.client, &endpoint.avt_control_url).await {
                 Ok(()) => {
                     play_ok = true;
@@ -334,8 +548,8 @@ impl HeosUpnpBackend {
                 }
                 Err(err) => {
                     last_play_err = err;
-                    if attempt + 1 < 8 {
-                        tokio::time::sleep(Duration::from_millis(120)).await;
+                    if attempt + 1 < HEOS_AVT_PLAY_MAX_ATTEMPTS {
+                        tokio::time::sleep(HEOS_AVT_PLAY_RETRY_BACKOFF).await;
                     }
                 }
             }
@@ -364,7 +578,8 @@ impl HeosUpnpBackend {
         let client = self.client.clone();
         let shared = self.shared.clone();
         let event_tx = self.event_tx.clone();
-        let interval = self.config.poll_interval;
+        let steady_interval = self.config.poll_interval;
+        let transition_interval = self.config.transition_poll_interval.min(steady_interval);
         let keepalive_interval = self.config.keepalive_interval;
         let mcu_port_override = self.config.mcu_port_override;
 
@@ -378,7 +593,19 @@ impl HeosUpnpBackend {
             let mut logged_premature_stop = false;
 
             loop {
-                tokio::time::sleep(interval).await;
+                let in_guard = shared
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .transition_guard_until
+                    .is_some_and(|until| Instant::now() < until);
+
+                let in_transition = in_guard || !saw_playing || consecutive_stopped_polls > 0;
+                let sleep_dur = if in_transition {
+                    transition_interval
+                } else {
+                    steady_interval
+                };
+                tokio::time::sleep(sleep_dur).await;
 
                 let in_guard = shared
                     .read()
@@ -404,7 +631,7 @@ impl HeosUpnpBackend {
                                 && (!in_guard
                                     || (i128::from(abs_pos) - i128::from(s.snapshot.position_ms))
                                         .abs()
-                                        <= 2_500);
+                                        <= HEOS_TRANSITION_DRIFT_TOLERANCE_MS);
                             if allow_pos_update {
                                 s.snapshot.position_ms =
                                     abs_pos.min(params.track_dur_ms.max(abs_pos));
@@ -416,7 +643,7 @@ impl HeosUpnpBackend {
                                 s.snapshot.buffered_ms = s
                                     .snapshot
                                     .position_ms
-                                    .saturating_add(2_000)
+                                    .saturating_add(HEOS_SYNTHETIC_BUFFER_AHEAD_MS)
                                     .max(s.snapshot.buffered_ms)
                                     .min(s.snapshot.duration_ms.max(abs_pos));
                                 Some(s.snapshot.clone())
@@ -473,9 +700,19 @@ impl HeosUpnpBackend {
                             {
                                 consecutive_stopped_polls =
                                     consecutive_stopped_polls.saturating_add(1);
-                                if consecutive_stopped_polls >= 2 {
-                                    let near_end = params.track_dur_ms == 0
-                                        || cur_pos_ms.saturating_add(5_000) >= params.track_dur_ms;
+                                if consecutive_stopped_polls >= HEOS_STOPPED_CONFIRMATION_THRESHOLD
+                                {
+                                    let guard_window =
+                                        compute_heos_near_end_window(params.track_dur_ms);
+                                    let progressed = has_playback_progressed(
+                                        cur_pos_ms,
+                                        params.anchor_start_ms,
+                                        params.track_dur_ms,
+                                    );
+                                    let near_end = progressed
+                                        && (params.track_dur_ms == 0
+                                            || cur_pos_ms.saturating_add(guard_window)
+                                                >= params.track_dur_ms);
                                     if near_end {
                                         shared
                                             .write()
@@ -767,10 +1004,12 @@ impl AudioBackend for HeosUpnpBackend {
                 .as_mut()
                 .ok_or_else(|| "no active HEOS session".to_string())?;
 
+            let track_dur_ms = active.session.effective_duration_ms();
+            let guard_dur = transition_guard_duration_for_track(track_dur_ms);
             self.shared
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+                .transition_guard_until = Some(Instant::now() + guard_dur);
 
             if paused {
                 if avt_pause(&self.client, &active.endpoint.avt_control_url)
@@ -874,6 +1113,8 @@ impl AudioBackend for HeosUpnpBackend {
                 .as_mut()
                 .ok_or_else(|| "no active HEOS session".to_string())?;
 
+            let track_dur_ms = active.session.effective_duration_ms();
+            let guard_dur = transition_guard_duration_for_track(track_dur_ms);
             let optim_snap = {
                 let mut s = self
                     .shared
@@ -882,7 +1123,7 @@ impl AudioBackend for HeosUpnpBackend {
                 let dur = s.snapshot.duration_ms.max(position_ms);
                 s.snapshot.position_ms = position_ms;
                 s.snapshot.buffered_ms = position_ms.saturating_add(30_000).min(dur);
-                s.transition_guard_until = Some(Instant::now() + Duration::from_millis(2_500));
+                s.transition_guard_until = Some(Instant::now() + guard_dur);
                 s.snapshot.clone()
             };
             let _ = self.event_tx.send(BackendEvent::StateChanged(optim_snap));

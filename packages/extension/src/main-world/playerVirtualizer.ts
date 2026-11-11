@@ -27,6 +27,7 @@ import {
   type CatalogTrackEntry,
   type SoundCloudTrackCatalog,
 } from './trackCatalog.js';
+import { WakingDevicePlayheadKeepalive } from './wakingKeepalive.js';
 
 export type VirtualizerMode = 'disabled' | 'remote' | 'drm_local_fallback';
 
@@ -58,16 +59,19 @@ export interface MaestroVirtualizerOptions {
   readonly nowPerfMs?: (() => number) | undefined;
 }
 
-const HEALTHY_FORWARD_BUFFER_SECONDS = 120;
-const TIMEUPDATE_INTERVAL_MS = 250;
-const PLAY_CREEP_RATE = 0.12;
-const PLAY_CREEP_MAX_MS = 250;
-const MINOR_BACKWARD_JITTER_MS = 1_200;
-const MAX_SOFT_DRIFT_MS = 2_500;
-const STALL_NUDGE_MIN_SECONDS = 0.04;
-const STALL_NUDGE_MAX_SECONDS = 0.22;
-const USER_INTERACTION_WINDOW_MS = 750;
-const PENDING_STREAM_DOM_POLL_MS = 60;
+export const HLS_GAP_NUDGE_SUPPRESSION = {
+  MIN_DELTA_SECONDS: 0.04,
+  MAX_DELTA_SECONDS: 0.22,
+  USER_GESTURE_GRACE_WINDOW_MS: 750,
+} as const;
+
+export const VIRTUALIZER_TIMING = {
+  HEALTHY_FORWARD_BUFFER_SECONDS: 120,
+  TIMEUPDATE_INTERVAL_MS: 250,
+  MINOR_BACKWARD_JITTER_MS: 1_200,
+  MAX_SOFT_DRIFT_MS: 2_500,
+  PENDING_STREAM_DOM_POLL_MS: 60,
+} as const;
 
 type CandidateTrackOutcome =
   | { readonly status: 'resolved'; readonly track: CatalogTrackEntry }
@@ -160,9 +164,7 @@ export class MaestroVirtualizerController {
   private anchorPerfNowMs = 0;
   private interpolationRate = 1;
   private receiverPhase: PlaybackPhase = 'idle';
-  private hasReceivedPlayingTickForTrack = false;
-  private playCreepOriginPositionMs = 0;
-  private playCreepStartPerfNowMs = 0;
+  private readonly wakingKeepalive = new WakingDevicePlayheadKeepalive();
   private lastUserInteractionPerfMs = Number.NEGATIVE_INFINITY;
 
   public constructor(options: MaestroVirtualizerOptions) {
@@ -580,11 +582,11 @@ export class MaestroVirtualizerController {
       const deltaSec = clampedSec - currentSec;
       const hadRecentUserGesture =
         this.readPerfNowMs() - this.lastUserInteractionPerfMs <=
-        USER_INTERACTION_WINDOW_MS;
+        HLS_GAP_NUDGE_SUPPRESSION.USER_GESTURE_GRACE_WINDOW_MS;
       if (
         !hadRecentUserGesture &&
-        deltaSec >= STALL_NUDGE_MIN_SECONDS &&
-        deltaSec <= STALL_NUDGE_MAX_SECONDS
+        deltaSec >= HLS_GAP_NUDGE_SUPPRESSION.MIN_DELTA_SECONDS &&
+        deltaSec <= HLS_GAP_NUDGE_SUPPRESSION.MAX_DELTA_SECONDS
       ) {
         return true;
       }
@@ -594,6 +596,9 @@ export class MaestroVirtualizerController {
     this.virtualEnded = false;
     this.anchorPositionMs = targetMs;
     this.anchorPerfNowMs = this.readPerfNowMs();
+    if (this.wakingKeepalive.isWaking()) {
+      this.wakingKeepalive.resetOrigin(targetMs, this.readPerfNowMs());
+    }
 
     if (this.mediaElementAwaitingFreshTrack || this.pendingPlayAwaitingStream) {
       this.pendingSeekPositionMs = targetMs;
@@ -655,12 +660,10 @@ export class MaestroVirtualizerController {
 
     // Gentle monotonic play-detection creep during initial 'loading' / 'waking_device'
     // so SoundCloud's 2.0s `_determineIfPlaying()` watchdog never times out during HEOS wake!
-    if (!this.hasReceivedPlayingTickForTrack) {
-      const creepElapsedMs = Math.max(0, now - this.playCreepStartPerfNowMs);
-      const creepMs = Math.min(PLAY_CREEP_MAX_MS, creepElapsedMs * PLAY_CREEP_RATE);
-      let posMs = Math.max(
+    if (this.wakingKeepalive.isWaking()) {
+      let posMs = this.wakingKeepalive.computeCurrentPositionMs(
         this.anchorPositionMs,
-        this.playCreepOriginPositionMs + creepMs,
+        now,
       );
       if (this.telemetryDurationMs > 0) {
         posMs = Math.min(this.telemetryDurationMs, posMs);
@@ -686,7 +689,7 @@ export class MaestroVirtualizerController {
       const healthyEndSec = Math.max(
         durSec,
         telBufSec,
-        posSec + HEALTHY_FORWARD_BUFFER_SECONDS,
+        posSec + VIRTUALIZER_TIMING.HEALTHY_FORWARD_BUFFER_SECONDS,
       );
       return createVirtualTimeRanges(healthyEndSec);
     }
@@ -778,7 +781,7 @@ export class MaestroVirtualizerController {
     this.receiverPhase = telemetry.phase;
 
     if (telemetry.phase === 'playing') {
-      this.hasReceivedPlayingTickForTrack = true;
+      this.wakingKeepalive.settle();
       this.virtualPaused = false;
 
       if (remainingPinMs !== null) {
@@ -791,11 +794,11 @@ export class MaestroVirtualizerController {
         this.interpolationRate = 1;
       } else {
         const backwardDeltaMs = prevEffectiveMs - telemetry.positionMs;
-        if (backwardDeltaMs <= 0 || backwardDeltaMs > MAX_SOFT_DRIFT_MS) {
+        if (backwardDeltaMs <= 0 || backwardDeltaMs > VIRTUALIZER_TIMING.MAX_SOFT_DRIFT_MS) {
           this.anchorPositionMs = telemetry.positionMs;
           this.anchorPerfNowMs = now;
           this.interpolationRate = 1;
-        } else if (backwardDeltaMs < MINOR_BACKWARD_JITTER_MS) {
+        } else if (backwardDeltaMs < VIRTUALIZER_TIMING.MINOR_BACKWARD_JITTER_MS) {
           this.anchorPositionMs = prevEffectiveMs;
           this.anchorPerfNowMs = now;
           this.interpolationRate = 1;
@@ -813,7 +816,7 @@ export class MaestroVirtualizerController {
         this.anchorPositionMs =
           seekPinReleased ||
           backwardDeltaMs <= 0 ||
-          backwardDeltaMs > MINOR_BACKWARD_JITTER_MS
+          backwardDeltaMs > VIRTUALIZER_TIMING.MINOR_BACKWARD_JITTER_MS
             ? telemetry.positionMs
             : prevEffectiveMs;
         this.anchorPerfNowMs = now;
@@ -903,6 +906,7 @@ export class MaestroVirtualizerController {
   public dispose(): void {
     this.unsubscribeCatalog();
     this.seekDebouncer.reset();
+    this.wakingKeepalive.reset();
     this.clearPendingSeekEventTimer();
     this.clearPendingStreamState();
     this.stopTimeupdateLoop();
@@ -928,7 +932,8 @@ export class MaestroVirtualizerController {
     this.telemetryDurationMs = resolution.track.durationMs;
     this.telemetryBufferedMs = Math.max(
       resolution.track.durationMs,
-      resolution.locator.startPositionMs + HEALTHY_FORWARD_BUFFER_SECONDS * 1000,
+      resolution.locator.startPositionMs +
+        VIRTUALIZER_TIMING.HEALTHY_FORWARD_BUFFER_SECONDS * 1000,
     );
     this.primePlayheadAnchor(resolution.locator.startPositionMs, 'loading', false);
     this.emitTransportCommand({
@@ -1174,9 +1179,11 @@ export class MaestroVirtualizerController {
     this.anchorPerfNowMs = now;
     this.interpolationRate = 1;
     this.receiverPhase = phase;
-    this.hasReceivedPlayingTickForTrack = hasPlayingTick;
-    this.playCreepOriginPositionMs = clampedMs;
-    this.playCreepStartPerfNowMs = now;
+    if (hasPlayingTick) {
+      this.wakingKeepalive.settle();
+    } else {
+      this.wakingKeepalive.start(clampedMs, now);
+    }
   }
 
   private scheduleAsyncSeekLifecycleEvents(targetElement: EventTarget): void {
@@ -1222,7 +1229,7 @@ export class MaestroVirtualizerController {
       if (matched !== undefined && matched.trackId !== this.activeRemoteTrackId) {
         this.commitPendingStreamTrack(matched);
       }
-    }, PENDING_STREAM_DOM_POLL_MS);
+    }, VIRTUALIZER_TIMING.PENDING_STREAM_DOM_POLL_MS);
   }
 
   private clearPendingStreamState(): void {
@@ -1253,7 +1260,7 @@ export class MaestroVirtualizerController {
         return;
       }
       dispatchMediaEvent(this.primaryMediaElement, 'timeupdate');
-    }, TIMEUPDATE_INTERVAL_MS);
+    }, VIRTUALIZER_TIMING.TIMEUPDATE_INTERVAL_MS);
   }
 
   private stopTimeupdateLoop(): void {

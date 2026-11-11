@@ -13,6 +13,7 @@ const REPO_ROOT = path.resolve(CURRENT_DIR, '..');
 
 const EXCLUDED_DIR_NAMES = new Set<string>([
   '.git',
+  '.agents',
   'node_modules',
   'target',
   'dist',
@@ -586,12 +587,20 @@ describe('Zero-PII & Universal Portability Repository Gate', () => {
       receiverRustFiles.map((file) => [file.relativePath, file.content] as const),
     );
 
-    const forbiddenVolumeOrMutePatterns: readonly { readonly label: string; readonly regex: RegExp }[] = [
+    const forbiddenUniversalPatterns: readonly { readonly label: string; readonly regex: RegExp }[] = [
       { label: 'UPnP RenderingControl', regex: /\bRenderingControl\b/ },
-      { label: 'UPnP SetVolume/SetMute', regex: /\bSet(?:Volume|Mute)\b/ },
-      { label: 'HEOS CLI set_volume/set_mute', regex: /\bset_(?:volume|mute)\b/ },
+      { label: 'UPnP SetVolume/SetMute SOAP Action', regex: /#(?:SetVolume|SetMute)|<(?:SetVolume|SetMute)\b/ },
       { label: 'Denon/Marantz MCU MV/MU command', regex: /b"(?:MV|MU)[A-Z0-9?]*\\r"/ },
     ];
+
+    const hardwareVolumeAllowedFiles = new Set<string>([
+      'crates/receiver/src/backends/heos_mcu.rs',
+      'crates/receiver/src/backends/heos_upnp.rs',
+      'crates/receiver/src/coordinator.rs',
+      'crates/receiver/src/protocol_ws.rs',
+      'crates/receiver/src/server.rs',
+      'crates/receiver/src/ws_handler.rs',
+    ]);
 
     for (const file of receiverRustFiles) {
       expect(
@@ -605,10 +614,17 @@ describe('Zero-PII & Universal Portability Repository Gate', () => {
         .filter((line) => !line.trimStart().startsWith('//'))
         .join('\n');
 
-      for (const forbidden of forbiddenVolumeOrMutePatterns) {
+      for (const forbidden of forbiddenUniversalPatterns) {
         expect(
           forbidden.regex.test(codeOnly),
           `${file.relativePath} must never invoke ${forbidden.label}`,
+        ).toBe(false);
+      }
+
+      if (!hardwareVolumeAllowedFiles.has(file.relativePath)) {
+        expect(
+          /\bSet(?:Volume|Mute)\b|\bset_(?:volume|mute)\b/.test(codeOnly),
+          `${file.relativePath} outside HEOS hardware volume control modules must never invoke set_volume/set_mute`,
         ).toBe(false);
       }
     }
@@ -622,6 +638,7 @@ describe('Zero-PII & Universal Portability Repository Gate', () => {
     expect(heosMcuSrc.length).toBeGreaterThan(0);
     expect(heosSoapSrc.length).toBeGreaterThan(0);
     expect(flacStreamerSrc.length).toBeGreaterThan(0);
+    expect(/\bSet(?:Volume|Mute)\b/.test(heosSoapSrc), 'UPnP SOAP must never contain SetVolume/SetMute').toBe(false);
 
     // 1. set_device_power_state_on may ONLY be called inside ensure_device_awake, NEVER inside spawn_poller.
     const pollerIdx = heosUpnpSrc.indexOf('fn spawn_poller(');

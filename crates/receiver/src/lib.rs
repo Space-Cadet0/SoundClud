@@ -10,6 +10,7 @@ pub mod backends;
 pub mod cli;
 pub mod coordinator;
 pub mod discovery;
+pub mod errors;
 pub mod flac_streamer;
 pub mod hls_fetch;
 pub mod hls_proxy;
@@ -19,9 +20,12 @@ pub mod protocol;
 pub mod protocol_ws;
 pub mod security;
 pub mod server;
+pub mod stream_planner;
 pub mod wav_streamer;
 pub mod wav_transcode;
 pub mod ws_handler;
+
+pub use crate::errors::{BackendError, HlsError, ReceiverError};
 
 pub use crate::protocol::{
     BIT_PERFECT_BIT_DEPTH, BIT_PERFECT_GAIN_DB, BIT_PERFECT_SAMPLE_RATE_HZ, DEFAULT_DISCOVERY_PORT,

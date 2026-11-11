@@ -78,6 +78,8 @@ pub struct OutputCapabilities {
     pub auto_wake_from_standby: bool,
     pub displays_track_metadata_on_device: bool,
     pub seek_debounce_ms: u32,
+    #[serde(rename = "supportsHardwareVolume", default)]
+    pub supports_hardware_volume: bool,
 }
 
 impl OutputCapabilities {
@@ -91,6 +93,7 @@ impl OutputCapabilities {
             auto_wake_from_standby: false,
             displays_track_metadata_on_device: false,
             seek_debounce_ms: get_default_seek_debounce_ms(kind),
+            supports_hardware_volume: false,
         }
     }
 
@@ -104,6 +107,7 @@ impl OutputCapabilities {
             auto_wake_from_standby: true,
             displays_track_metadata_on_device: true,
             seek_debounce_ms: HEOS_SEEK_DEBOUNCE_MS,
+            supports_hardware_volume: true,
         }
     }
 }

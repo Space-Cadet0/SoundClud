@@ -4,6 +4,7 @@
  */
 
 export * from './constants.js';
+export * from './models.js';
 export * from './outputs.js';
 export * from './soundcloud.js';
 export * from './transcodingRanker.js';

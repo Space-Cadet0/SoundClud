@@ -261,6 +261,11 @@ fn roundtrips_all_ws_commands_and_events_matching_typescript_discriminators() {
         ClientWsCommand::Ping {
             client_timestamp_ms: 123_456,
         },
+        ClientWsCommand::SetVolume {
+            command_seq: 7,
+            volume: Some(42),
+            muted: Some(false),
+        },
     ];
 
     for cmd in commands {
@@ -325,6 +330,10 @@ fn roundtrips_all_ws_commands_and_events_matching_typescript_discriminators() {
         ServerWsEvent::Pong {
             client_timestamp_ms: 100,
             server_timestamp_ms: 105,
+        },
+        ServerWsEvent::VolumeChanged {
+            volume: 42,
+            muted: false,
         },
     ];
 

@@ -67,7 +67,7 @@ async function sendRequest(
   return { ok: false, error: 'No response from SoundClud background worker' };
 }
 
-function bootstrapPopup(): void {
+export function bootstrapPopup(): void {
   const handoffBtn = document.getElementById(
     'handoff-toggle',
   ) as HTMLButtonElement | null;
@@ -97,10 +97,134 @@ function bootstrapPopup(): void {
   ) as HTMLInputElement | null;
   const dialogError = document.getElementById('dialog-error');
 
+  const ampVolumeCard = document.getElementById('amp-volume-card');
+  const ampVolumeSlider = document.getElementById(
+    'amp-volume-slider',
+  ) as HTMLInputElement | null;
+  const ampVolumeLabel = document.getElementById('amp-volume-label');
+  const ampMuteBtn = document.getElementById(
+    'amp-mute-btn',
+  ) as HTMLButtonElement | null;
+  const ampVolDownBtn = document.getElementById(
+    'amp-vol-down-btn',
+  ) as HTMLButtonElement | null;
+  const ampVolUpBtn = document.getElementById(
+    'amp-vol-up-btn',
+  ) as HTMLButtonElement | null;
+
+  let isSliderDragging = false;
+  let currentHardwareVolume = 25;
+  let currentHardwareMuted = false;
+
   let currentSnapshot: ExtensionUiSnapshot | null = null;
 
   if (endpointDialog !== null) {
     installDialogLightDismissFallback(endpointDialog);
+  }
+
+  const sendVolumeCommand = (level?: number, mute?: boolean): void => {
+    if (level === undefined && mute === undefined) {
+      return;
+    }
+    void (async () => {
+      showError(null);
+      const res = await sendRequest({
+        type: 'set_volume',
+        ...(level !== undefined
+          ? { volume: Math.min(100, Math.max(0, Math.round(level))) }
+          : {}),
+        ...(mute !== undefined ? { muted: mute } : {}),
+      });
+      if (res.ok) {
+        renderSnapshot(res.snapshot);
+      } else {
+        showError(res.error);
+      }
+    })();
+  };
+
+  let sliderDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  const SLIDER_DEBOUNCE_MS = 100;
+
+  const debouncedSendVolumeCommand = (level?: number, mute?: boolean): void => {
+    if (sliderDebounceTimer !== null) {
+      clearTimeout(sliderDebounceTimer);
+    }
+    sliderDebounceTimer = setTimeout(() => {
+      sliderDebounceTimer = null;
+      sendVolumeCommand(level, mute);
+    }, SLIDER_DEBOUNCE_MS);
+  };
+
+  if (ampVolumeSlider !== null) {
+    ampVolumeSlider.addEventListener('input', () => {
+      isSliderDragging = true;
+      const val = Number(ampVolumeSlider.value);
+      currentHardwareVolume = val;
+      if (ampVolumeLabel !== null) {
+        ampVolumeLabel.textContent = `${String(val)}%`;
+      }
+      debouncedSendVolumeCommand(val);
+    });
+
+    ampVolumeSlider.addEventListener('change', () => {
+      if (sliderDebounceTimer !== null) {
+        clearTimeout(sliderDebounceTimer);
+        sliderDebounceTimer = null;
+      }
+      isSliderDragging = false;
+      const val = Number(ampVolumeSlider.value);
+      currentHardwareVolume = val;
+      sendVolumeCommand(val);
+    });
+  }
+
+  if (ampVolDownBtn !== null) {
+    ampVolDownBtn.addEventListener('click', () => {
+      if (sliderDebounceTimer !== null) {
+        clearTimeout(sliderDebounceTimer);
+        sliderDebounceTimer = null;
+      }
+      const next = Math.max(0, currentHardwareVolume - 2);
+      currentHardwareVolume = next;
+      if (ampVolumeSlider !== null) {
+        ampVolumeSlider.value = String(next);
+      }
+      if (ampVolumeLabel !== null) {
+        ampVolumeLabel.textContent = `${String(next)}%`;
+      }
+      sendVolumeCommand(next);
+    });
+  }
+
+  if (ampVolUpBtn !== null) {
+    ampVolUpBtn.addEventListener('click', () => {
+      if (sliderDebounceTimer !== null) {
+        clearTimeout(sliderDebounceTimer);
+        sliderDebounceTimer = null;
+      }
+      const next = Math.min(100, currentHardwareVolume + 2);
+      currentHardwareVolume = next;
+      if (ampVolumeSlider !== null) {
+        ampVolumeSlider.value = String(next);
+      }
+      if (ampVolumeLabel !== null) {
+        ampVolumeLabel.textContent = `${String(next)}%`;
+      }
+      sendVolumeCommand(next);
+    });
+  }
+
+  if (ampMuteBtn !== null) {
+    ampMuteBtn.addEventListener('click', () => {
+      if (sliderDebounceTimer !== null) {
+        clearTimeout(sliderDebounceTimer);
+        sliderDebounceTimer = null;
+      }
+      currentHardwareMuted = !currentHardwareMuted;
+      ampMuteBtn.setAttribute('aria-pressed', String(currentHardwareMuted));
+      sendVolumeCommand(undefined, currentHardwareMuted);
+    });
   }
 
   const showError = (msg: string | null): void => {
@@ -195,6 +319,36 @@ function bootstrapPopup(): void {
     }
     if (signalDetail !== null) {
       signalDetail.textContent = status.signalDetail;
+    }
+
+    const supportsVolume =
+      snapshot.handoffEnabled &&
+      snapshot.activeOutput !== null &&
+      (snapshot.activeOutput.capabilities.supportsHardwareVolume === true ||
+        snapshot.activeOutput.kind === 'heos_upnp');
+
+    if (ampVolumeCard !== null) {
+      ampVolumeCard.hidden = !supportsVolume;
+    }
+
+    if (supportsVolume) {
+      if (!isSliderDragging) {
+        if (typeof snapshot.hardwareVolume === 'number') {
+          currentHardwareVolume = snapshot.hardwareVolume;
+        }
+        if (ampVolumeSlider !== null) {
+          ampVolumeSlider.value = String(currentHardwareVolume);
+        }
+        if (ampVolumeLabel !== null) {
+          ampVolumeLabel.textContent = `${String(currentHardwareVolume)}%`;
+        }
+      }
+      if (typeof snapshot.hardwareMuted === 'boolean') {
+        currentHardwareMuted = snapshot.hardwareMuted;
+      }
+      if (ampMuteBtn !== null) {
+        ampMuteBtn.setAttribute('aria-pressed', String(currentHardwareMuted));
+      }
     }
 
     if (nowPlayingEl !== null) {

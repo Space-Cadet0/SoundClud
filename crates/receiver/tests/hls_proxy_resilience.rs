@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use aes::Aes128;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -323,5 +323,210 @@ async fn caches_init_and_aes_key_in_ram_and_transparently_refreshes_on_mid_mix_4
     assert_eq!(session.hls_refresh_count(), 2);
 
     assert!(!state.leaked_auth_on_cdn.load(Ordering::SeqCst));
+    srv_task.abort();
+}
+
+struct MockCapState {
+    base_url: std::sync::RwLock<String>,
+    aes_key: [u8; 16],
+    aes_iv: [u8; 16],
+    init_bytes: Vec<u8>,
+    seg_hits: Vec<AtomicUsize>,
+}
+
+#[tokio::test]
+async fn test_hls_cache_eviction_cap_and_refetch() {
+    let key: [u8; 16] = *b"1234567890abcdef";
+    let iv: [u8; 16] = *b"abcdef0123456789";
+
+    let mut hits = Vec::with_capacity(30);
+    for _ in 0..30 {
+        hits.push(AtomicUsize::new(0));
+    }
+
+    let state = Arc::new(MockCapState {
+        base_url: std::sync::RwLock::new(String::new()),
+        aes_key: key,
+        aes_iv: iv,
+        init_bytes: b"ftypisom-mock-init-mp4-cap".to_vec(),
+        seg_hits: hits,
+    });
+
+    let app = Router::new()
+        .route(
+            "/resolve/cap",
+            get(|State(st): State<Arc<MockCapState>>| async move {
+                let base = st.base_url.read().unwrap().clone();
+                Json(json!({ "url": format!("{base}/cdn/cap_playlist.m3u8") })).into_response()
+            }),
+        )
+        .route(
+            "/cdn/cap_playlist.m3u8",
+            get(|State(st): State<Arc<MockCapState>>| async move {
+                let base = st.base_url.read().unwrap().clone();
+                let mut m3u8 = format!(
+                    "#EXTM3U\n\
+                     #EXT-X-VERSION:6\n\
+                     #EXT-X-TARGETDURATION:6\n\
+                     #EXT-X-MAP:URI=\"{base}/cdn/cap_init.mp4\"\n\
+                     #EXT-X-KEY:METHOD=AES-128,URI=\"{base}/cdn/cap_key.bin\",IV=0x{}\n",
+                    hex::encode(st.aes_iv)
+                );
+                for i in 0..30 {
+                    m3u8.push_str(&format!(
+                        "#EXTINF:6.000,\n\
+                         {base}/cdn/cap_seg/{i}\n"
+                    ));
+                }
+                m3u8.push_str("#EXT-X-ENDLIST\n");
+                (StatusCode::OK, m3u8)
+            }),
+        )
+        .route(
+            "/cdn/cap_init.mp4",
+            get(|State(st): State<Arc<MockCapState>>| async move {
+                (StatusCode::OK, st.init_bytes.clone()).into_response()
+            }),
+        )
+        .route(
+            "/cdn/cap_key.bin",
+            get(|State(st): State<Arc<MockCapState>>| async move {
+                (StatusCode::OK, st.aes_key.to_vec())
+            }),
+        )
+        .route(
+            "/cdn/cap_seg/{idx}",
+            get(
+                |State(st): State<Arc<MockCapState>>, Path(idx): Path<usize>| async move {
+                    if idx >= 30 {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    st.seg_hits[idx].fetch_add(1, Ordering::SeqCst);
+                    let plain = format!("segment-content-index-{idx}").into_bytes();
+                    let enc = encrypt_aes128(&st.aes_key, &st.aes_iv, &plain);
+                    (StatusCode::OK, enc).into_response()
+                },
+            ),
+        )
+        .with_state(state.clone());
+
+    let listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+        .await
+        .unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    *state.base_url.write().unwrap() = base_url.clone();
+    let srv_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let locator = StreamLocatorPayload {
+        locator_id: "loc_cap_1".to_string(),
+        track: TrackMetadata {
+            track_id: "999".to_string(),
+            permalink_url: "https://soundcloud.com/artist/cap-test".to_string(),
+            title: "Cap Test Track".to_string(),
+            artist: "SoundClud Tester".to_string(),
+            artwork_url: None,
+            duration_ms: 180_000,
+            waveform_url: None,
+        },
+        selected: SelectedTranscodingDescriptor {
+            resolve_url: format!("{base_url}/resolve/cap"),
+            preset: "aac_256k".to_string(),
+            protocol: PlayableProtocol::EncryptedHls,
+            mime_type: "audio/mp4".to_string(),
+            quality: StreamQualityTier::Hq,
+            bitrate_kbps: 256,
+            sample_rate_hz: SourceSampleRateHz::Hz44100,
+            initial_playlist_url: None,
+        },
+        fallback_transcodings: Vec::new(),
+        auth: EphemeralSoundCloudAuth {
+            client_id: "mock_cid".to_string(),
+            oauth_token: Some(RedactedSecret::new("mock-token")),
+            track_authorization: None,
+            secret_token: None,
+            account_tier: AccountTier::GoPlus,
+        },
+        start_position_ms: 0,
+    };
+
+    let proxy = HlsProxy::new();
+    let session = proxy
+        .create_session(locator, None)
+        .await
+        .expect("cap test session creation");
+
+    // 1. Fetch segments 0 through 23 (24 segments total = exactly MAX_CACHED_SEGMENTS)
+    for i in 0..24 {
+        let seg = session
+            .fetch_decrypted_segment(i)
+            .await
+            .expect("initial fetch");
+        assert_eq!(
+            seg.as_ref(),
+            format!("segment-content-index-{i}").as_bytes()
+        );
+        assert_eq!(
+            state.seg_hits[i].load(Ordering::SeqCst),
+            1,
+            "segment {i} hit once"
+        );
+    }
+
+    // 2. Re-fetching all 24 segments must hit RAM cache with zero additional network requests
+    for i in 0..24 {
+        let seg = session
+            .fetch_decrypted_segment(i)
+            .await
+            .expect("cache hit fetch");
+        assert_eq!(
+            seg.as_ref(),
+            format!("segment-content-index-{i}").as_bytes()
+        );
+        assert_eq!(
+            state.seg_hits[i].load(Ordering::SeqCst),
+            1,
+            "segment {i} served from RAM cache"
+        );
+    }
+
+    // 3. Fetch segment 24 (the 25th segment) -> must enforce 24-segment cap by evicting segment 0 (FIFO)
+    let seg24 = session
+        .fetch_decrypted_segment(24)
+        .await
+        .expect("seg 24 fetch");
+    assert_eq!(seg24.as_ref(), b"segment-content-index-24");
+    assert_eq!(state.seg_hits[24].load(Ordering::SeqCst), 1);
+
+    // 4. Segments 1..=24 must still reside in the RAM cache
+    for i in 1..=24 {
+        let seg = session
+            .fetch_decrypted_segment(i)
+            .await
+            .expect("still cached fetch");
+        assert_eq!(
+            seg.as_ref(),
+            format!("segment-content-index-{i}").as_bytes()
+        );
+        assert_eq!(
+            state.seg_hits[i].load(Ordering::SeqCst),
+            1,
+            "segment {i} must remain cached after seg 24 insertion"
+        );
+    }
+
+    // 5. Segment 0 was evicted -> fetching it again must result in a clean cache miss refetch (hits becomes 2)
+    let seg0_refetched = session
+        .fetch_decrypted_segment(0)
+        .await
+        .expect("evicted refetch");
+    assert_eq!(seg0_refetched.as_ref(), b"segment-content-index-0");
+    assert_eq!(
+        state.seg_hits[0].load(Ordering::SeqCst),
+        2,
+        "segment 0 must have been evicted and refetched from network"
+    );
+
     srv_task.abort();
 }

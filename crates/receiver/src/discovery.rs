@@ -146,7 +146,7 @@ fn parse_txt_peer_announcement(
         receiver_id,
         receiver_name: name.unwrap_or_else(|| "SoundClud Receiver".to_string()),
         host: sender_ip.to_string(),
-        port: port.unwrap_or(9876),
+        port: port.unwrap_or(crate::protocol::DEFAULT_DISCOVERY_PORT),
         protocol_version: PROTOCOL_VERSION.to_string(),
     })
 }

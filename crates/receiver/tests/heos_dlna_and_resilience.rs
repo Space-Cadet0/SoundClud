@@ -539,26 +539,23 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
     let track1_uri = aios.uris.lock().unwrap().last().cloned().unwrap();
     assert!(track1_uri.contains("/stream.flac?start_ms=0"));
 
-    // Verify Host-MCU (:23) woke FIRST (`PW? -> PWON -> SI? -> SINET -> SLP? -> SLPOFF`),
+    // Verify Host-MCU (:23) woke FIRST (`PW? -> PWON -> SI? -> SINET`),
     // ACT SetDevicePowerState("ON") ran once for initial wake, and CLI bound `pid = 7`!
     assert_eq!(aios.set_power_calls.load(Ordering::SeqCst), 1);
     {
         let cmds = mcu_cmds.lock().unwrap().clone();
-        assert_eq!(
-            &cmds[..6],
-            &["PW?", "PWON", "SI?", "SINET", "SLP?", "SLPOFF"]
-        );
+        assert_eq!(&cmds[..4], &["PW?", "PWON", "SI?", "SINET"]);
         assert!(!cmds
             .iter()
-            .any(|c| c.starts_with("MV") || c.starts_with("MU")));
+            .any(|c| c.starts_with("MV") || c.starts_with("MU") || c.starts_with("SLP")));
     }
     assert!(
         cli_log
             .lock()
             .unwrap()
             .iter()
-            .any(|c| c == "heos://player/set_play_state?pid=7&state=play"),
-        "must retry get_players past empty payload:[] and assert play state for pid=7"
+            .any(|c| c == "heos://player/get_play_state?pid=7"),
+        "must retry get_players past empty payload:[] and assert read-only play state for pid=7"
     );
 
     // Verify Pause SOAP 500 falls back to Stop + Paused and Resume re-anchors cleanly
@@ -591,12 +588,12 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
     assert!(reanchored_uri.ends_with("?start_ms=9000000"));
 
     // Verify keepalive timer persists across poller respawns (`seek` every 55ms < 120ms keepalive_interval)
-    // and sends `SLPOFF` + `set_play_state?pid=7&state=play` with ZERO `SetDevicePowerState` calls!
-    let slpoff_before = mcu_cmds
+    // and sends passive queries (`PW?`, `SI?`) and `heart_beat` with ZERO `SLPOFF` or `SetDevicePowerState` calls!
+    let pw_before = mcu_cmds
         .lock()
         .unwrap()
         .iter()
-        .filter(|c| c.as_str() == "SLPOFF")
+        .filter(|c| c.as_str() == "PW?")
         .count();
     let heartbeat_before = cli_log
         .lock()
@@ -613,11 +610,11 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
             .unwrap();
     }
     tokio::time::sleep(Duration::from_millis(90)).await;
-    let slpoff_after = mcu_cmds
+    let pw_after = mcu_cmds
         .lock()
         .unwrap()
         .iter()
-        .filter(|c| c.as_str() == "SLPOFF")
+        .filter(|c| c.as_str() == "PW?")
         .count();
     let heartbeat_after = cli_log
         .lock()
@@ -625,8 +622,18 @@ async fn promotes_fallback_transcoding_activates_mcu_handles_pause_fallback_and_
         .iter()
         .filter(|c| c.contains("heart_beat"))
         .count();
+    let slpoff_count = mcu_cmds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.as_str() == "SLPOFF" || c.as_str() == "SLP?")
+        .count();
+    assert_eq!(
+        slpoff_count, 0,
+        "keepalive and zone activation must NEVER send SLPOFF or SLP? (prevents Sleep > Off OLED cycling)"
+    );
     assert!(
-        slpoff_after > slpoff_before && heartbeat_after > heartbeat_before,
+        pw_after > pw_before && heartbeat_after > heartbeat_before,
         "keepalive must fire across rapid seek poller respawns without starvation"
     );
     assert_eq!(

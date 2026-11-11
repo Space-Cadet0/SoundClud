@@ -1,6 +1,6 @@
 **SoundClud {{RELEASE_TAG}}** brings zero-compromise **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio handoff from the official [soundcloud.com](https://soundcloud.com) web player directly to **Denon & Marantz HEOS Built-In** network amplifiers/speakers and **Optical TOSLINK (S/PDIF)** Hi-Fi DACs.
 
-Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboard's hardware media keys inside `soundcloud.com` as normal—while your computer's internal speakers stay silent and your Hi-Fi amplifier plays bit-perfect lossless audio controlled exclusively by your physical amplifier volume knob or remote.
+Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboard's hardware media keys inside `soundcloud.com` as normal—while your computer's internal speakers stay silent and your Hi-Fi amplifier plays `0 dB` bit-perfect lossless audio (with optional live HEOS hardware master volume & mute control right from the browser popup and player bar).
 
 ---
 
@@ -40,7 +40,7 @@ Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboa
   - **Hands-Free Auto-Wake**: Pressing **Play** on `soundcloud.com` automatically wakes your Denon/Marantz amplifier from Network Standby and switches to **HEOS Music**.
   - **Front OLED Track Metadata & Exact Duration**: Streams uncompressed RFC 9639 `24-bit / 44.1 kHz` FLAC with `VORBIS_COMMENT` & `DIDL-Lite` tags so your amplifier's front display shows the live **Track Title**, **Artist**, and **Elapsed / Total Time** while preventing unintended EU Auto-Standby shutdowns during playback.
 - **Bit-Perfect Optical TOSLINK Mode (`44.1 kHz` S/PDIF)**: Locks macOS CoreAudio physical sample rate to `44,100 Hz` at `0 dB` unity gain with continuous silent S/PDIF optical clock lock (`anullsrc`) to eliminate DAC relock clicks between tracks.
-- **Strict Amp-Knob-Only Volume (`0 dB` Invariant)**: SoundClud never attenuates digital samples and never sends remote volume commands to your amplifier—your physical Hi-Fi volume knob and remote remain in 100% control.
+- **0 dB Digital Integrity + Live HEOS Hardware Master Volume**: SoundClud locks digital PCM samples at `0 dB` unity gain (zero software DSP attenuation) while adding bidirectional Denon/Marantz HEOS analog hardware volume & mute controls in both the Extension Popup and SoundCloud player-bar Cast Pill.
 - **Multi-Hour DJ Mix Resilience & Instant Waveform Scrubbing**: Transparently refreshes expiring SoundCloud HLS CDN signatures mid-mix (`HTTP 403` recovery) and supports instant `HTTP 206` byte-range waveform seeking across 1–4+ hour sets.
 - **Graceful Widevine DRM Local Fallback**: If an individual major-label track requires hardware Widevine DRM, SoundClud plays that single track locally in your browser and automatically resumes Hi-Fi handoff on the very next track in your queue.
 

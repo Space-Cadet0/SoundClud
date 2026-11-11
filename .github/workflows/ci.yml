@@ -64,11 +64,11 @@ jobs:
       - name: Run strict TypeScript typecheck
         run: npm run typecheck
 
-      - name: Run offline unit tests
-        run: npm test
-
       - name: Run Rust format, clippy, and unit tests
         run: npm run check:rust
+
+      - name: Run offline unit tests
+        run: npm test
 
       - name: Verify macOS Monterey Intel target (x86_64-apple-darwin, MACOSX_DEPLOYMENT_TARGET=11.0)
         if: matrix.os == 'macos-14'

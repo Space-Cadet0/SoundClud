@@ -23,7 +23,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && npm --workspaces run typecheck",
     "test": "vitest run",
     "check:rust": "PATH=\"$HOME/.cargo/bin:$PATH\" cargo fmt --all -- --check && PATH=\"$HOME/.cargo/bin:$PATH\" cargo clippy --workspace --all-targets -- -D warnings && PATH=\"$HOME/.cargo/bin:$PATH\" cargo test --workspace",
-    "verify": "npm run check:hygiene && npm run build:extension && npm run typecheck && npm test && npm run check:rust"
+    "verify": "npm run check:hygiene && npm run build:extension && npm run typecheck && npm run check:rust && npm test"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",
