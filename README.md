@@ -20,7 +20,7 @@
 
 **SoundClud** lets you browse, queue, scrub waveforms, and press hardware media keys directly inside the native first-party `soundcloud.com` web interface in Chromium (`Chrome`, `Brave`, `Arc`, `Edge`)—while offloading 100% of stream fetching, decoding, and **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio output to either:
 1. **Headless Optical TOSLINK / CoreAudio / ALSA** (`LocalMpvBackend`, e.g., a Mac Mini wired via Mini-TOSLINK S/PDIF), or
-2. **Denon / Marantz HEOS Built-In Amplifiers & Speakers Directly Over LAN** (`HeosUpnpBackend`, e.g., Marantz PM7000N — auto-waking from Network Standby, displaying live Track/Artist/Elapsed Time on the front OLED, streaming asynchronous `44.1 kHz / 24-bit` `0 dB` FLAC with zero digital attenuation, and providing bidirectional remote hardware analog preamplifier Master Volume & Mute control).
+2. **Denon / Marantz HEOS Built-In Amplifiers & Speakers Directly Over LAN** (`HeosUpnpBackend`, e.g., Marantz PM7000N — auto-waking from Network Standby, displaying live Track/Artist/Elapsed Time on the front OLED, streaming single-decode `44.1 kHz / 24-bit` `0 dB` PCM inside uncompressed `SUBFRAME_VERBATIM` FLAC with zero re-compression or digital attenuation, and providing bidirectional remote hardware analog preamplifier Master Volume & Mute control).
 
 - **End-User Guide**: **[`docs/USER_GUIDE.md`](./docs/USER_GUIDE.md)** — Step-by-step installation, configuration, everyday usage, service management, and troubleshooting.
 - **Architecture & Wire Protocol Spec**: **[`docs/ARCHITECTURE_SPEC.md`](./docs/ARCHITECTURE_SPEC.md)** — Full first-principles engineering specification (`v1.2`).
@@ -68,10 +68,10 @@ SoundClud/
 
 ## Quick Start
 
-### Zero-Terminal macOS GUI Install (`SoundClud-v0.1.0-macOS-Universal.dmg`)
+### Zero-Terminal macOS GUI Install (`SoundClud-v0.1.1-macOS-Universal.dmg`)
 Works natively on **both** Apple Silicon (`M1`–`M4`) and Intel (`x86_64`, **macOS 12 Monterey+**, including the 2014 Intel Mac Mini) with **zero Terminal, zero `sudo`, and zero Homebrew**:
 
-1. Open **`SoundClud-v0.1.0-macOS-Universal.dmg`** (from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) or built locally via `npm run package:macos-dmg`) and drag **`SoundClud.app`** into **`Applications`**.
+1. Open **`SoundClud-v0.1.1-macOS-Universal.dmg`** (from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) or built locally via `npm run package:macos-dmg`) and drag **`SoundClud.app`** into **`Applications`**.
 2. Launch **`SoundClud.app`**, select **Direct HEOS Network Mode** (laptop/desktop -> Denon/Marantz HEOS) or **Optical TOSLINK + HEOS Server Mode** (headless Mac Mini -> Optical S/PDIF), and click **`Install & Start Receiver`**.
 3. Under **Step 2 — Browser Extension Setup** inside `SoundClud.app`, click **`Copy "chrome://extensions" & Open Browser`** and **`Show Extension Folder in Finder`**, enable **Developer mode** in `chrome://extensions`, and drag **`SoundClud Chrome Extension`** onto the tab.
 4. Open `https://soundcloud.com` and select your **HEOS Amplifier** or **Optical Out** from the player-bar cast pill.

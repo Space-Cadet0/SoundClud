@@ -1,6 +1,6 @@
-**SoundClud {{RELEASE_TAG}}** brings zero-compromise **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio handoff from the official [soundcloud.com](https://soundcloud.com) web player directly to **Denon & Marantz HEOS Built-In** network amplifiers/speakers and **Optical TOSLINK (S/PDIF)** Hi-Fi DACs.
+**SoundClud {{RELEASE_TAG}}** brings zero-compromise **`0 dB` Bit-Perfect (`44.1 kHz / 24-bit`)** audio transport from the official [soundcloud.com](https://soundcloud.com) web player directly to **Denon & Marantz HEOS Built-In** network amplifiers/speakers and **Optical TOSLINK (S/PDIF)** Hi-Fi DACs—bypassing Chrome and OS audio mixer resampling completely.
 
-Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboard's hardware media keys inside `soundcloud.com` as normal—while your computer's internal speakers stay silent and your Hi-Fi amplifier plays `0 dB` bit-perfect lossless audio (with optional live HEOS hardware master volume & mute control right from the browser popup and player bar).
+Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboard's hardware media keys inside `soundcloud.com` as normal—while your computer's internal speakers stay silent and your Hi-Fi amplifier plays single-decode `44.1 kHz / 24-bit` `0 dB` PCM audio (with live bidirectional HEOS hardware master volume & mute control right from the browser popup and player bar).
 
 ---
 
@@ -32,17 +32,19 @@ Browse, queue, scrub waveforms across multi-hour DJ mixes, and press your keyboa
 
 ---
 
-## Highlights in `{{RELEASE_TAG}}`
+## What's New & Highlights in `{{RELEASE_TAG}}`
 
-- **Automatic SoundCloud Go+ High Quality (`256 kbps` AAC-LC @ `44.1 kHz`)**: Uses your existing `soundcloud.com` browser session with **zero separate login** and **zero disk-stored credentials**, automatically upgrading SoundCloud Web's default `sq` stream to `hq` (`aac_256k`) when available—including private and secret-link tracks. Also works seamlessly with SoundCloud Free and signed-out browsing.
-- **Direct Denon & Marantz HEOS Network Streaming (`0 dB` `44.1 kHz / 24-bit` Lossless FLAC)**:
-  - Automatic SSDP/mDNS/HEOS discovery on your home LAN with zero IP configuration.
-  - **Hands-Free Auto-Wake**: Pressing **Play** on `soundcloud.com` automatically wakes your Denon/Marantz amplifier from Network Standby and switches to **HEOS Music**.
-  - **Front OLED Track Metadata & Exact Duration**: Streams uncompressed RFC 9639 `24-bit / 44.1 kHz` FLAC with `VORBIS_COMMENT` & `DIDL-Lite` tags so your amplifier's front display shows the live **Track Title**, **Artist**, and **Elapsed / Total Time** while preventing unintended EU Auto-Standby shutdowns during playback.
-- **Bit-Perfect Optical TOSLINK Mode (`44.1 kHz` S/PDIF)**: Locks macOS CoreAudio physical sample rate to `44,100 Hz` at `0 dB` unity gain with continuous silent S/PDIF optical clock lock (`anullsrc`) to eliminate DAC relock clicks between tracks.
-- **0 dB Digital Integrity + Live HEOS Hardware Master Volume**: SoundClud locks digital PCM samples at `0 dB` unity gain (zero software DSP attenuation) while adding bidirectional Denon/Marantz HEOS analog hardware volume & mute controls in both the Extension Popup and SoundCloud player-bar Cast Pill.
-- **Multi-Hour DJ Mix Resilience & Instant Waveform Scrubbing**: Transparently refreshes expiring SoundCloud HLS CDN signatures mid-mix (`HTTP 403` recovery) and supports instant `HTTP 206` byte-range waveform seeking across 1–4+ hour sets.
-- **Graceful Widevine DRM Local Fallback**: If an individual major-label track requires hardware Widevine DRM, SoundClud plays that single track locally in your browser and automatically resumes Hi-Fi handoff on the very next track in your queue.
+- **Bidirectional Remote HEOS Hardware Master Volume & Mute (`0 dB` Digital Integrity Preserved)**:
+  - Control your Denon or Marantz HEOS amplifier's physical analog preamplifier attenuator (`0–100%` slider, `−`/`+` 2% steps, and mute toggle) directly from **both** the SoundClud Extension Popup and the SoundCloud bottom player-bar Cast Pill, with instant live push sync whenever you turn the physical amplifier knob or use your IR remote—while keeping digital PCM audio locked at `0 dBFS` unity gain.
+- **Marantz / Denon Front OLED & Elapsed-Time Progress Fix**:
+  - Eliminated periodic `"Sleep ▶ Off"` OSD popups on Marantz PM7000N / HEOS front displays by replacing intrusive `SLPOFF` commands with mutex-serialized read-only Host-MCU status heartbeats (`PW?` / `SI?`), and restored continuous 1 Hz elapsed-time ticks by switching HEOS CLI keepalives to read-only `system/heart_beat` + `get_play_state` with adaptive `1000 ms` steady-state UPnP polling.
+- **Performance, Memory & Reliability Overhaul**:
+  - Reduced HLS segment RAM cache footprint by **75%** (`96` -> `24` segments), extracted shared DLNA/PCM byte-range planning (`stream_planner`), added mDNS receiver IP failover across DHCP renewals, serialized single-socket Host-MCU `:23` access, and expanded offline verification to **314 automated Vitest/E2E tests** + full Rust adversarial suites.
+- **Automatic SoundCloud Go+ High Quality (`256 kbps` AAC-LC @ `44.1 kHz`)**: Uses your existing `soundcloud.com` browser session with **zero separate login** and **zero disk-stored credentials**, automatically upgrading SoundCloud Web's default `sq` stream to `hq` (`aac_256k`) when available—including private and secret-link tracks.
+- **Single-Decode `24-bit / 44.1 kHz` `0 dB` PCM Transport (Direct HEOS & Optical TOSLINK)**:
+  - **Direct Denon & Marantz HEOS Network Streaming**: Decodes SoundCloud's stream once to `24-bit / 44.1 kHz` `0 dB` PCM and wraps raw samples verbatim inside uncompressed RFC 9639 `SUBFRAME_VERBATIM` FLAC (`CRC-8`/`CRC-16` verified, zero lossy re-compression, zero `48 kHz` OS mixer resampling) with `STREAMINFO`, `SEEKTABLE`, and `VORBIS_COMMENT` tags for live **Track Title**, **Artist**, and **Elapsed / Total Time** on the amplifier's OLED.
+  - **Bit-Perfect Optical TOSLINK Mode (`44.1 kHz` S/PDIF)**: Locks macOS CoreAudio physical sample rate to `44,100 Hz` at `0 dB` unity gain with continuous silent S/PDIF optical clock lock (`anullsrc`) to eliminate DAC relock clicks between tracks.
+- **Multi-Hour DJ Mix Resilience & Graceful Widevine Fallback**: Transparently refreshes expiring SoundCloud HLS CDN signatures mid-mix (`HTTP 403` recovery), supports instant `HTTP 206` byte-range waveform seeking across 1–4+ hour sets, and plays single Widevine-DRM tracks locally while automatically resuming Hi-Fi handoff on the next track.
 
 ---
 

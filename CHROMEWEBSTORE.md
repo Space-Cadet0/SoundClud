@@ -1,6 +1,6 @@
 # Chrome Web Store Listing & Security Review Dossier — SoundClud
 
-> Last Updated: 2026-10-25
+> Last Updated: 2026-11-11
 
 ---
 
@@ -42,7 +42,7 @@ SoundClud is an independent open-source Hi-Fi audio companion project and is not
 SUPPORT
 Documentation, receiver installers, and issue tracker: https://github.com/Space-Cadet0/SoundClud/issues
 
-Version 0.1.0 — Initial Manifest V3 release with Optical TOSLINK and Denon/Marantz HEOS Direct 44.1 kHz / 24-bit 0 dB playback.
+Version 0.1.1 — Adds bidirectional Denon/Marantz HEOS hardware master volume & mute controls in the toolbar popup and player bar, fixes Marantz OLED sleep-modal interruptions and elapsed-time progress, and hardens long-session reliability.
 ```
 
 **Category** `[REQUIRED]`
@@ -177,4 +177,5 @@ Every permission in `packages/extension/manifest.json` is strictly scoped to Sou
 
 | Version | Date | Changes | Status |
 |---------|------|---------|--------|
-| `0.1.0` | 2026-10-25 | Initial Chromium MV3 release: zero-friction SoundCloud Go+ `aac_256k` HQ stream selection, `0 dB` Bit-Perfect `44.1 kHz / 24-bit` Optical TOSLINK (`LocalMpvBackend`) & Denon/Marantz HEOS Direct (`HeosUpnpBackend`) output picker, standby auto-wake, `DIDL-Lite` OLED metadata, dynamic waveform scrub debounce, hardware media-key keepalive, and automatic Widevine local playback fallback. | Ready for Packaging |
+| `0.1.1` | 2026-11-11 | Bidirectional Denon/Marantz HEOS hardware master volume & mute controls in Popup and player-bar Cast Pill, Marantz PM7000N OLED `"Sleep ▶ Off"` & elapsed-time progress fix, 75% HLS segment cache reduction, mDNS receiver IP failover, and 10-dimension codebase hardening. | Ready for Packaging |
+| `0.1.0` | 2026-10-25 | Initial Chromium MV3 release: zero-friction SoundCloud Go+ `aac_256k` HQ stream selection, `0 dB` Bit-Perfect `44.1 kHz / 24-bit` Optical TOSLINK (`LocalMpvBackend`) & Denon/Marantz HEOS Direct (`HeosUpnpBackend`) output picker, standby auto-wake, `DIDL-Lite` OLED metadata, dynamic waveform scrub debounce, hardware media-key keepalive, and automatic Widevine local playback fallback. | Released |

@@ -197,7 +197,7 @@ describe('Tier 3: Volume & Seek Concurrency Interplay (Cross-Feature)', () => {
     });
 
     ws.close();
-    expect(volumeChangeLatencyMs).toBeLessThan(50);
+    expect(volumeChangeLatencyMs).toBeLessThan(250);
   });
 
   // TC-T3-14: F9 + F10

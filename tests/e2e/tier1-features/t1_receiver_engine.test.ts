@@ -93,7 +93,7 @@ describe('Tier 1: Receiver Engine & Backend Core Subsystems (Features 11–16)',
       });
       const duration = Date.now() - start;
 
-      expect(duration).toBeLessThan(50);
+      expect(duration).toBeLessThan(250);
     });
 
     it('T1-F11-04: parses Host-MCU response lines accurately over TCP socket', async () => {

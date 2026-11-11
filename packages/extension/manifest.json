@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "116",
   "name": "SoundClud — Bit-Perfect TOSLINK & HEOS Handoff",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stream SoundCloud Go+ 256 kbps HQ audio bit-perfectly at 44.1 kHz / 0 dB to optical TOSLINK DACs and Denon/Marantz HEOS amplifiers.",
   "permissions": [
     "storage",

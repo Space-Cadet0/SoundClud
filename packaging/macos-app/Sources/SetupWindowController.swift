@@ -269,7 +269,7 @@ final class SetupWindowController: NSWindowController {
             iconView.heightAnchor.constraint(equalToConstant: 44),
         ])
 
-        let versionString = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.0"
+        let versionString = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "0.1.1"
         let titleLabel = NSTextField(labelWithString: "SoundClud — Hi-Fi Setup & Control")
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.font = NSFont.systemFont(ofSize: 18, weight: .bold)

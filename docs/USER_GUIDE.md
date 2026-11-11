@@ -11,10 +11,10 @@ Digital audio output in both modes is locked at **`0 dB` Bit-Perfect unity gain*
 
 ## Part 1 — Zero-Terminal macOS Installation (`.dmg` GUI App)
 
-A **single Universal 2 disk image (`SoundClud-v0.1.0-macOS-Universal.dmg`)** runs natively on **both** Apple Silicon Macs (`M1` / `M2` / `M3` / `M4`) **and** Intel Macs (`x86_64`, macOS 11 Big Sur / macOS 12 Monterey+, including the Late 2014 Intel Mac Mini) with **zero Terminal commands, zero `sudo`, and zero Homebrew**.
+A **single Universal 2 disk image (`SoundClud-v0.1.1-macOS-Universal.dmg`)** runs natively on **both** Apple Silicon Macs (`M1` / `M2` / `M3` / `M4`) **and** Intel Macs (`x86_64`, macOS 11 Big Sur / macOS 12 Monterey+, including the Late 2014 Intel Mac Mini) with **zero Terminal commands, zero `sudo`, and zero Homebrew**.
 
 ### Step 1: Open the Disk Image & Install `SoundClud.app`
-1. Download **`SoundClud-v0.1.0-macOS-Universal.dmg`** from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) (or open `dist/SoundClud-v0.1.0-macOS-Universal.dmg`).
+1. Download **`SoundClud-v0.1.1-macOS-Universal.dmg`** from [GitHub Releases](https://github.com/Space-Cadet0/SoundClud/releases) (or open `dist/SoundClud-v0.1.1-macOS-Universal.dmg`).
 2. Double-click the `.dmg` file and drag **`SoundClud.app`** onto the **`Applications`** folder shortcut.
    *(If you double-click `SoundClud.app` directly inside the disk image, it will offer a 1-click **Copy to Applications & Open** button automatically.)*
 3. Open **`SoundClud`** from **Applications** (or Spotlight / Launchpad).
@@ -25,7 +25,7 @@ Inside the **SoundClud — Hi-Fi Setup & Control** window:
 
 1. Under **Step 1 — Receiver Audio Mode & One-Click Install**, pick your setup:
    - **Direct HEOS Network Mode (MacBook / Desktop -> Denon or Marantz HEOS)**:
-     Select this on your everyday laptop/desktop to stream `44.1 kHz / 24-bit` `0 dB` Lossless FLAC directly over Wi-Fi/Ethernet to your Denon or Marantz HEOS amplifier. Finishes in ~1 second offline.
+     Select this on your everyday laptop/desktop to stream single-decode `44.1 kHz / 24-bit` `0 dB` PCM inside uncompressed `SUBFRAME_VERBATIM` FLAC directly over Wi-Fi/Ethernet to your Denon or Marantz HEOS amplifier (zero lossy re-encoding or OS mixer resampling). Finishes in ~1 second offline.
    - **Optical TOSLINK + HEOS Server Mode (Headless Mac Mini -> Optical S/PDIF)**:
      Select this on a dedicated Mac Mini plugged into your amplifier via a **3.5mm Mini-TOSLINK to Standard TOSLINK** optical cable. Automatically downloads and SHA-256-verifies a standalone `mpv` audio engine (no Homebrew needed) and enables **Keep Mac Awake for Headless LAN Playback** so the Mac Mini never sleeps on AC power (no `sudo pmset` needed).
 2. Click **`Install & Start Receiver`**.
@@ -106,7 +106,7 @@ For Linux (`x86_64` / `aarch64`, `systemd --user`) or headless SSH automation wi
 ```bash
 # Build native release receiver + macOS Universal DMG (on macOS)
 cargo build --release --bin soundclud-receiver
-npm run package:macos-dmg   # macOS only: outputs dist/SoundClud-v0.1.0-macOS-Universal.dmg
+npm run package:macos-dmg   # macOS only: outputs dist/SoundClud-v0.1.1-macOS-Universal.dmg
 
 # CLI install (add --heos-only for pure-Rust HEOS mode, or --keep-awake on headless macOS)
 ./packaging/install/install.sh --bin-source ./target/release/soundclud-receiver
