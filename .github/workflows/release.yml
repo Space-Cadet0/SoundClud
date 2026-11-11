@@ -150,10 +150,10 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-latest
             macosx_deployment_target: "11.0"
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             macosx_deployment_target: "11.0"
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
@@ -272,7 +272,7 @@ jobs:
     needs:
       - verify-and-package
       - build-receiver
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 20
 
     steps:
